@@ -1,0 +1,109 @@
+From b281aea6b2d6678a2af1b38e641c6fe6585f58b9 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:53 -0400
+Subject: [PATCH 14/44] add -input-script for scripted keyboard/joystick input
+
+---
+ src/Makefile.am |  1 +
+ src/joystick.c  |  2 ++
+ src/xroar.c     | 20 ++++++++++++++++++++
+ 3 files changed, 23 insertions(+)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 6209409..0d0da94 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -38,6 +38,7 @@ xroar_SOURCES = \
+ 	hkbd.c hkbd.h \
+ 	hkbd_joystick.c \
+ 	joystick.c joystick.h \
++	joystick_script.c joystick_script.h \
+ 	keyboard.c keyboard.h \
+ 	logging.c logging.h \
+ 	machine.c machine.h \
+diff --git a/src/joystick.c b/src/joystick.c
+index b39fa49..c6f8c92 100644
+--- a/src/joystick.c
++++ b/src/joystick.c
+@@ -60,6 +60,7 @@ extern struct joystick_module evdev_js_mod;
+ extern struct joystick_module joydev_js_mod;
+ extern struct joystick_module sdl_js_mod_exported;
+ extern struct joystick_module wasm_js_mod;
++extern struct joystick_module script_js_mod;
+ static struct joystick_module * const joystick_module_list[] = {
+ #ifdef HAVE_EVDEV
+ 	&evdev_js_mod,
+@@ -73,6 +74,7 @@ static struct joystick_module * const joystick_module_list[] = {
+ #ifdef HAVE_WASM
+ 	&wasm_js_mod,
+ #endif
++	&script_js_mod,
+ 	NULL
+ };
+ 
+diff --git a/src/xroar.c b/src/xroar.c
+index 799a261..b084958 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -53,6 +53,7 @@
+ 
+ #include "ao.h"
+ #include "auto_kbd.h"
++#include "joystick_script.h"
+ #include "becker.h"
+ #include "cart.h"
+ #include "crclist.h"
+@@ -300,6 +301,8 @@ struct private_cfg {
+ #endif
+ };
+ 
++static char *input_script_path = NULL;
++
+ static struct private_cfg private_cfg = {
+ 	.machine.keymap = ANY_AUTO,
+ 	.machine.cpu = ANY_AUTO,
+@@ -1215,6 +1218,17 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 		sdsfree(filename);
+ 	}
+ 	joystick_init();
++
++	// Builtin scripted-pointer config, so the runner needs only
++	// "-joy-right script". Submodule "script" lives in joystick_script.c.
++	if (!joystick_config_by_name("script")) {
++		struct joystick_config *jc = joystick_config_new();
++		jc->name = xstrdup("script");
++		jc->description = xstrdup("Scripted synthetic pointer");
++		jc->axis_specs[0] = xstrdup("script:x");
++		jc->axis_specs[1] = xstrdup("script:y");
++		jc->button_specs[0] = xstrdup("script:0");
++	}
+ #ifdef HAVE_WASM
+ 	if (private_cfg.joy.wasm_virtual) {
+ 		wasm_js_init();
+@@ -1429,6 +1443,10 @@ void xroar_init_finish(void) {
+ 		private_cfg.kbd.type_list = slist_remove(private_cfg.kbd.type_list, data);
+ 		sdsfree(data);
+ 	}
++
++	// Scripted pointer/keyboard timeline (joystick_script.c). Machine and any
++	// -load snapshot are live by now, so events schedule from the current tick.
++	script_js_load(input_script_path);
+ }
+ 
+ static void xroar_ui_set_config_autosave(void *sptr, int tag, void *smsg) {
+@@ -3352,6 +3370,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_STRING("joy-right", &private_cfg.joy.right) },
+ 	{ XC_SET_STRING("joy-left", &private_cfg.joy.left) },
+ 	{ XC_SET_STRING("joy-virtual", &private_cfg.joy.virtual) },
++	{ XC_SET_STRING("input-script", &input_script_path) },
+ 
+ 	/* Printing: */
+ 	{ XC_SET_STRING_NE("lp-file", &private_cfg.printer.file) },
+@@ -3520,6 +3539,7 @@ static void helptext(void) {
+ "  -joy-right NAME       map right joystick\n"
+ "  -joy-left NAME        map left joystick\n"
+ "  -joy-virtual NAME     specify the 'virtual' joystick to cycle [kjoy0]\n"
++"  -input-script FILE    drive keyboard and joystick from a script file\n"
+ "\n"
+ 
+ " Printers:\n"

@@ -1,0 +1,115 @@
+From c40d6c1ea0b89cd70088b4b6199a54262c3e00e6 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:49 -0400
+Subject: [PATCH 40/44] gdb: report the address a watchpoint stop actually
+
+---
+ src/gdb.c     | 33 ++++++++++++++++++++++++++++-----
+ src/machine.c |  4 +++-
+ src/machine.h |  9 +++++++++
+ 3 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/src/gdb.c b/src/gdb.c
+index 04a7671..526f642 100644
+--- a/src/gdb.c
++++ b/src/gdb.c
+@@ -100,6 +100,10 @@
+  * context of the stop as extra name:value pairs -- xpc, block, task and
+  * paddr, the same values the corresponding qxroar queries return -- so a
+  * client does not need a query round trip per stop to find out where it is.
++ * A watchpoint stop adds watch:PADDR, the address that actually matched.
++ * Use that, not paddr: paddr is the machine's last bus cycle, which by the
++ * time a stop reply is formatted has moved past the triggering access -- a
++ * 16-bit store to a watched byte reports the byte AFTER it.
+  * Unrecognised pairs are ignorable by protocol.  Machines with no GIME reply
+  * 'S' exactly as before.
+ 
+@@ -475,6 +479,9 @@ void gdb_single_step(struct gdb_interface *gi) {
+ }
+ 
+ static void gdb_machine_single_step(struct gdb_interface_private *gip) {
++	// Same reason as gdb_continue: the latch belongs to the stop we are
++	// leaving, not to the one the step will produce.
++	gip->machine->debug.wp_match_pending = 0;
+ 	pthread_mutex_lock(&gip->run_state_mt);
+ 	if (gip->run_state == gdb_run_state_stopped) {
+ 		gip->run_state = gdb_run_state_single_step;
+@@ -494,6 +501,10 @@ static void gdb_machine_signal(struct gdb_interface_private *gip, int sig, bool
+ }
+ 
+ static void gdb_continue(struct gdb_interface_private *gip) {
++	// The watchpoint-match latch describes the stop we are leaving. Clear
++	// it here so the next stop reply carries watch: only if the next stop
++	// is itself a watchpoint hit.
++	gip->machine->debug.wp_match_pending = 0;
+ 	pthread_mutex_lock(&gip->run_state_mt);
+ 	if (gip->run_state == gdb_run_state_stopped) {
+ 		gip->run_state = gdb_run_state_running;
+@@ -899,14 +910,26 @@ static int send_char(struct gdb_interface_private *gip, char c) {
+ // stop rather than "whatever is mapped by the time you ask".  Machines with
+ // no MMU have nothing to add and reply 'S' as before.
+ static void send_last_signal(struct gdb_interface_private *gip) {
+-	char tmpbuf[64];
++	char tmpbuf[96];
+ 	if (gip->gime) {
+ 		uint16_t pc = mc6809_get_pc(gip->cpu);
+ 		unsigned xpc = tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff;
+-		snprintf(tmpbuf, sizeof(tmpbuf),
+-			 "T%02xxpc:%05x;block:%02x;task:%02x;paddr:%05x;",
+-			 gip->last_signal, xpc, (xpc >> 13) & 0xff,
+-			 tcc1014_get_task(gip->gime), gip->gime->Z & 0x7ffff);
++		int n = snprintf(tmpbuf, sizeof(tmpbuf),
++				 "T%02xxpc:%05x;block:%02x;task:%02x;paddr:%05x;",
++				 gip->last_signal, xpc, (xpc >> 13) & 0xff,
++				 tcc1014_get_task(gip->gime), gip->gime->Z & 0x7ffff);
++		// A watchpoint stop reports the address that MATCHED, which is
++		// not paddr: a trap handler only asks the CPU to stop, so the
++		// instruction finishes and the last bus cycle has moved on by
++		// the time this runs -- a 16-bit store to the watched address
++		// reports its second byte, which reads as a near miss. The
++		// session latches the real one; gdb_continue clears the latch,
++		// so it describes this stop and not an earlier one.
++		if (n > 0 && (size_t)n < sizeof(tmpbuf) &&
++		    gip->machine->debug.wp_match_pending) {
++			snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
++				 gip->machine->debug.wp_match_address & 0x1fffff);
++		}
+ 		send_packet_string(gip, tmpbuf);
+ 		return;
+ 	}
+diff --git a/src/machine.c b/src/machine.c
+index 7e20aa1..3455e6c 100644
+--- a/src/machine.c
++++ b/src/machine.c
+@@ -500,8 +500,10 @@ void machine_remove_hbreak(struct machine *m, int32_t A) {
+ // Watchpoint flavour of machine_trap_handler: same action, but watchpoint
+ // handlers carry the accessed byte.
+ static void machine_trap_whandler(void *sptr, bool RnW, uint32_t A, uint8_t D) {
+-	(void)RnW; (void)A; (void)D;
++	(void)RnW; (void)D;
+ 	struct machine *m = sptr;
++	m->debug.wp_match_address = A;
++	m->debug.wp_match_pending = 1;
+ 	m->signal(m, MACHINE_SIGTRAP);
+ }
+ 
+diff --git a/src/machine.h b/src/machine.h
+index 5cac70b..e6caed9 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -267,6 +267,15 @@ struct machine {
+ 					  int32_t Astart, uint32_t Aend,
+ 					  DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
++		// Address a watchpoint handler matched, latched by
++		// machine_trap_whandler() for the gdb stop reply.  A handler only
++		// asks the CPU to stop, so the stop is reported after the
++		// instruction finishes -- by which time a 16-bit store has put
++		// its second byte on the bus; the latch carries the address that
++		// actually matched across that gap.  Cleared by the consumer.
++		uint32_t wp_match_address;
++		bool wp_match_pending;
++
+ 		// CPU debug information copied from main CPU (the one that
+ 		// would be debugged)
+ 		struct debug_cpu cpu;

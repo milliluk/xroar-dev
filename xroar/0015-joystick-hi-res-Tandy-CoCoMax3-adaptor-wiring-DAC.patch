@@ -1,0 +1,599 @@
+From e3abb73a8d1c589c1565e2135aef49db2b59a659 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:55 -0400
+Subject: [PATCH 15/44] joystick: hi-res (Tandy/CoCoMax3) adaptor wiring + DAC
+
+---
+ src/coco3.c         | 196 +++++++++++++++++++++++++++++++++++++++++++-
+ src/dragon/dragon.c | 102 ++++++++++++++++++++++-
+ src/dragon/dragon.h |   7 ++
+ src/machine.c       |   9 ++
+ src/machine.h       |  13 +++
+ src/xroar.c         |  10 +++
+ 6 files changed, 333 insertions(+), 4 deletions(-)
+
+diff --git a/src/coco3.c b/src/coco3.c
+index f1fbe68..52ff237 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -67,6 +67,14 @@
+ # define M_PI 3.14159265358979323846
+ #endif
+ 
++// CoCo joystick DAC encoding: PIA1 PA2-PA7 are the six DAC bits.  XRoar's
++// joystick axis is 16-bit, so a single DAC code step spans 2^(8+2) axis units.
++#define JOYSTICK_DAC_LOW_BITS 2
++#define JOYSTICK_DAC_AXIS_SHIFT 8
++#define JOYSTICK_DAC_OUTPUT_MASK (UINT8_MAX << JOYSTICK_DAC_LOW_BITS)
++#define JOYSTICK_DAC_BIN_CENTRE (1u << (JOYSTICK_DAC_LOW_BITS - 1))
++#define JOYSTICK_DAC_STEP (1u << (JOYSTICK_DAC_AXIS_SHIFT + JOYSTICK_DAC_LOW_BITS))
++
+ // Measured peak-to-peak voltages: 0V, 1V, 1.6V, 2V.  Scaled here:
+ static float rgb_intensity_map[4] = { 0.000, 0.460, 0.736, 0.920 };
+ 
+@@ -188,6 +196,20 @@ struct coco3 {
+ 	// Useful configuration side-effect tracking
+ 	bool has_secb;
+ 	uint32_t crc_secb;
++
++	// Hi-res joystick interface (Tandy Hi-Res / CoCo Max 3 monostable
++	// adaptor).  See machine.h for the HIRES_* selector values.
++	int hires_joystick;        // selected adaptor, or HIRES_NONE
++	int hires_joystick_port;   // 0 = right, 1 = left
++	_Bool hires_joystick_ca;   // last seen strobe level
++	struct event hires_joystick_event[2];  // per-axis monostable
++
++	// Normal joystick DAC settling.  Software-only high-resolution joystick
++	// readers sample the comparator while a one-step DAC transition is still
++	// in flight.
++	uint32_t joystick_dac_start;
++	uint32_t joystick_dac_target;
++	event_ticks joystick_dac_transition_tick;
+ };
+ 
+ #define COCO3_SER_RAM           (2)
+@@ -209,6 +231,12 @@ static const struct ser_struct ser_struct_coco3[] = {
+ 	SER_ID_STRUCT_ELEM(10, struct coco3, dat.task),
+ 	SER_ID_STRUCT_UNHANDLED(COCO3_SER_DAT_MMU_BANK),
+ 	SER_ID_STRUCT_UNHANDLED(COCO3_SER_DAT_VRAM_BANK),
++	SER_ID_STRUCT_ELEM(20, struct coco3, hires_joystick),
++	SER_ID_STRUCT_ELEM(21, struct coco3, hires_joystick_port),
++	SER_ID_STRUCT_ELEM(22, struct coco3, hires_joystick_ca),
++	SER_ID_STRUCT_ELEM(23, struct coco3, joystick_dac_start),
++	SER_ID_STRUCT_ELEM(24, struct coco3, joystick_dac_target),
++	SER_ID_STRUCT_TYPE(25, ser_type_tick, struct coco3, joystick_dac_transition_tick),
+ };
+ 
+ static bool coco3_read_elem(void *sptr, struct ser_handle *sh, int tag);
+@@ -321,6 +349,11 @@ static void coco3_remove_watchpoint(struct machine *m, int RnW,
+ 
+ static void keyboard_update(void *sptr);
+ static void joystick_update(void *sptr);
++static uint32_t joystick_dac_target_value(struct coco3 *mcc3);
++static void joystick_dac_write(struct coco3 *mcc3);
++static uint32_t joystick_dac_value(struct coco3 *mcc3);
++static void hires_joystick_update(struct coco3 *mcc3);
++static void hires_joystick_fire(void *sptr);
+ static void update_sound_mux_source(void *sptr);
+ 
+ static void single_bit_feedback(void *sptr, bool level);
+@@ -340,7 +373,7 @@ static void coco3_instruction_posthook(void *sptr);
+ static uint16_t fetch_vram(void *sptr, uint32_t A);
+ 
+ static void pia0a_data_preread(void *sptr);
+-#define pia0a_data_postwrite keyboard_update
++static void pia0a_data_postwrite(void *sptr);
+ #define pia0a_control_postwrite update_sound_mux_source
+ #define pia0b_data_postwrite keyboard_update
+ #define pia0b_control_postwrite update_sound_mux_source
+@@ -663,6 +696,20 @@ static bool coco3_finish(struct part *p) {
+ 	mcc3->PIA1->b.data_postwrite = DELEGATE_AS0(void, pia1b_data_postwrite, mcc3);
+ 	mcc3->PIA1->b.control_postwrite = DELEGATE_AS0(void, pia1b_control_postwrite, mcc3);
+ 
++	// Hi-res joystick interface
++	mcc3->hires_joystick = mc->hires_joystick;
++	mcc3->hires_joystick_port =
++		(mcc3->hires_joystick == HIRES_LEFT ||
++		 mcc3->hires_joystick == HIRES_LEFT_COCOMAX3) ? 1 : 0;
++	mcc3->hires_joystick_ca = 0;
++	event_init(&mcc3->hires_joystick_event[0], MACHINE_EVENT_LIST,
++		   DELEGATE_AS0(void, hires_joystick_fire, mcc3));
++	event_init(&mcc3->hires_joystick_event[1], MACHINE_EVENT_LIST,
++		   DELEGATE_AS0(void, hires_joystick_fire, mcc3));
++	mcc3->joystick_dac_target = joystick_dac_target_value(mcc3);
++	mcc3->joystick_dac_start = mcc3->joystick_dac_target;
++	mcc3->joystick_dac_transition_tick = event_current_tick;
++
+ 	// Single-bit sound feedback
+ 	mcc3->snd->sbs_feedback = DELEGATE_AS1(void, bool, single_bit_feedback, mcc3);
+ 
+@@ -738,6 +785,8 @@ static void coco3_free(struct part *p) {
+ 		keyboard_interface_free(mcc3->keyboard.interface);
+ 	}
+ 	machine_remove_breakpoint_all(&mcc3->public, mcc3);
++	event_dequeue(&mcc3->hires_joystick_event[0]);
++	event_dequeue(&mcc3->hires_joystick_event[1]);
+ 	if (mcc3->printer_interface) {
+ 		printer_interface_free(mcc3->printer_interface);
+ 	}
+@@ -879,6 +928,12 @@ static void coco3_reset(struct machine *m, bool hard) {
+ 	}
+ 	mc6821_reset(mcc3->PIA0);
+ 	mc6821_reset(mcc3->PIA1);
++	event_dequeue(&mcc3->hires_joystick_event[0]);
++	event_dequeue(&mcc3->hires_joystick_event[1]);
++	mcc3->hires_joystick_ca = 0;
++	mcc3->joystick_dac_target = joystick_dac_target_value(mcc3);
++	mcc3->joystick_dac_start = mcc3->joystick_dac_target;
++	mcc3->joystick_dac_transition_tick = event_current_tick;
+ 	if (mcc3->cart && mcc3->cart->reset) {
+ 		mcc3->cart->reset(mcc3->cart, hard);
+ 	}
+@@ -1490,18 +1545,137 @@ static void keyboard_update(void *sptr) {
+ 	mcc3->GIME->IL1 = (PIA_VALUE_A(mcc3->PIA0) | 0x80) != 0xff;
+ }
+ 
++// Residual distance from a one-step DAC target, indexed by elapsed fast CoCo
++// E-cycles.  These are the full-resolution rise/fall values preserved in VCC's
++// software hi-res joystick implementation.  VCC used a 14-bit comparator axis;
++// XRoar uses 16 bits, so the measured residual units scale by four.
++#define JOYSTICK_DAC_E_TICKS EVENT_TICKS_14M31818(8)
++#define JOYSTICK_DAC_VCC_SCALE 4u
++static const uint16_t joystick_dac_rising[10] = {
++	256 * JOYSTICK_DAC_VCC_SCALE, 256 * JOYSTICK_DAC_VCC_SCALE,
++	256 * JOYSTICK_DAC_VCC_SCALE, 256 * JOYSTICK_DAC_VCC_SCALE,
++	 48 * JOYSTICK_DAC_VCC_SCALE,  32 * JOYSTICK_DAC_VCC_SCALE,
++	 24 * JOYSTICK_DAC_VCC_SCALE,  20 * JOYSTICK_DAC_VCC_SCALE,
++	  0 * JOYSTICK_DAC_VCC_SCALE,   0 * JOYSTICK_DAC_VCC_SCALE
++};
++static const uint16_t joystick_dac_falling[10] = {
++	256 * JOYSTICK_DAC_VCC_SCALE, 256 * JOYSTICK_DAC_VCC_SCALE,
++	256 * JOYSTICK_DAC_VCC_SCALE, 256 * JOYSTICK_DAC_VCC_SCALE,
++	224 * JOYSTICK_DAC_VCC_SCALE, 116 * JOYSTICK_DAC_VCC_SCALE,
++	 64 * JOYSTICK_DAC_VCC_SCALE,  56 * JOYSTICK_DAC_VCC_SCALE,
++	 48 * JOYSTICK_DAC_VCC_SCALE,   0 * JOYSTICK_DAC_VCC_SCALE
++};
++
++static uint32_t joystick_dac_target_value(struct coco3 *mcc3) {
++	uint32_t dac_code = mcc3->PIA1->a.out_sink & JOYSTICK_DAC_OUTPUT_MASK;
++	return (dac_code | JOYSTICK_DAC_BIN_CENTRE) << JOYSTICK_DAC_AXIS_SHIFT;
++}
++
++static void joystick_dac_write(struct coco3 *mcc3) {
++	uint32_t target = joystick_dac_target_value(mcc3);
++	if (target == mcc3->joystick_dac_target)
++		return;
++	mcc3->joystick_dac_start = mcc3->joystick_dac_target;
++	mcc3->joystick_dac_target = target;
++	mcc3->joystick_dac_transition_tick = event_current_tick;
++}
++
++static uint32_t joystick_dac_value(struct coco3 *mcc3) {
++	uint32_t start = mcc3->joystick_dac_start;
++	uint32_t target = mcc3->joystick_dac_target;
++	uint32_t distance = start > target ? start - target : target - start;
++
++	// The measured deep-scan data describes the fine one-DAC-step scan only.
++	// Coarse successive-approximation jumps remain instantaneous.
++	if (distance != JOYSTICK_DAC_STEP)
++		return target;
++
++	event_ticks dt = event_current_tick - mcc3->joystick_dac_transition_tick;
++	unsigned e_cycles = dt / JOYSTICK_DAC_E_TICKS;
++	if (e_cycles >= ARRAY_N_ELEMENTS(joystick_dac_rising))
++		return target;
++
++	if (target > start)
++		return target - joystick_dac_rising[e_cycles];
++	return target + joystick_dac_falling[e_cycles];
++}
++
+ static void joystick_update(void *sptr) {
+ 	struct coco3 *mcc3 = sptr;
+ 	int port = PIA_VALUE_CB2(mcc3->PIA0);
+ 	int axis = PIA_VALUE_CA2(mcc3->PIA0);
+-	int dac_value = ((mcc3->PIA1->a.out_sink & 0xfc) | 2) << 8;
++
++	// Hi-res adaptor: the selected stick's JOYIN comes from the monostable,
++	// not the analogue comparator.  JOYIN reads high once the pulse has
++	// finished (event no longer queued), low while it is still running.
++	if (mcc3->hires_joystick != HIRES_NONE && port == mcc3->hires_joystick_port) {
++		if (event_queued(&mcc3->hires_joystick_event[axis]))
++			mcc3->PIA0->a.in_sink &= 0x7f;
++		else
++			mcc3->PIA0->a.in_sink |= 0x80;
++		return;
++	}
++
++	uint32_t dac_value = joystick_dac_value(mcc3);
+ 	int js_value = joystick_read_axis(port, axis);
+-	if (js_value >= dac_value)
++	if ((uint32_t)js_value >= dac_value)
+ 		mcc3->PIA0->a.in_sink |= 0x80;
+ 	else
+ 		mcc3->PIA0->a.in_sink &= 0x7f;
+ }
+ 
++// Hi-res joystick monostable expiry.  Nothing to compute: the comparator read
++// in joystick_update() tests event_queued() directly.  The event exists only
++// so that it removes itself from the queue when the pulse ends.
++static void hires_joystick_fire(void *sptr) {
++	(void)sptr;
++}
++
++// Drive the hi-res joystick adaptor.  Called whenever a line that can act as
++// the adaptor's strobe changes: the DAC MSB (Tandy Hi-Res) or PIA0 PA2/PA3
++// (CoCo Max 3).  On the strobe's high-to-low edge a per-axis monostable is
++// armed for a duration proportional to the axis position.  The pulse-width
++// constants are taken from MAME's trs/coco.cpp poll_hires_joystick().
++static void hires_joystick_update(struct coco3 *mcc3) {
++	_Bool newvalue;
++	_Bool is_cocomax3;
++
++	switch (mcc3->hires_joystick) {
++	case HIRES_RIGHT:
++	case HIRES_LEFT:
++		// DAC bit 5 of the 6-bit value, i.e. PIA1 PA7
++		newvalue = mcc3->PIA1->a.out_sink & 0x80;
++		is_cocomax3 = 0;
++		break;
++	case HIRES_RIGHT_COCOMAX3:
++		newvalue = mcc3->PIA0->a.out_sink & 0x04;
++		is_cocomax3 = 1;
++		break;
++	case HIRES_LEFT_COCOMAX3:
++		newvalue = mcc3->PIA0->a.out_sink & 0x08;
++		is_cocomax3 = 1;
++		break;
++	default:
++		return;
++	}
++
++	for (int axis = 0; axis < 2; axis++) {
++		if (mcc3->hires_joystick_ca && !newvalue) {
++			// High-to-low: arm the monostable for this axis
++			double value = (double)joystick_read_axis(mcc3->hires_joystick_port, axis) / 65535.;
++			if (is_cocomax3)
++				value = value * 2885. + 380.;
++			else
++				value = value * 5850. + 535.;
++			event_queue_dt(&mcc3->hires_joystick_event[axis], EVENT_US((uintmax_t)value));
++		} else if (!mcc3->hires_joystick_ca && newvalue) {
++			// Low-to-high: cancel any pending pulse
++			event_dequeue(&mcc3->hires_joystick_event[axis]);
++		}
++	}
++	mcc3->hires_joystick_ca = newvalue;
++}
++
+ static void update_sound_mux_source(void *sptr) {
+ 	struct coco3 *mcc3 = sptr;
+ 	unsigned source = (PIA_VALUE_CB2(mcc3->PIA0) << 1)
+@@ -1516,10 +1690,26 @@ static void pia0a_data_preread(void *sptr) {
+ 	joystick_update(sptr);
+ }
+ 
++static void pia0a_data_postwrite(void *sptr) {
++	struct coco3 *mcc3 = sptr;
++	// Preserve the keyboard IRQ update this line used to do via its
++	// #define pia0a_data_postwrite keyboard_update.
++	keyboard_update(mcc3);
++	// CoCo Max 3 adaptor strobes on PIA0 PA2 (right) / PA3 (left)
++	if (mcc3->hires_joystick == HIRES_RIGHT_COCOMAX3 ||
++	    mcc3->hires_joystick == HIRES_LEFT_COCOMAX3) {
++		hires_joystick_update(mcc3);
++	}
++}
++
+ static void pia1a_data_postwrite(void *sptr) {
+ 	struct coco3 *mcc3 = sptr;
++	joystick_dac_write(mcc3);
+ 	sound_set_dac_level(mcc3->snd, (float)(PIA_VALUE_A(mcc3->PIA1) & 0xfc) / 252.);
+ 	tape_update_output(mcc3->tape_interface, mcc3->PIA1->a.out_sink & 0xfc);
++	// Tandy Hi-Res adaptor strobes on the DAC MSB
++	if (mcc3->hires_joystick == HIRES_RIGHT || mcc3->hires_joystick == HIRES_LEFT)
++		hires_joystick_update(mcc3);
+ }
+ 
+ static void pia1a_control_postwrite(void *sptr) {
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 170b376..4b2f89c 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -76,6 +76,9 @@ static const struct ser_struct ser_struct_dragon[] = {
+ 	SER_ID_STRUCT_UNHANDLED(DRAGON_SER_RAM_SIZE),
+ 	SER_ID_STRUCT_UNHANDLED(DRAGON_SER_RAM_MASK),
+         SER_ID_STRUCT_ELEM(5, struct dragon, inverted_text),
++	SER_ID_STRUCT_ELEM(20, struct dragon, hires_joystick),
++	SER_ID_STRUCT_ELEM(21, struct dragon, hires_joystick_port),
++	SER_ID_STRUCT_ELEM(22, struct dragon, hires_joystick_ca),
+ };
+ 
+ static bool dragon_read_elem(void *sptr, struct ser_handle *sh, int tag);
+@@ -241,6 +244,8 @@ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ 				     DELEGATE_T2(void, bool, uint32) handler);
+ 
+ static void joystick_update(void *sptr);
++static void hires_joystick_update(struct dragon *md);
++static void hires_joystick_fire(void *sptr);
+ static void update_sound_mux_source(void *sptr);
+ 
+ static void single_bit_feedback(void *sptr, bool level);
+@@ -257,7 +262,7 @@ static void vdg_fetch_handler(void *sptr, uint16_t A, int nbytes, uint16_t *dest
+ static void vdg_fetch_handler_chargen(void *sptr, uint16_t A, int nbytes, uint16_t *dest);
+ 
+ static void pia0a_data_preread(void *sptr);
+-#define pia0a_data_postwrite NULL
++static void pia0a_data_postwrite(void *sptr);
+ #define pia0a_control_postwrite update_sound_mux_source
+ #define pia0b_data_preread dragon_keyboard_update
+ #define pia0b_data_postwrite NULL
+@@ -483,6 +488,17 @@ bool dragon_finish_common(struct dragon *md) {
+ 	md->PIA1->b.data_postwrite = DELEGATE_AS0(void, dragon_pia1b_data_postwrite, md);
+ 	md->PIA1->b.control_postwrite = DELEGATE_AS0(void, pia1b_control_postwrite, md);
+ 
++	// Hi-res joystick interface
++	md->hires_joystick = mc->hires_joystick;
++	md->hires_joystick_port =
++		(md->hires_joystick == HIRES_LEFT ||
++		 md->hires_joystick == HIRES_LEFT_COCOMAX3) ? 1 : 0;
++	md->hires_joystick_ca = 0;
++	event_init(&md->hires_joystick_event[0], MACHINE_EVENT_LIST,
++		   DELEGATE_AS0(void, hires_joystick_fire, md));
++	event_init(&md->hires_joystick_event[1], MACHINE_EVENT_LIST,
++		   DELEGATE_AS0(void, hires_joystick_fire, md));
++
+ 	// Single-bit sound feedback
+ 	md->snd->sbs_feedback = DELEGATE_AS1(void, bool, single_bit_feedback, md);
+ 
+@@ -657,6 +673,11 @@ void dragon_free_common(struct part *p) {
+ 	if (md->printer_interface) {
+ 		printer_interface_free(md->printer_interface);
+ 	}
++	if (md->bp_session) {
++		bp_session_free(md->bp_session);
++	}
++	event_dequeue(&md->hires_joystick_event[0]);
++	event_dequeue(&md->hires_joystick_event[1]);
+ 	rombank_free(md->ext_charset);
+ }
+ 
+@@ -813,6 +834,9 @@ void dragon_reset(struct machine *m, bool hard) {
+ 	}
+ 	mc6821_reset(md->PIA0);
+ 	mc6821_reset(md->PIA1);
++	event_dequeue(&md->hires_joystick_event[0]);
++	event_dequeue(&md->hires_joystick_event[1]);
++	md->hires_joystick_ca = 0;
+ 	if (md->cart && md->cart->reset) {
+ 		md->cart->reset(md->cart, hard);
+ 	}
+@@ -1360,6 +1384,18 @@ static void joystick_update(void *sptr) {
+ 	struct dragon *md = sptr;
+ 	int port = PIA_VALUE_CB2(md->PIA0);
+ 	int axis = PIA_VALUE_CA2(md->PIA0);
++
++	// Hi-res adaptor: the selected stick's JOYIN comes from the monostable,
++	// not the analogue comparator.  JOYIN reads high once the pulse has
++	// finished (event no longer queued), low while it is still running.
++	if (md->hires_joystick != HIRES_NONE && port == md->hires_joystick_port) {
++		if (event_queued(&md->hires_joystick_event[axis]))
++			md->PIA0->a.in_sink &= 0x7f;
++		else
++			md->PIA0->a.in_sink |= 0x80;
++		return;
++	}
++
+ 	int dac_value = ((md->PIA1->a.out_sink & 0xfc) | 2) << 8;
+ 	int js_value = joystick_read_axis(port, axis);
+ 	if (js_value >= dac_value)
+@@ -1368,6 +1404,58 @@ static void joystick_update(void *sptr) {
+ 		md->PIA0->a.in_sink &= 0x7f;
+ }
+ 
++// Hi-res joystick monostable expiry.  Nothing to compute: the comparator read
++// in joystick_update() tests event_queued() directly.  The event exists only
++// so that it removes itself from the queue when the pulse ends.
++static void hires_joystick_fire(void *sptr) {
++	(void)sptr;
++}
++
++// Drive the hi-res joystick adaptor.  Called whenever a line that can act as
++// the adaptor's strobe changes: the DAC MSB (Tandy Hi-Res) or PIA0 PA2/PA3
++// (CoCo Max 3).  On the strobe's high-to-low edge a per-axis monostable is
++// armed for a duration proportional to the axis position.  The pulse-width
++// constants are taken from MAME's trs/coco.cpp poll_hires_joystick().
++static void hires_joystick_update(struct dragon *md) {
++	_Bool newvalue;
++	_Bool is_cocomax3;
++
++	switch (md->hires_joystick) {
++	case HIRES_RIGHT:
++	case HIRES_LEFT:
++		// DAC bit 5 of the 6-bit value, i.e. PIA1 PA7
++		newvalue = md->PIA1->a.out_sink & 0x80;
++		is_cocomax3 = 0;
++		break;
++	case HIRES_RIGHT_COCOMAX3:
++		newvalue = md->PIA0->a.out_sink & 0x04;
++		is_cocomax3 = 1;
++		break;
++	case HIRES_LEFT_COCOMAX3:
++		newvalue = md->PIA0->a.out_sink & 0x08;
++		is_cocomax3 = 1;
++		break;
++	default:
++		return;
++	}
++
++	for (int axis = 0; axis < 2; axis++) {
++		if (md->hires_joystick_ca && !newvalue) {
++			// High-to-low: arm the monostable for this axis
++			double value = (double)joystick_read_axis(md->hires_joystick_port, axis) / 65535.;
++			if (is_cocomax3)
++				value = value * 2885. + 380.;
++			else
++				value = value * 5850. + 535.;
++			event_queue_dt(&md->hires_joystick_event[axis], EVENT_US((uintmax_t)value));
++		} else if (!md->hires_joystick_ca && newvalue) {
++			// Low-to-high: cancel any pending pulse
++			event_dequeue(&md->hires_joystick_event[axis]);
++		}
++	}
++	md->hires_joystick_ca = newvalue;
++}
++
+ static void update_sound_mux_source(void *sptr) {
+ 	struct dragon *md = sptr;
+ 	unsigned source = (PIA_VALUE_CB2(md->PIA0) << 1)
+@@ -1389,12 +1477,24 @@ static void pia0a_data_preread(void *sptr) {
+ 	joystick_update(sptr);
+ }
+ 
++static void pia0a_data_postwrite(void *sptr) {
++	struct dragon *md = sptr;
++	// CoCo Max 3 adaptor strobes on PIA0 PA2 (right) / PA3 (left)
++	if (md->hires_joystick == HIRES_RIGHT_COCOMAX3 ||
++	    md->hires_joystick == HIRES_LEFT_COCOMAX3) {
++		hires_joystick_update(md);
++	}
++}
++
+ /* Overridden in coco.c */
+ 
+ static void pia1a_data_postwrite(void *sptr) {
+ 	struct dragon *md = sptr;
+ 	sound_set_dac_level(md->snd, (float)(PIA_VALUE_A(md->PIA1) & 0xfc) / 252.);
+ 	tape_update_output(md->tape_interface, md->PIA1->a.out_sink & 0xfc);
++	// Tandy Hi-Res adaptor strobes on the DAC MSB
++	if (md->hires_joystick == HIRES_RIGHT || md->hires_joystick == HIRES_LEFT)
++		hires_joystick_update(md);
+ 	dragon_keyboard_update(md);
+ 	printer_strobe(md->printer_interface, PIA_VALUE_A(md->PIA1) & 0x02, PIA_VALUE_B(md->PIA0));
+ }
+diff --git a/src/dragon/dragon.h b/src/dragon/dragon.h
+index 7bc5385..36cc61c 100644
+--- a/src/dragon/dragon.h
++++ b/src/dragon/dragon.h
+@@ -124,6 +124,13 @@ struct dragon {
+ 	bool relaxed_pia0_decode;
+ 	bool relaxed_pia1_decode;
+ 
++	// Hi-res joystick interface (Tandy Hi-Res / CoCo Max 3 monostable
++	// adaptor).  See machine.h for the HIRES_* selector values.
++	int hires_joystick;        // selected adaptor, or HIRES_NONE
++	int hires_joystick_port;   // 0 = right, 1 = left
++	_Bool hires_joystick_ca;   // last seen strobe level
++	struct event hires_joystick_event[2];  // per-axis monostable
++
+ 	struct {
+ 		int sam_variant;
+ 		bool immunity;
+diff --git a/src/machine.c b/src/machine.c
+index 2004011..dac8ed5 100644
+--- a/src/machine.c
++++ b/src/machine.c
+@@ -142,6 +142,15 @@ struct xconfig_enum machine_vdg_type_list[] = {
+ 	{ XC_ENUM_END() }
+ };
+ 
++struct xconfig_enum machine_hires_joystick_list[] = {
++	{ XC_ENUM_INT("none", HIRES_NONE, "No hi-res joystick adaptor") },
++	{ XC_ENUM_INT("right", HIRES_RIGHT, "Tandy Hi-Res, right port") },
++	{ XC_ENUM_INT("right-cocomax3", HIRES_RIGHT_COCOMAX3, "CoCo Max 3 style, right port") },
++	{ XC_ENUM_INT("left", HIRES_LEFT, "Tandy Hi-Res, left port") },
++	{ XC_ENUM_INT("left-cocomax3", HIRES_LEFT_COCOMAX3, "CoCo Max 3 style, left port") },
++	{ XC_ENUM_END() }
++};
++
+ struct xconfig_enum machine_ram_org_list[] = {
+ 	{ XC_ENUM_INT("4kx1", RAM_ORG_4Kx1, "4K x 1 (e.g. MK4096)") },
+ 	{ XC_ENUM_INT("16kx1", RAM_ORG_16Kx1, "16K x 1 (e.g. 4116)") },
+diff --git a/src/machine.h b/src/machine.h
+index d5a3642..1054a42 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -106,14 +106,27 @@ struct machine_config {
+ 	char *default_cart;
+ 	bool nodos;
+ 	bool cart_enabled;
++	int hires_joystick;  // hi-res joystick adaptor, see enum below
+ 	struct slist *opts;
+ };
+ 
++// Hi-res joystick adaptor selection (machine_config.hires_joystick).  Models
++// the Tandy Hi-Res and CoCo Max 3 monostable interfaces; mirrors the cases in
++// MAME's trs/coco.cpp poll_hires_joystick().
++enum {
++	HIRES_NONE = 0,
++	HIRES_RIGHT,           // Tandy Hi-Res, right port
++	HIRES_RIGHT_COCOMAX3,  // CoCo Max 3 style, right port
++	HIRES_LEFT,            // Tandy Hi-Res, left port
++	HIRES_LEFT_COCOMAX3,   // CoCo Max 3 style, left port
++};
++
+ extern struct xconfig_enum machine_keyboard_list[];
+ extern struct xconfig_enum machine_cpu_list[];
+ extern struct xconfig_enum machine_tv_type_list[];
+ extern struct xconfig_enum machine_tv_input_list[];
+ extern struct xconfig_enum machine_vdg_type_list[];
++extern struct xconfig_enum machine_hires_joystick_list[];
+ extern struct xconfig_enum machine_ram_org_list[];
+ extern struct xconfig_enum machine_ram_init_list[];
+ 
+diff --git a/src/xroar.c b/src/xroar.c
+index b084958..bf2065a 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -69,6 +69,7 @@
+ #include "machine.h"
+ #include "module.h"
+ #include "part.h"
++#include "ram.h"
+ #include "path.h"
+ #include "printer.h"
+ #include "rom.h"
+@@ -179,6 +180,7 @@ struct private_cfg {
+ 		int tv_type;
+ 		int tv_input;
+ 		int vdg_type;
++		int hires_joystick;
+ 		int ram_org;
+ 		int ram_init;
+ 		bool cart_dfn;
+@@ -309,6 +311,7 @@ static struct private_cfg private_cfg = {
+ 	.machine.tv_type = ANY_AUTO,
+ 	.machine.tv_input = ANY_AUTO,
+ 	.machine.vdg_type = -1,
++	.machine.hires_joystick = -1,
+ 	.machine.ram = ANY_AUTO,
+ 	.machine.ram_org = ANY_AUTO,
+ 	.machine.ram_init = ANY_AUTO,
+@@ -2570,6 +2573,10 @@ static void set_machine(const char *name) {
+ 			xroar.machine_config->vdg_type = private_cfg.machine.vdg_type;
+ 			private_cfg.machine.vdg_type = -1;
+ 		}
++		if (private_cfg.machine.hires_joystick != -1) {
++			xroar.machine_config->hires_joystick = private_cfg.machine.hires_joystick;
++			private_cfg.machine.hires_joystick = -1;
++		}
+ 		if (private_cfg.machine.ram != ANY_AUTO) {
+ 			xroar.machine_config->ram = private_cfg.machine.ram;
+ 			private_cfg.machine.ram = ANY_AUTO;
+@@ -3228,6 +3235,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_ENUM("tv-type", &private_cfg.machine.tv_type, machine_tv_type_list) },
+ 	{ XC_SET_ENUM("tv-input", &private_cfg.machine.tv_input, machine_tv_input_list) },
+ 	{ XC_SET_ENUM("vdg-type", &private_cfg.machine.vdg_type, machine_vdg_type_list) },
++	{ XC_SET_ENUM("hires-joystick", &private_cfg.machine.hires_joystick, machine_hires_joystick_list) },
+ 	{ XC_SET_ENUM("ram-org", &private_cfg.machine.ram_org, machine_ram_org_list) },
+ 	{ XC_SET_INT("ram", &private_cfg.machine.ram) },
+ 	{ XC_SET_ENUM("ram-init", &private_cfg.machine.ram_init, machine_ram_init_list) },
+@@ -3469,6 +3477,8 @@ static void helptext(void) {
+ "    -tv-type TYPE           TV type (-tv-type help for list)\n"
+ "    -tv-input INPUT         TV input (-tv-input help for list)\n"
+ "    -vdg-type TYPE          VDG type (6847 or 6847t1)\n"
++"    -hires-joystick TYPE    hi-res joystick adaptor (none, right, left,\n"
++"                              right-cocomax3, left-cocomax3)\n"
+ "    -ram-org ORG            RAM organisation (-ram-org help for list)\n"
+ "    -ram KBYTES             amount of RAM in K\n"
+ "    -ram-init METHOD        RAM start pattern (-ram-init help for list)\n"

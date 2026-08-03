@@ -1,0 +1,977 @@
+From 20559ec99238055f13efdeeff122e3b9f8f5ee1d Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:00 -0400
+Subject: [PATCH 17/44] trap-actions: -trap-load (blob loader) +
+
+The cycle counter is kept twice: xroar_cpu_cycles counts 6809 bus cycles,
+xroar_master_cycles the same interval in master clock ticks (14.31818MHz),
+summed from the tick count each bus cycle actually consumed. CPU cycles are
+the right unit for almost everything and stay the default, but they are not
+a time on this machine -- a cycle is 16 ticks at 0.89MHz and 8 at 1.79MHz,
+so a count taken across a POKE 65497 converts to nothing at all. Master
+ticks mean the same thing either side of a speed change.
+
+-trap-cycle-master puts a master= field at the FRONT of the
+-trap-cycle-print line and leaves cycles= in place: if you asked for master
+ticks that is the number you came for, and anything matching on the field
+name rather than its position keeps working either way. The ratio between
+the two fields tells you what speed the machine was in.
+-trap-cycle-reset zeroes both counters whether or not the flag is set, so
+the two are always measuring the same interval.
+---
+ portalib/delegate.h        |   2 +
+ src/breakpoint.c           |   6 +-
+ src/breakpoint.h           |  20 +++--
+ src/coco3.c                |  36 +++-----
+ src/debug.h                |   5 ++
+ src/dragon/deluxecoco.c    |   2 +-
+ src/dragon/dragon.c        |  20 +++--
+ src/dragon/dragonpro.c     |   2 +-
+ src/dragon/immunity.c      |   2 +-
+ src/machine.c              |  12 ++-
+ src/machine.h              |   6 +-
+ src/mc10.c                 |  10 +--
+ src/mc6801/mc6801.c        |   6 ++
+ src/mc6809/hd6309.c        |   1 +
+ src/mc6809/mc6809.c        |  11 ++-
+ src/mc6809/mc6809.h        |   1 +
+ src/mc6809/mc6809_common.c |  34 ++++----
+ src/xroar.c                | 166 ++++++++++++++++++++++++++++++++++---
+ src/xroar.h                |  13 +++
+ 19 files changed, 266 insertions(+), 89 deletions(-)
+
+diff --git a/portalib/delegate.h b/portalib/delegate.h
+index 1e4dd90..bd36063 100644
+--- a/portalib/delegate.h
++++ b/portalib/delegate.h
+@@ -60,6 +60,7 @@ typedef DELEGATE_S0(void) DELEGATE_T0(void);
+ typedef DELEGATE_S1(void, bool) DELEGATE_T1(void, bool);
+ typedef DELEGATE_S2(void, bool, uint16_t) DELEGATE_T2(void, bool, uint16);
+ typedef DELEGATE_S2(void, bool, uint32_t) DELEGATE_T2(void, bool, uint32);
++typedef DELEGATE_S3(void, bool, uint32_t, uint8_t) DELEGATE_T3(void, bool, uint32, uint8);
+ typedef DELEGATE_S1(void, int) DELEGATE_T1(void, int);
+ typedef DELEGATE_S2(void, int, bool) DELEGATE_T2(void, int, bool);
+ typedef DELEGATE_S2(void, int, int) DELEGATE_T2(void, int, int);
+@@ -157,6 +158,7 @@ DELEGATE_DEF_PROTO0(void, void);
+ DELEGATE_DEF_PROTO1(void, void, bool, bool);
+ DELEGATE_DEF_PROTO2(void, void, bool, bool, uint16_t, uint16);
+ DELEGATE_DEF_PROTO2(void, void, bool, bool, uint32_t, uint32);
++DELEGATE_DEF_PROTO3(void, void, bool, bool, uint32_t, uint32, uint8_t, uint8);
+ DELEGATE_DEF_PROTO1(void, void, int, int);
+ DELEGATE_DEF_PROTO2(void, void, int, int, bool, bool);
+ DELEGATE_DEF_PROTO2(void, void, int, int, int, int);
+diff --git a/src/breakpoint.c b/src/breakpoint.c
+index 58c9011..5738042 100644
+--- a/src/breakpoint.c
++++ b/src/breakpoint.c
+@@ -125,7 +125,7 @@ void bp_breakpoint_remove(struct bp_breakpoint_set *bbs, int32_t A,
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ bool bp_watchpoint_add(struct bp_watchpoint_set *set, bool RnW, uint32_t Astart,
+-			uint32_t Aend, DELEGATE_T2(void, bool, uint32) handler) {
++			uint32_t Aend, DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct bp_watchpoint **list = &set->list[RnW];
+ 	// Does this watchpoint with this handler already exist?
+ 	for (struct bp_watchpoint *iter = *list; iter; iter = iter->next) {
+@@ -147,7 +147,7 @@ bool bp_watchpoint_add(struct bp_watchpoint_set *set, bool RnW, uint32_t Astart,
+ }
+ 
+ void bp_watchpoint_remove(struct bp_watchpoint_set *set, int RnW, int32_t Astart,
+-			  uint32_t Aend, DELEGATE_T2(void, bool, uint32) handler) {
++			  uint32_t Aend, DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	if (RnW < 0) {
+ 		bp_watchpoint_remove(set, 0, Astart, Aend, handler);
+ 		bp_watchpoint_remove(set, 1, Astart, Aend, handler);
+@@ -173,7 +173,7 @@ void bp_watchpoint_remove(struct bp_watchpoint_set *set, int RnW, int32_t Astart
+ 	}
+ }
+ 
+-extern inline void bp_check_watchpoints(struct bp_watchpoint_set *set, bool RnW, uint32_t A);
++extern inline void bp_check_watchpoints(struct bp_watchpoint_set *set, bool RnW, uint32_t A, uint8_t D);
+ 
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+diff --git a/src/breakpoint.h b/src/breakpoint.h
+index 88b7a8a..b0bbde1 100644
+--- a/src/breakpoint.h
++++ b/src/breakpoint.h
+@@ -32,6 +32,8 @@ struct slist;
+  * Breakpoints.  Trap on execution from address.
+  */
+ 
++// Breakpoint session
++
+ struct bp_breakpoint {
+ 	uint32_t A;
+ 	DELEGATE_T2(void, bool, uint32) handler[BP_HANDLERS_PER_ADDRESS];
+@@ -71,7 +73,7 @@ struct bp_watchpoint {
+ 	struct bp_watchpoint *next;
+ 	uint32_t Astart;
+ 	uint32_t Aend;
+-	DELEGATE_T2(void, bool, uint32) handler;
++	DELEGATE_T3(void, bool, uint32, uint8) handler;
+ };
+ 
+ struct bp_watchpoint_set {
+@@ -82,21 +84,25 @@ struct bp_watchpoint_set {
+ // watchpoint already exists)
+ bool bp_watchpoint_add(struct bp_watchpoint_set *wps, bool Rnw,
+ 			uint32_t Astart, uint32_t Aend,
+-			DELEGATE_T2(void, bool, uint32) handler);
++			DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
+ // Remove specific watchpoint.
+ void bp_watchpoint_remove(struct bp_watchpoint_set *wps, int Rnw,
+ 			  int32_t Astart, uint32_t Aend,
+-			  DELEGATE_T2(void, bool, uint32) handler);
+-
+-// Inlined watchpoint match & dispatch
+-inline void bp_check_watchpoints(struct bp_watchpoint_set *set, bool RnW, uint32_t A) {
++			  DELEGATE_T3(void, bool, uint32, uint8) handler);
++
++// Inlined watchpoint match & dispatch.  D is the byte on the CPU data bus at
++// dispatch time: authoritative for writes (the byte being written), best
++// effort for reads on machines that check before the bus settles.  Carried so
++// value-qualified traps and trap actions can see what moved without a
++// re-read that would hit I/O twice.
++inline void bp_check_watchpoints(struct bp_watchpoint_set *set, bool RnW, uint32_t A, uint8_t D) {
+ 	struct bp_watchpoint *list = set->list[RnW];
+ 	struct bp_watchpoint *next;
+ 	for (struct bp_watchpoint *iter = list; iter; iter = next) {
+ 		next = iter->next;
+ 		if (A >= iter->Astart && A <= iter->Aend) {
+-			DELEGATE_CALL(iter->handler, RnW, A);
++			DELEGATE_CALL(iter->handler, RnW, A, D);
+ 		}
+ 	}
+ }
+diff --git a/src/coco3.c b/src/coco3.c
+index 52ff237..399bc40 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -342,10 +342,10 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+ 				    DELEGATE_T2(void, bool, uint32) handler);
+ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+ 				 uint32_t Astart, uint32_t Aend,
+-				 DELEGATE_T2(void, bool, uint32) handler);
++				 DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void coco3_remove_watchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+-				    DELEGATE_T2(void, bool, uint32) handler);
++				    DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
+ static void keyboard_update(void *sptr);
+ static void joystick_update(void *sptr);
+@@ -1062,27 +1062,6 @@ static int32_t coco3_emustate(void *sptr, const char *name) {
+ 	return -1;
+ }
+ 
+-static void coco3_bp_add_n(struct machine *m, struct machine_bp *list, int n, void *sptr) {
+-	struct coco3 *mcc3 = (struct coco3 *)m;
+-	for (int i = 0; i < n; i++) {
+-		if (list[i].add_cond & BP_CRC_COMBINED)
+-			continue;
+-		if ((list[i].add_cond & BP_CRC_EXT) && (!mcc3->has_secb || !crclist_match(list[i].cond_crc_extbas, mcc3->crc_secb)))
+-			continue;
+-		if (list[i].add_cond & BP_CRC_BAS)
+-			continue;
+-		list[i].bp.handler.sptr = sptr;
+-		bp_add(mcc3->bp_session, &list[i].bp);
+-	}
+-}
+-
+-static void coco3_bp_remove_n(struct machine *m, struct machine_bp *list, int n) {
+-	struct coco3 *mcc3 = (struct coco3 *)m;
+-	for (int i = 0; i < n; i++) {
+-		bp_remove(mcc3->bp_session, &list[i].bp);
+-	}
+-}
+-
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ static void coco3_ui_set_keymap(void *sptr, int tag, void *smsg) {
+@@ -1399,6 +1378,11 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+ static void cpu_cycle(void *sptr, int ncycles, bool RnW, uint16_t A) {
+ 	struct coco3 *mcc3 = sptr;
+ 	mcc3->cycles -= ncycles;
++	xroar_cpu_cycles += 1;  // one call per 6809 bus cycle = one CPU cycle
++	// ncycles is what this bus cycle costs in master clock ticks -- 16 at
++	// 0.89MHz, 8 at 1.79MHz -- so this stays a time even across a speed
++	// change, which the CPU-cycle count above does not.
++	xroar_master_cycles += ncycles;
+ 	if (mcc3->cycles <= 0) mcc3->CPU->running = 0;
+ 	event_run_queue(MACHINE_EVENT_LIST, ncycles);
+ 	MC6809_IRQ_SET(mcc3->CPU, mcc3->PIA0->a.irq | mcc3->PIA0->b.irq | mcc3->GIME->IRQ);
+@@ -1410,7 +1394,7 @@ static void cpu_cycle(void *sptr, int ncycles, bool RnW, uint16_t A) {
+ 		write_byte(mcc3, A);
+ 	}
+ #ifdef WANT_GDB_TARGET
+-	bp_check_watchpoints(&mcc3->watchpoint_set, RnW, A);
++	bp_check_watchpoints(&mcc3->watchpoint_set, RnW, A, mcc3->CPU->D);
+ #endif
+ 	mcc3->GIME->IL1 = (PIA_VALUE_A(mcc3->PIA0) | 0x80) != 0xff;
+ }
+@@ -1497,7 +1481,7 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+ 
+ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+ 				 uint32_t Astart, uint32_t Aend,
+-				 DELEGATE_T2(void, bool, uint32) handler) {
++				 DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct part *p = &m->part;
+ 	struct coco3 *mcc3 = (struct coco3 *)m;
+ 	if (!bp_watchpoint_add(&mcc3->watchpoint_set, RnW, Astart, Aend, handler)) {
+@@ -1507,7 +1491,7 @@ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+ 
+ static void coco3_remove_watchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+-				    DELEGATE_T2(void, bool, uint32) handler) {
++				    DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct coco3 *mcc3 = (struct coco3 *)m;
+ 	bp_watchpoint_remove(&mcc3->watchpoint_set, RnW, Astart, Aend, handler);
+ }
+diff --git a/src/debug.h b/src/debug.h
+index 1f82ab4..083575e 100644
+--- a/src/debug.h
++++ b/src/debug.h
+@@ -55,6 +55,11 @@ struct debug_cpu {
+ 	// Get/set processor flags
+ 	DELEGATE_T1(bool, int) get_flag;
+ 	DELEGATE_T2(void, int, bool) set_flag;
++
++	// Current program counter.  1.11 carried this and the refactor dropped
++	// it; the emuext handlers, trap access context, and the flight recorder
++	// all want the PC without a round trip through the register interface.
++	DELEGATE_T0(unsigned) get_pc;
+ 	// lwasm emulator-extension opcodes (pragma emuext).  Called by the CPU
+ 	// core when it decodes BREAK ($113E) or LOG ($103E).  The machine wires
+ 	// these to route to gdb / stderr; see coco3.c, mc10.c.
+diff --git a/src/dragon/deluxecoco.c b/src/dragon/deluxecoco.c
+index c7addb4..5b1033b 100644
+--- a/src/dragon/deluxecoco.c
++++ b/src/dragon/deluxecoco.c
+@@ -431,7 +431,7 @@ static void deluxecoco_cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+ 	struct dragon *md = &mdp->dragon;
+ 
+ 	// Check watchpoints
+-	bp_check_watchpoints(&md->watchpoint_set, RnW, A);
++	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
+ 
+ 	// SAM decode / timing
+ 	int ncycles = md->SAM->mem_cycle(md->SAM, RnW, A);
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 4b2f89c..9fed50f 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -238,10 +238,10 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+ 				     DELEGATE_T2(void, bool, uint32) handler);
+ static void dragon_add_watchpoint(struct machine *m, bool RnW,
+ 				  uint32_t Astart, uint32_t Aend,
+-				  DELEGATE_T2(void, bool, uint32) handler);
++				  DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ 				     int32_t Astart, uint32_t Aend,
+-				     DELEGATE_T2(void, bool, uint32) handler);
++				     DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
+ static void joystick_update(void *sptr);
+ static void hires_joystick_update(struct dragon *md);
+@@ -673,9 +673,6 @@ void dragon_free_common(struct part *p) {
+ 	if (md->printer_interface) {
+ 		printer_interface_free(md->printer_interface);
+ 	}
+-	if (md->bp_session) {
+-		bp_session_free(md->bp_session);
+-	}
+ 	event_dequeue(&md->hires_joystick_event[0]);
+ 	event_dequeue(&md->hires_joystick_event[1]);
+ 	rombank_free(md->ext_charset);
+@@ -1076,13 +1073,20 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+ 	struct dragon *md = sptr;
+ 
+ 	// Check watchpoints
+-	bp_check_watchpoints(&md->watchpoint_set, RnW, A);
++	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
++	xroar_cpu_cycles += 1;  // one call per 6809 bus cycle = one CPU cycle
+ 
+ 	// SAM decode / timing
+ 	int ncycles = md->SAM->mem_cycle(md->SAM, RnW, A);
+ 
+ 	// Advance clock, collect IRQs
+ 	if (ncycles && !md->clock_inhibit) {
++		// Counted inside the same guard that advances event time, and
++		// with the same figure, so the master count is event time and
++		// not an approximation of it: an inhibited cycle advances
++		// neither. (The CPU count above is deliberately every bus
++		// cycle, inhibited or not.)
++		xroar_master_cycles += ncycles;
+ 		dragon_advance_clock(md, ncycles);
+ 		MC6809_IRQ_SET(md->CPU, md->PIA0->a.irq || md->PIA0->b.irq);
+ 		MC6809_FIRQ_SET(md->CPU, md->PIA1->a.irq || md->PIA1->b.irq);
+@@ -1348,7 +1352,7 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+ 
+ static void dragon_add_watchpoint(struct machine *m, bool RnW,
+ 				  uint32_t Astart, uint32_t Aend,
+-				  DELEGATE_T2(void, bool, uint32) handler) {
++				  DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct part *p = &m->part;
+ 	struct dragon *md = (struct dragon *)m;
+ 	if (!bp_watchpoint_add(&md->watchpoint_set, RnW, Astart, Aend, handler)) {
+@@ -1358,7 +1362,7 @@ static void dragon_add_watchpoint(struct machine *m, bool RnW,
+ 
+ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ 				     int32_t Astart, uint32_t Aend,
+-				     DELEGATE_T2(void, bool, uint32) handler) {
++				     DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct dragon *md = (struct dragon *)m;
+ 	bp_watchpoint_remove(&md->watchpoint_set, RnW, Astart, Aend, handler);
+ }
+diff --git a/src/dragon/dragonpro.c b/src/dragon/dragonpro.c
+index 2b611a8..2435624 100644
+--- a/src/dragon/dragonpro.c
++++ b/src/dragon/dragonpro.c
+@@ -480,7 +480,7 @@ static void dragonpro_cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+ 	struct dragon *md = &mdp->dragon;
+ 
+ 	// Check watchpoints
+-	bp_check_watchpoints(&md->watchpoint_set, RnW, A);
++	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
+ 
+ 	// SAM decode / timing
+ 	int ncycles = md->SAM->mem_cycle(md->SAM, RnW, A);
+diff --git a/src/dragon/immunity.c b/src/dragon/immunity.c
+index f93ce22..bb4ac28 100644
+--- a/src/dragon/immunity.c
++++ b/src/dragon/immunity.c
+@@ -155,7 +155,7 @@ void immunity_cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+ 	uint32_t addr = (uint32_t)A;
+ 
+ 	// Check watchpoints based on untransformed address
+-	bp_check_watchpoints(&md->watchpoint_set, RnW, A);
++	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
+ 
+ 	if (A >= 0xffa0 && A <= 0xffaf) { // MMU registers
+ 		if (RnW)
+diff --git a/src/machine.c b/src/machine.c
+index dac8ed5..99eb9c0 100644
+--- a/src/machine.c
++++ b/src/machine.c
+@@ -497,11 +497,19 @@ void machine_remove_hbreak(struct machine *m, int32_t A) {
+ 	machine_remove_breakpoint(m, A, DELEGATE_AS2(void, bool, uint32, machine_trap_handler, m));
+ }
+ 
++// Watchpoint flavour of machine_trap_handler: same action, but watchpoint
++// handlers carry the accessed byte.
++static void machine_trap_whandler(void *sptr, bool RnW, uint32_t A, uint8_t D) {
++	(void)RnW; (void)A; (void)D;
++	struct machine *m = sptr;
++	m->signal(m, MACHINE_SIGTRAP);
++}
++
+ void machine_add_hwatch(struct machine *m, bool RnW, uint32_t Astart, uint32_t Aend) {
+-	machine_add_watchpoint(m, RnW, Astart, Aend, DELEGATE_AS2(void, bool, uint32, machine_trap_handler, m));
++	machine_add_watchpoint(m, RnW, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
+ }
+ 
+ void machine_remove_hwatch(struct machine *m, int RnW, int32_t Astart, uint32_t Aend) {
+-	machine_remove_watchpoint(m, RnW, Astart, Aend, DELEGATE_AS2(void, bool, uint32, machine_trap_handler, m));
++	machine_remove_watchpoint(m, RnW, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
+ }
+ #endif
+diff --git a/src/machine.h b/src/machine.h
+index 1054a42..d9c4cfc 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -238,13 +238,13 @@ struct machine {
+ 		// Add a watchpoint
+ 		void (*add_watchpoint)(struct machine *, bool RnW,
+ 				       uint32_t Astart, uint32_t Aend,
+-				       DELEGATE_T2(void, bool, uint32) handler);
++				       DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
+ 		// Remove a watchpoint, wildcard matching similar to breakpoints,
+ 		// though only Astart < 0 is checked.
+ 		void (*remove_watchpoint)(struct machine *, int RnW,
+ 					  int32_t Astart, uint32_t Aend,
+-					  DELEGATE_T2(void, bool, uint32) handler);
++					  DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
+ 		// CPU debug information copied from main CPU (the one that
+ 		// would be debugged)
+@@ -297,7 +297,7 @@ void machine_remove_hbreak(struct machine *m, int32_t A);
+ #define machine_add_watchpoint(m,rnw,as,ae,h) (m)->debug.add_watchpoint((m), (rnw), (as), (ae), (h))
+ #define machine_remove_watchpoint(m,rnw,as,ae,h) (m)->debug.remove_watchpoint((m), (rnw), (as), (ae), (h))
+ 
+-#define machine_remove_watchpoint_all(m,s) machine_remove_watchpoint((m), -1, 0, DELEGATE_AS2(void, bool, uint32, NULL, (s)))
++#define machine_remove_watchpoint_all(m,s) machine_remove_watchpoint((m), -1, 0, DELEGATE_AS3(void, bool, uint32, uint8, NULL, (s)))
+ 
+ #ifdef WANT_GDB_TARGET
+ void machine_add_hwatch(struct machine *m, bool RnW, uint32_t Astart, uint32_t Aend);
+diff --git a/src/mc10.c b/src/mc10.c
+index f38847e..b66668e 100644
+--- a/src/mc10.c
++++ b/src/mc10.c
+@@ -209,10 +209,10 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+ 				   DELEGATE_T2(void, bool, uint32) handler);
+ static void mc10_add_watchpoint(struct machine *m, bool RnW,
+ 				uint32_t Astart, uint32_t Aend,
+-				DELEGATE_T2(void, bool, uint32) handler);
++				DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void mc10_remove_watchpoint(struct machine *m, int RnW,
+ 				   int32_t Astart, uint32_t Aend,
+-				   DELEGATE_T2(void, bool, uint32) handler);
++				   DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
+ static void mc10_vdg_fs(void *sptr, bool level);
+ static void mc10_vdg_render_line(void *sptr, unsigned burst, unsigned npixels, uint8_t const *data);
+@@ -904,7 +904,7 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+ 
+ static void mc10_add_watchpoint(struct machine *m, bool RnW,
+ 				  uint32_t Astart, uint32_t Aend,
+-				  DELEGATE_T2(void, bool, uint32) handler) {
++				  DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct part *p = &m->part;
+ 	struct mc10 *mp = (struct mc10 *)m;
+ 	if (!bp_watchpoint_add(&mp->watchpoint_set, RnW, Astart, Aend, handler)) {
+@@ -914,7 +914,7 @@ static void mc10_add_watchpoint(struct machine *m, bool RnW,
+ 
+ static void mc10_remove_watchpoint(struct machine *m, int RnW,
+ 				     int32_t Astart, uint32_t Aend,
+-				     DELEGATE_T2(void, bool, uint32) handler) {
++				     DELEGATE_T3(void, bool, uint32, uint8) handler) {
+ 	struct mc10 *mp = (struct mc10 *)m;
+ 	bp_watchpoint_remove(&mp->watchpoint_set, RnW, Astart, Aend, handler);
+ }
+@@ -1076,7 +1076,7 @@ static void mc10_mem_cycle(void *sptr, bool RnW, uint16_t A) {
+ 		}
+ 	}
+ #ifdef WANT_GDB_TARGET
+-	bp_check_watchpoints(&mp->watchpoint_set, RnW, A);
++	bp_check_watchpoints(&mp->watchpoint_set, RnW, A, mp->CPU->D);
+ #endif
+ 
+ 	int ncycles = 16;
+diff --git a/src/mc6801/mc6801.c b/src/mc6801/mc6801.c
+index 43ac7e5..0007e31 100644
+--- a/src/mc6801/mc6801.c
++++ b/src/mc6801/mc6801.c
+@@ -139,6 +139,11 @@ static void mc6801_set_register(void *sptr, int n, uint32_t v);
+ 
+ // Debug interface: CC manipulation
+ 
++static unsigned mc6801_get_pc(void *sptr) {
++	struct MC6801 *cpu = sptr;
++	return cpu->reg_pc;
++}
++
+ static bool mc6801_get_flag(void *sptr, int n);
+ static void mc6801_set_flag(void *sptr, int n, bool v);
+ 
+@@ -259,6 +264,7 @@ static struct part *mc6801_allocate(void) {
+ 	cpu->debug.cpu.register_ps = 0;  // CC
+ 	cpu->debug.cpu.register_sp = 4;  // SP
+ 	cpu->debug.cpu.register_pc = 5;  // PC
++	cpu->debug.cpu.get_pc = DELEGATE_AS0(unsigned, mc6801_get_pc, cpu);
+ 	cpu->debug.cpu.get_flag = DELEGATE_AS1(bool, int, mc6801_get_flag, cpu);
+ 	cpu->debug.cpu.set_flag = DELEGATE_AS2(void, int, bool, mc6801_set_flag, cpu);
+ 
+diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
+index 1e12781..7d1bfaa 100644
+--- a/src/mc6809/hd6309.c
++++ b/src/mc6809/hd6309.c
+@@ -218,6 +218,7 @@ static struct part *hd6309_allocate(void) {
+ 	cpu->debug.cpu.register_ps = 0;  // CC
+ 	cpu->debug.cpu.register_sp = 7;  // S
+ 	cpu->debug.cpu.register_pc = 8;  // PC
++	cpu->debug.cpu.get_pc = DELEGATE_AS0(unsigned, mc6809_get_pc, cpu);
+ 	cpu->debug.cpu.get_flag = DELEGATE_AS1(bool, int, mc6809_get_flag, cpu);
+ 	cpu->debug.cpu.set_flag = DELEGATE_AS2(void, int, bool, mc6809_set_flag, cpu);
+ 
+diff --git a/src/mc6809/mc6809.c b/src/mc6809/mc6809.c
+index e136ee0..0042d40 100644
+--- a/src/mc6809/mc6809.c
++++ b/src/mc6809/mc6809.c
+@@ -196,6 +196,7 @@ static struct part *mc6809_allocate(void) {
+ 	cpu->debug.cpu.register_ps = 0;  // CC
+ 	cpu->debug.cpu.register_sp = 7;  // S
+ 	cpu->debug.cpu.register_pc = 8;  // PC
++	cpu->debug.cpu.get_pc = DELEGATE_AS0(unsigned, mc6809_get_pc, cpu);
+ 	cpu->debug.cpu.get_flag = DELEGATE_AS1(bool, int, mc6809_get_flag, cpu);
+ 	cpu->debug.cpu.set_flag = DELEGATE_AS2(void, int, bool, mc6809_set_flag, cpu);
+ 
+@@ -1318,7 +1319,7 @@ static void mc6809_run(struct MC6809 *cpu) {
+ 			// 0x103e LOG (emuext) / SWI2 inherent, illegal
+ 			case 0x023e:
+ 				mc6809_emuext_log(cpu);
+-				if (cpu->debug_cpu.emuext)
++				if (cpu->debug.cpu.emuext)
+ 					break;
+ 				// -emuext off: native illegal behaviour (no live patch)
+ 				peek_byte(cpu, REG_PC);
+@@ -1338,7 +1339,7 @@ static void mc6809_run(struct MC6809 *cpu) {
+ 			// 0x113e BREAK (emuext) / FIRQ inherent, illegal [hoglet67]
+ 			case 0x033e:
+ 				mc6809_emuext_break(cpu);
+-				if (cpu->debug_cpu.emuext)
++				if (cpu->debug.cpu.emuext)
+ 					break;
+ 				// -emuext off: native illegal behaviour (no live patch)
+ 				peek_byte(cpu, REG_PC);
+@@ -1607,6 +1608,12 @@ const struct debug_feature m6809_core_feature = {
+ 	ARRAY_N_ELEMENTS(feature_regs), feature_regs
+ };
+ 
++
++unsigned mc6809_get_pc(void *sptr) {
++	struct MC6809 *cpu = sptr;
++	return cpu->reg_pc;
++}
++
+ static uint32_t mc6809_get_register(void *sptr, int r) {
+ 	struct MC6809 *cpu = sptr;
+ 	switch (r) {
+diff --git a/src/mc6809/mc6809.h b/src/mc6809/mc6809.h
+index ba6b6fe..6a13e4e 100644
+--- a/src/mc6809/mc6809.h
++++ b/src/mc6809/mc6809.h
+@@ -153,6 +153,7 @@ bool mc6809_is_a(struct part *p, const char *name);
+ void mc6809_init_debug_info(struct MC6809 *cpu);
+ extern const struct debug_feature m6809_core_feature;
+ bool mc6809_get_flag(void *sptr, int n);
++unsigned mc6809_get_pc(void *sptr);
+ void mc6809_set_flag(void *sptr, int n, bool v);
+ 
+ #endif
+diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
+index 296960d..419fcd1 100644
+--- a/src/mc6809/mc6809_common.c
++++ b/src/mc6809/mc6809_common.c
+@@ -107,8 +107,8 @@ static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
+ 
+ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 	uint16_t p = REG_PC;             // cursor over operands; REG_PC untouched
+-	uint16_t fmt = DELEGATE_CALL(cpu->debug_cpu.debug_read, p) << 8; p++;
+-	fmt |= DELEGATE_CALL(cpu->debug_cpu.debug_read, p); p++;
++	uint16_t fmt = DELEGATE_CALL(cpu->debug.cpu.debug_read, p) << 8; p++;
++	fmt |= DELEGATE_CALL(cpu->debug.cpu.debug_read, p); p++;
+ 
+ 	char out[1024];
+ 	unsigned o = 0;
+@@ -116,7 +116,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 	_Bool has_conv = 0;
+ 
+ 	for (unsigned i = 0; i < 256 && o < sizeof(out) - 1; i++) {
+-		uint8_t c = DELEGATE_CALL(cpu->debug_cpu.debug_read, fmt + i);
++		uint8_t c = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + i);
+ 		if (c == 0) { terminated = 1; break; }
+ 
+ 		// ${name}: read CPU/machine state directly, consumes NO argument
+@@ -126,13 +126,13 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 		//   cycles      event_current_tick -> decimal
+ 		// A bare '$' not followed by '{' is emitted literally.
+ 		if (c == '$') {
+-			uint8_t n1 = DELEGATE_CALL(cpu->debug_cpu.debug_read, fmt + i + 1);
++			uint8_t n1 = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + i + 1);
+ 			if (n1 != '{') { out[o++] = c; continue; }  // literal $
+ 			char name[16];
+ 			unsigned nl = 0;
+ 			unsigned j = i + 2;
+ 			while (j < 256 && nl < sizeof(name) - 1) {
+-				uint8_t nc = DELEGATE_CALL(cpu->debug_cpu.debug_read, fmt + j);
++				uint8_t nc = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + j);
+ 				if (nc == '}' || nc == 0) break;
+ 				name[nl++] = nc;
+ 				j++;
+@@ -154,10 +154,10 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 			else if (0 == strcmp(name, "s"))   snprintf(piece, sizeof(piece), "%04x", REG_S);
+ 			else if (0 == strcmp(name, "pc"))  snprintf(piece, sizeof(piece), "%04x", REG_PC);
+ 			else if (0 == strcmp(name, "cycles")) snprintf(piece, sizeof(piece), "%u", (unsigned)event_current_tick);
+-			else if (cpu->debug_cpu.state_read.func) {
++			else if (cpu->debug.cpu.state_read.func) {
+ 				// xpc/paddr/block/task -- machine-specific, routed via a
+ 				// named state delegate wired in coco3.c.
+-				int32_t sv = DELEGATE_CALL(cpu->debug_cpu.state_read, name);
++				int32_t sv = DELEGATE_CALL(cpu->debug.cpu.state_read, name);
+ 				if (sv < 0)
+ 					snprintf(piece, sizeof(piece), "${%s}", name);  // unknown: echo back
+ 				else if (0 == strcmp(name, "xpc") || 0 == strcmp(name, "paddr"))
+@@ -178,18 +178,18 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 		uint8_t cv = 0;
+ 		for (;;) {
+ 			i++;
+-			cv = (i < 256) ? DELEGATE_CALL(cpu->debug_cpu.debug_read, fmt + i) : 0;
++			cv = (i < 256) ? DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + i) : 0;
+ 			if (cv == 'h') { hcount++; continue; }
+ 			break;
+ 		}
+ 		if (cv == '%') { out[o++] = '%'; continue; }  // literal %, no arg
+ 		has_conv = 1;
+ 
+-		uint16_t ap = DELEGATE_CALL(cpu->debug_cpu.debug_read, p) << 8; p++;
+-		ap |= DELEGATE_CALL(cpu->debug_cpu.debug_read, p); p++;
++		uint16_t ap = DELEGATE_CALL(cpu->debug.cpu.debug_read, p) << 8; p++;
++		ap |= DELEGATE_CALL(cpu->debug.cpu.debug_read, p); p++;
+ 		unsigned width = (hcount >= 2) ? 1 : 2;  // hh = 8-bit, h/none = 16-bit
+-		uint32_t v = DELEGATE_CALL(cpu->debug_cpu.debug_read, ap);
+-		if (width == 2) v = (v << 8) | DELEGATE_CALL(cpu->debug_cpu.debug_read, ap + 1);
++		uint32_t v = DELEGATE_CALL(cpu->debug.cpu.debug_read, ap);
++		if (width == 2) v = (v << 8) | DELEGATE_CALL(cpu->debug.cpu.debug_read, ap + 1);
+ 
+ 		char piece[300];
+ 		switch (cv) {
+@@ -205,7 +205,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 		case 's': {
+ 			unsigned q = 0;
+ 			for (unsigned k = 0; k < sizeof(piece) - 1 && k < 256; k++) {
+-				uint8_t sc = DELEGATE_CALL(cpu->debug_cpu.debug_read, ap + k);
++				uint8_t sc = DELEGATE_CALL(cpu->debug.cpu.debug_read, ap + k);
+ 				if (!sc) break;
+ 				piece[q++] = sc;
+ 			}
+@@ -226,20 +226,20 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 	}
+ 	out[o] = 0;
+ 
+-	if (cpu->debug_cpu.emuext) {
++	if (cpu->debug.cpu.emuext) {
+ 		// enabled: consume operands, emit (machine adds gdb mirror)
+ 		REG_PC = p;
+ 		if (terminated)
+-			DELEGATE_SAFE_CALL(cpu->debug_cpu.instruction_log, out);
++			DELEGATE_SAFE_CALL(cpu->debug.cpu.instruction_log, out);
+ 	} else if (terminated && has_conv) {
+ 		// disabled: echo a genuine LOG, but leave PC at the operands so
+ 		// the program runs into them and fails -- no live patch
+-		DELEGATE_SAFE_CALL(cpu->debug_cpu.instruction_log, out);
++		DELEGATE_SAFE_CALL(cpu->debug.cpu.instruction_log, out);
+ 	}
+ }
+ 
+ static void mc6809_emuext_break(struct MC6809 *cpu) {
+-	DELEGATE_SAFE_CALL(cpu->debug_cpu.instruction_break);
++	DELEGATE_SAFE_CALL(cpu->debug.cpu.instruction_break);
+ }
+ 
+ /*
+diff --git a/src/xroar.c b/src/xroar.c
+index a2b9ee6..6bffbfc 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -107,6 +107,9 @@ struct xroar xroar = {
+ 	},
+ };
+ 
++uint64_t xroar_cpu_cycles = 0;
++uint64_t xroar_master_cycles = 0;
++
+ #ifdef WANT_TRAPS
+ 
+ // Traps
+@@ -128,10 +131,21 @@ struct trap_def {
+ 	char *timeout;
+ 	int trace;
+ 	int no_trace;
++	int cycle_reset;    // reset CPU cycle counter when trap fires
++	int cycle_print;    // print CPU cycle counter when trap fires
++	char *load_spec;    // -trap-load FILE[,opts]; see load_blob()
+ 
+ 	// Internal
+ 	unsigned long counter;
++	long match_value;   // value= qualifier for write traps, or -1 for none
+ 	struct xroar_timeout *timeout_data;
++	// Context of the access that fired a WATCH trap, recorded by
++	// handle_trap_watch() before the shared handler runs.  wp_ctx says the
++	// fields are live for this dispatch; pc/breakpoint traps leave it 0.
++	bool wp_ctx;
++	unsigned wp_pc;
++	unsigned wp_addr;
++	uint8_t wp_value;
+ };
+ 
+ static unsigned num_trap_defs = 0;
+@@ -144,9 +158,13 @@ static struct slist *tape_motor_traps = NULL;
+ 
+ static void set_trap(const char *);
+ static void set_trap_count(const char *);
++static void set_trap_cycle_reset(void);
++static void set_trap_cycle_print(void);
++static void set_trap_cycle_print_reset(void);
+ 
+ static void handle_trap(void *);
+ static void handle_trap_new(void *, bool RnW, uint32_t A);
++static void handle_trap_watch(void *, bool RnW, uint32_t A, uint8_t D);
+ static void enable_all_traps(void);
+ static void disable_all_traps(void);
+ 
+@@ -292,6 +310,10 @@ struct private_cfg {
+ 		struct trap_def trap_def;
+ #endif
+ 		bool ratelimit;
++		// -trap-cycle-master: -trap-cycle-print also reports master clock
++		// ticks. Off by default -- CPU cycles are what most measurements
++		// want, and an extra field in a parsed line is not free.
++		bool cycle_master;
+ 	} debug;
+ 
+ #ifndef HAVE_WASM
+@@ -3198,10 +3220,10 @@ static void parse_range_ul(const char *str, unsigned long *a, unsigned long *b)
+ 	char *bstr = str_copy;
+ 	char *astr = strsep(&bstr, "-");
+ 	if (a && astr && *astr) {
+-		*a = strtoul(astr, NULL, 0);
++		*a = parse_num_ul(astr);
+ 	}
+ 	if (b && bstr && *bstr) {
+-		*b = strtoul(bstr, NULL, 0);
++		*b = parse_num_ul(bstr);
+ 	}
+ 	free(str_copy);
+ }
+@@ -3225,6 +3247,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 	char *cond_copy = xstrdup(trap->cond);
+ 	char *val = cond_copy;
+ 	char *key = strsep(&val, "=");
++
++	// Optional ",value=VALUE" qualifier.  Only meaningful for write traps;
++	// any other key combined with value= is an error.
++	trap->match_value = -1;
++	if (val) {
++		char *vq = strchr(val, ',');
++		if (vq) {
++			*vq++ = 0;  // terminate the address part at the comma
++			char *vkey = strsep(&vq, "=");
++			if (!vkey || 0 != c_strcasecmp(vkey, "value") || !vq || !*vq) {
++				if (enable)
++					LOG_MOD_WARN("trap", "%s: malformed value= qualifier\n", trap->cond);
++				free(cond_copy);
++				return;
++			}
++			if (!key || 0 != c_strcasecmp(key, "write")) {
++				if (enable)
++					LOG_MOD_WARN("trap", "%s: value= is only valid with write=\n", trap->cond);
++				free(cond_copy);
++				return;
++			}
++			trap->match_value = (long)(parse_num_ul(vq) & 0xff);
++		}
++	}
++
+ 	if (key && *key && val && *val) {
+ 		unsigned long a = -1UL, b = -1UL;
+ 		parse_range_ul(val, &a, &b);
+@@ -3246,23 +3293,23 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 				}
+ 			} else if (0 == c_strcasecmp(key, "read")) {
+ 				if (enable) {
+-					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
++					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+ 				} else {
+-					machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
++					machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+ 				}
+ 			} else if (0 == c_strcasecmp(key, "write")) {
+ 				if (enable) {
+-					machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
++					machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+ 				} else {
+-					machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
++					machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+ 				}
+ 			} else if (0 == c_strcasecmp(key, "access")) {
+ 				if (enable) {
+-					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
+-					machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
++					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+ 				} else {
+-					machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
+-					machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
++					machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+ 				}
+ 			}
+ 		}
+@@ -3282,15 +3329,39 @@ static void disable_all_traps(void) {
+ 	}
+ }
+ 
+-// Temporarily wrap handle_trap() until we modernise watchpoints too
++// Breakpoint (pc=) dispatch: no access context to record.
+ static void handle_trap_new(void *sptr, bool RnW, uint32_t A) {
+ 	(void)RnW;
+ 	(void)A;
+-	handle_trap(sptr);
++	struct trap_def *trap = sptr;
++	trap->wp_ctx = 0;
++	handle_trap(trap);
++}
++
++// Watchpoint (read=/write=/access=) dispatch: record the address, the byte
++// that was on the bus, and the PC, so value-qualified traps and trap actions
++// can see what moved.
++static void handle_trap_watch(void *sptr, bool RnW, uint32_t A, uint8_t D) {
++	(void)RnW;
++	struct trap_def *trap = sptr;
++	trap->wp_ctx = 1;
++	trap->wp_addr = A;
++	trap->wp_value = D;
++	trap->wp_pc = DELEGATE_CALL(xroar.machine->debug.cpu.get_pc);
++	handle_trap(trap);
+ }
+ 
+ static void handle_trap(void *sptr) {
+ 	struct trap_def *trap = sptr;
++
++	// Value-qualified write trap: only fire when the byte that hit the bus
++	// matches exactly.  Checked before the counter so a non-matching write
++	// does not consume a one-shot.
++	if (trap->match_value >= 0 && trap->wp_ctx &&
++	    trap->wp_value != (uint8_t)trap->match_value) {
++		return;
++	}
++
+ 	struct trap_count_range *range = trap->count ? trap->count->data : NULL;
+ 	++trap->counter;
+ 	if (range && trap->counter < range->first) {
+@@ -3315,6 +3386,37 @@ static void handle_trap(void *sptr) {
+ 		xroar_set_trace(0, 0);
+ 	}
+ 
++	// Cycle counter actions.  Print before reset so -trap-cycle-print-reset
++	// reports the elapsed count and then zeroes it.  The reset/print is
++	// taken at the point the trapped write reaches the bus, so probe
++	// overhead is consistent and can be subtracted if needed.
++	if (trap->cycle_print) {
++		unsigned pc = trap->wp_ctx ? trap->wp_pc : 0;
++		unsigned addr = trap->wp_ctx ? trap->wp_addr : 0;
++		unsigned value = trap->wp_ctx ? trap->wp_value : 0;
++		if (private_cfg.debug.cycle_master) {
++			// master= leads: if you asked for it, it is the number you
++			// came for. cycles= stays, so anything matching on the
++			// field name rather than the position keeps working.
++			LOG_MOD_PRINT("trap-cycle-print", "master=%llu cycles=%llu pc=0x%04X addr=0x%04X value=0x%02X\n",
++				      (unsigned long long)xroar_master_cycles,
++				      (unsigned long long)xroar_cpu_cycles,
++				      pc, addr & 0xffff, value & 0xff);
++		} else {
++			LOG_MOD_PRINT("trap-cycle-print", "cycles=%llu pc=0x%04X addr=0x%04X value=0x%02X\n",
++				      (unsigned long long)xroar_cpu_cycles, pc, addr & 0xffff, value & 0xff);
++		}
++	}
++	if (trap->cycle_reset) {
++		// Both counters, always, so the two are measuring the same
++		// interval whichever one -trap-cycle-master makes you read.
++		xroar_cpu_cycles = 0;
++		xroar_master_cycles = 0;
++	}
++	if (trap->load_spec) {
++		load_blob(trap->load_spec);
++	}
++
+ 	if (range) {
+ 		if (range->last == (unsigned long)-1) {
+ 			// Unlimited - don't remove breakpoint
+@@ -3336,6 +3438,19 @@ static void handle_trap(void *sptr) {
+ 	enable_trap(trap, 0);
+ }
+ 
++static void set_trap_cycle_reset(void) {
++	private_cfg.debug.trap_def.cycle_reset = 1;
++}
++
++static void set_trap_cycle_print(void) {
++	private_cfg.debug.trap_def.cycle_print = 1;
++}
++
++static void set_trap_cycle_print_reset(void) {
++	private_cfg.debug.trap_def.cycle_print = 1;
++	private_cfg.debug.trap_def.cycle_reset = 1;
++}
++
+ static void set_trap(const char *cond) {
+ 	if (cur_trap_def) {
+ 		if (private_cfg.debug.trap_def.count) {
+@@ -3368,6 +3483,19 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->no_trace = private_cfg.debug.trap_def.no_trace;
+ 			private_cfg.debug.trap_def.no_trace = -1;
+ 		}
++		if (private_cfg.debug.trap_def.cycle_reset) {
++			cur_trap_def->cycle_reset = 1;
++			private_cfg.debug.trap_def.cycle_reset = 0;
++		}
++		if (private_cfg.debug.trap_def.cycle_print) {
++			cur_trap_def->cycle_print = 1;
++			private_cfg.debug.trap_def.cycle_print = 0;
++		}
++		if (private_cfg.debug.trap_def.load_spec) {
++			free(cur_trap_def->load_spec);
++			cur_trap_def->load_spec = private_cfg.debug.trap_def.load_spec;
++			private_cfg.debug.trap_def.load_spec = NULL;
++		}
+ 	}
+ 	if (cond) {
+ 		unsigned i = num_trap_defs++;
+@@ -3377,6 +3505,7 @@ static void set_trap(const char *cond) {
+ 		cur_trap_def->cond = xstrdup(cond);
+ 		cur_trap_def->trace = -1;
+ 		cur_trap_def->no_trace = -1;
++		cur_trap_def->match_value = -1;
+ 	}
+ }
+ 
+@@ -3621,6 +3750,11 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT0("trap-trace", &private_cfg.debug.trap_def.trace) },
+ 	{ XC_SET_INT("trap-trace-n", &private_cfg.debug.trap_def.trace) },
+ 	{ XC_SET_INT1("trap-no-trace", &private_cfg.debug.trap_def.no_trace) },
++	{ XC_CALL_NONE("trap-cycle-reset", &set_trap_cycle_reset) },
++	{ XC_CALL_NONE("trap-cycle-print", &set_trap_cycle_print) },
++	{ XC_CALL_NONE("trap-cycle-print-reset", &set_trap_cycle_print_reset) },
++	{ XC_SET_BOOL("trap-cycle-master", &private_cfg.debug.cycle_master) },
++	{ XC_SET_STRING("trap-load", &private_cfg.debug.trap_def.load_spec) },
+ 	// All now handled with traps:
+ 	{ XC_CALL_STRING("snap-motoroff", &set_snap_motoroff) },
+ 	{ XC_CALL_STRING("timeout", &set_timeout) },
+@@ -3856,13 +3990,19 @@ static void helptext(void) {
+ "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
+ "  -q, -quiet            equivalent to -verbose 0\n"
+ #ifdef WANT_TRAPS
+-"  -trap CONDITION       configure trap\n"
++"  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
+ "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
+ "    -trap-snap FILE     write snapshot at trap\n"
+ "    -trap-timeout N     quit emulator N seconds after trap\n"
+ "    -trap-trace         start trace mode at trap\n"
+ "    -trap-trace-n N     start trace mode at trap for N instructions\n"
+ "    -trap-no-trace      stop trace mode at trap\n"
++"    -trap-cycle-reset   reset CPU cycle counter at trap\n"
++"    -trap-cycle-print   print CPU cycle counter at trap\n"
++"    -trap-cycle-print-reset  print then reset CPU cycle counter at trap\n"
++"  -trap-cycle-master    -trap-cycle-print also reports master clock ticks\n"
++"                          (14.31818MHz; survives a CPU speed change)\n"
++"    -trap-load FILE[,opts]   load FILE when trap fires; opts: format= addr= max=\n"
+ "  -timeout N            run for N seconds then quit\n"
+ "  -timeout-motoroff N   quit N seconds after tape motor switches off\n"
+ "  -snap-motoroff FILE   write a snapshot each time tape motor switches off\n"
+diff --git a/src/xroar.h b/src/xroar.h
+index 973edc2..6fa67ef 100644
+--- a/src/xroar.h
++++ b/src/xroar.h
+@@ -184,6 +184,19 @@ struct xroar {
+ 
+ extern struct xroar xroar;
+ 
++// Free-running count of emulated CPU bus cycles, summed on the real 6809
++// memory-cycle path.  Used by the -trap-cycle-* trap actions.  Not a wall
++// clock and not reset on machine reset; reset explicitly via a trap action.
++extern uint64_t xroar_cpu_cycles;
++
++// The same interval counted in master clock ticks (EVENT_TICK_RATE, 14.31818
++// MHz) instead of CPU cycles, summed from the tick count each bus cycle
++// consumed.  This is the one that means the same thing either side of a speed
++// change: a CPU cycle is 16 ticks at 0.89MHz and 8 at 1.79MHz, so a CPU-cycle
++// count taken across a POKE 65497 does not convert to a time.  Reported by
++// -trap-cycle-print when -trap-cycle-master is set.
++extern uint64_t xroar_master_cycles;
++
+ #define UI_EVENT_LIST xroar.ui_events
+ #define MACHINE_EVENT_LIST xroar.machine_events
+ 

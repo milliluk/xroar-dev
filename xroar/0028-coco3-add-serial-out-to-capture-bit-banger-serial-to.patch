@@ -1,0 +1,335 @@
+From 115af56bed730d70b9e6e88d9a33192a86d93390 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:24 -0400
+Subject: [PATCH 28/44] coco3: add -serial-out to capture bit-banger serial to
+
+---
+ src/coco3.c         | 105 +++++++++++++++++++++++++++++++++++++++++++-
+ src/gdb.c           |  32 ++++++++++++++
+ src/mc6809/mc6809.c |  12 +++++
+ src/mc6809/mc6809.h |   1 +
+ src/xroar.c         |  15 +++++++
+ 5 files changed, 164 insertions(+), 1 deletion(-)
+
+diff --git a/src/coco3.c b/src/coco3.c
+index 5d76af3..55d5952 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -23,6 +23,7 @@
+ 
+ #include <assert.h>
+ #include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
+@@ -39,6 +40,7 @@
+ #include "cart.h"
+ #include "crc32.h"
+ #include "crclist.h"
++#include "events.h"
+ #include "gdb.h"
+ #include "joystick.h"
+ #include "keyboard.h"
+@@ -79,6 +81,12 @@
+ // Measured peak-to-peak voltages: 0V, 1V, 1.6V, 2V.  Scaled here:
+ static float rgb_intensity_map[4] = { 0.000, 0.460, 0.736, 0.920 };
+ 
++// -serial-out FILE: capture CoCo serial (bit-banger, PIA1-A bit 1) output to a
++// file.  Set by the xroar.c option table.  -serial-out-baud sets the assumed
++// bit rate (default 600, the CoCo single-speed rate).
++char *coco3_serial_out_file = NULL;
++int coco3_serial_out_baud = 600;
++
+ // The GIME appears to generate its composite output (used in NTSC machines
+ // only) by switching between a set of 7 voltages at 3.58Mhz (presumably with
+ // R/C net to smooth to almost-but-not-quite sine waves).  AFAICT there is no
+@@ -211,6 +219,18 @@ struct coco3 {
+ 	uint32_t joystick_dac_start;
+ 	uint32_t joystick_dac_target;
+ 	event_ticks joystick_dac_transition_tick;
++	// -serial-out: signal-level tap on the serial bit-banger (PIA1-A bit 1).
++	// Decodes 8N1 frames relative to the idle (mark) level captured at each
++	// start edge, so it is independent of output driver polarity.
++	struct {
++		FILE *stream;            // capture file, or NULL if disabled
++		struct event sample_event;
++		event_ticks bit_ticks;   // master ticks per serial bit
++		uint8_t line;            // last seen TxD level (PIA1-A bit 1)
++		uint8_t idle;            // mark level captured at the start edge
++		uint8_t data;            // byte being assembled (LSB first)
++		int bit;                 // -2 start check; -1 idle; 0..7 data; 8 stop
++	} serial_out;
+ };
+ 
+ #define COCO3_SER_RAM           (2)
+@@ -398,6 +418,7 @@ static void pia0a_data_postwrite(void *sptr);
+ 
+ #define pia1a_data_preread NULL
+ static void pia1a_data_postwrite(void *sptr);
++static void coco3_serial_sample(void *sptr);
+ static void pia1a_control_postwrite(void *sptr);
+ #define pia1b_data_preread NULL
+ static void pia1b_data_postwrite(void *sptr);
+@@ -794,6 +815,21 @@ static bool coco3_finish(struct part *p) {
+ 
+ 	mcc3->dat.readable = 1;
+ 
++	// -serial-out: open the capture file and arm the bit-banger tap.
++	if (coco3_serial_out_file) {
++		mcc3->serial_out.stream = fopen(coco3_serial_out_file, "ab");
++		if (!mcc3->serial_out.stream) {
++			LOG_MOD_WARN("coco3", "-serial-out: cannot open '%s'\n", coco3_serial_out_file);
++		} else {
++			int baud = coco3_serial_out_baud > 0 ? coco3_serial_out_baud : 600;
++			mcc3->serial_out.bit_ticks = (event_ticks)(EVENT_TICK_RATE / (unsigned)baud);
++			mcc3->serial_out.bit = -1;
++			mcc3->serial_out.line = (PIA_VALUE_A(mcc3->PIA1) >> 1) & 1;
++			event_init(&mcc3->serial_out.sample_event, MACHINE_EVENT_LIST,
++			           DELEGATE_AS0(void, coco3_serial_sample, mcc3));
++		}
++	}
++
+ 	tcc1014_notify_mode(mcc3->GIME);
+ 
+ 	return 1;
+@@ -817,6 +853,11 @@ static void coco3_free(struct part *p) {
+ 	machine_remove_breakpoint_all(&mcc3->public, mcc3);
+ 	event_dequeue(&mcc3->hires_joystick_event[0]);
+ 	event_dequeue(&mcc3->hires_joystick_event[1]);
++	if (mcc3->serial_out.stream) {
++		event_dequeue(&mcc3->serial_out.sample_event);
++		fclose(mcc3->serial_out.stream);
++		mcc3->serial_out.stream = NULL;
++	}
+ 	if (mcc3->printer_interface) {
+ 		printer_interface_free(mcc3->printer_interface);
+ 	}
+@@ -973,6 +1014,12 @@ static void coco3_reset(struct machine *m, bool hard) {
+ 	printer_reset(mcc3->printer_interface);
+ 	machine_remove_breakpoint_all(m, mcc3);
+ 	machine_add_breakpoint_sym(m, "serial.printchr", DELEGATE_AS2(void, bool, uint32, coco3_print_byte, mcc3));
++	// Drop any in-progress serial frame so a reset mid-byte emits nothing.
++	if (mcc3->serial_out.stream) {
++		event_dequeue(&mcc3->serial_out.sample_event);
++		mcc3->serial_out.bit = -1;
++		mcc3->serial_out.data = 0;
++	}
+ }
+ 
+ static enum machine_run_state coco3_run(struct machine *m, int ncycles) {
+@@ -1810,6 +1857,45 @@ static void pia0a_data_postwrite(void *sptr) {
+ 	}
+ }
+ 
++// -serial-out: sample the serial line at bit centres.  A start edge first
++// schedules a check at the start-bit centre (0.5 bit after the edge): if the
++// line has already returned to mark it was a glitch, not a real start, so the
++// frame is dropped.  Otherwise the 8 data bits are sampled at one-bit
++// intervals, decoded relative to the mark level captured at the start edge
++// (mark==1, space==0, LSB first).  A final sample checks the stop bit; a frame
++// with a non-mark stop bit is dropped as a framing error.
++
++static void coco3_serial_sample(void *sptr) {
++	struct coco3 *mcc3 = sptr;
++	int b = mcc3->serial_out.bit;
++	_Bool is_mark = (mcc3->serial_out.line == mcc3->serial_out.idle);
++	if (b == -2) {
++		// Start-bit centre: reject a glitch that already returned to mark.
++		if (is_mark) {
++			mcc3->serial_out.bit = -1;
++			return;
++		}
++		mcc3->serial_out.bit = 0;
++		event_queue_dt(&mcc3->serial_out.sample_event, mcc3->serial_out.bit_ticks);
++		return;
++	}
++	if (b < 0)
++		return;
++	if (b < 8) {
++		if (is_mark)
++			mcc3->serial_out.data |= (1 << b);
++		mcc3->serial_out.bit = b + 1;
++		event_queue_dt(&mcc3->serial_out.sample_event, mcc3->serial_out.bit_ticks);
++	} else {
++		if (is_mark && mcc3->serial_out.stream) {
++			putc(mcc3->serial_out.data, mcc3->serial_out.stream);
++			fflush(mcc3->serial_out.stream);
++		}
++		mcc3->serial_out.bit = -1;
++		mcc3->serial_out.data = 0;
++	}
++}
++
+ static void pia1a_data_postwrite(void *sptr) {
+ 	struct coco3 *mcc3 = sptr;
+ 	joystick_dac_write(mcc3);
+@@ -1818,6 +1904,19 @@ static void pia1a_data_postwrite(void *sptr) {
+ 	// Tandy Hi-Res adaptor strobes on the DAC MSB
+ 	if (mcc3->hires_joystick == HIRES_RIGHT || mcc3->hires_joystick == HIRES_LEFT)
+ 		hires_joystick_update(mcc3);
++	if (mcc3->serial_out.stream) {
++		uint8_t newline = (PIA_VALUE_A(mcc3->PIA1) >> 1) & 1;
++		if (mcc3->serial_out.bit == -1 && newline != mcc3->serial_out.line) {
++			// Possible start edge: capture the mark level and validate at the
++			// start-bit centre before committing to a frame.
++			mcc3->serial_out.idle = mcc3->serial_out.line;
++			mcc3->serial_out.data = 0;
++			mcc3->serial_out.bit = -2;
++			event_queue_dt(&mcc3->serial_out.sample_event,
++			               mcc3->serial_out.bit_ticks / 2);
++		}
++		mcc3->serial_out.line = newline;
++	}
+ }
+ 
+ static void pia1a_control_postwrite(void *sptr) {
+@@ -1892,7 +1991,11 @@ static void coco3_print_byte(void *sptr, bool RnW, uint32_t A) {
+ 	int byte = MC6809_REG_A(mcc3->CPU);
+ 	printer_strobe(mcc3->printer_interface, 0, byte);
+ 	printer_strobe(mcc3->printer_interface, 1, byte);
+-	mcc3->CPU->reg_pc = 0xa2df;
++	// Normally we shortcut past the ROM's slow bit-bang timing loop.  When
++	// capturing serial at the signal level, let the ROM actually bit-bang the
++	// byte out PIA1-A bit 1 so the -serial-out tap sees ROM output too.
++	if (!mcc3->serial_out.stream)
++		mcc3->CPU->reg_pc = 0xa2df;
+ }
+ 
+ /* Sound output can feed back into the single bit sound pin when it's
+diff --git a/src/gdb.c b/src/gdb.c
+index faad5ce..368af48 100644
+--- a/src/gdb.c
++++ b/src/gdb.c
+@@ -232,6 +232,7 @@ static int get_register_hex(struct gdb_interface_private *gip, int regno,
+ 			    size_t dsize, char *dest);
+ static int hexdigit(char c);
+ static int hex8(char *s);
++static int hex16(char *s);
+ 
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+@@ -975,6 +976,29 @@ error:
+ 
+ // General query handler ('q' packets)
+ 
++// Response handler for 'qXfer' (general query to read target special data bytes)
++
++static void qXfer(struct gdb_interface_private *gip,
++		  const char *src, size_t src_length,
++		  size_t offset, size_t length) {
++	if (offset >= src_length) {
++		offset = src_length;
++		length = 0;
++	} else if ((offset + length) > src_length) {
++		length = src_length - offset;
++	}
++	if (length > (sizeof(packet) - 6)) {
++		length = sizeof(packet) - 6;
++	}
++	if ((offset + length) >= src_length) {
++		packet[0] = 'l';
++	} else {
++		packet[0] = 'm';
++	}
++	memcpy(packet + 1, src + offset, length);
++	send_packet(gip, packet, length + 1);
++}
++
+ static void general_query(struct gdb_interface_private *gip, char *args) {
+ 	if (0 == strncmp(args, "Rcmd", 4)) {
+ 		// This query uses comma instead of colon as separator.
+@@ -1469,3 +1493,11 @@ static int hex8(char *s) {
+ 		return -1;
+ 	return (n1 << 4) | n0;
+ }
++
++static int hex16(char *s) {
++	int b1 = hex8(s);
++	int b0 = hex8(s+2);
++	if (b0 < 0 || b1 < 0)
++		return -1;
++	return (b1 << 8) | b0;
++}
+diff --git a/src/mc6809/mc6809.c b/src/mc6809/mc6809.c
+index 0042d40..b0a5679 100644
+--- a/src/mc6809/mc6809.c
++++ b/src/mc6809/mc6809.c
+@@ -1614,6 +1614,18 @@ unsigned mc6809_get_pc(void *sptr) {
+ 	return cpu->reg_pc;
+ }
+ 
++// PC of the instruction currently being traced/executed (start-of-instruction
++// PC, stable mid-instruction).  1.11 carried this; restored for the
++// qxroar.trace-pc gdb query.
++unsigned mc6809_get_trace_pc(void *sptr) {
++	struct MC6809 *cpu = sptr;
++#ifdef TRACE
++	return cpu->trace_pc;
++#else
++	return cpu->reg_pc;
++#endif
++}
++
+ static uint32_t mc6809_get_register(void *sptr, int r) {
+ 	struct MC6809 *cpu = sptr;
+ 	switch (r) {
+diff --git a/src/mc6809/mc6809.h b/src/mc6809/mc6809.h
+index 6a13e4e..7f89955 100644
+--- a/src/mc6809/mc6809.h
++++ b/src/mc6809/mc6809.h
+@@ -154,6 +154,7 @@ void mc6809_init_debug_info(struct MC6809 *cpu);
+ extern const struct debug_feature m6809_core_feature;
+ bool mc6809_get_flag(void *sptr, int n);
+ unsigned mc6809_get_pc(void *sptr);
++unsigned mc6809_get_trace_pc(void *sptr);
+ void mc6809_set_flag(void *sptr, int n, bool v);
+ 
+ #endif
+diff --git a/src/xroar.c b/src/xroar.c
+index d0b9164..b56cfa7 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -4319,6 +4319,15 @@ static struct xconfig_enum screenshot_when_list[] = {
+ 
+ /* Configuration directives */
+ 
++static union {
++	bool v_bool;
++	int v_int;
++} dummy_value;
++
++// -serial-out capture config, defined in coco3.c.
++extern char *coco3_serial_out_file;
++extern int coco3_serial_out_baud;
++
+ static struct xconfig_option const xroar_options[] = {
+ 	/* Machines: */
+ 	{ XC_CALL_STRING("default-machine", &set_default_machine) },
+@@ -4487,6 +4496,8 @@ static struct xconfig_option const xroar_options[] = {
+ 	/* Printing: */
+ 	{ XC_SET_STRING_NE("lp-file", &private_cfg.printer.file) },
+ 	{ XC_SET_STRING("lp-pipe", &private_cfg.printer.pipe) },
++	{ XC_SET_STRING_NE("serial-out", &coco3_serial_out_file) },
++	{ XC_SET_INT("serial-out-baud", &coco3_serial_out_baud) },
+ 
+ 	/* Emulator actions: */
+ 	{ XC_SET_BOOL("ratelimit", &private_cfg.debug.ratelimit) },
+@@ -4679,6 +4690,8 @@ static void helptext(void) {
+ #ifdef HAVE_POPEN
+ "  -lp-pipe COMMAND      pipe Dragon printer output to COMMAND\n"
+ #endif
++"  -serial-out FILE      capture CoCo serial (bit-banger) output to FILE\n"
++"  -serial-out-baud BAUD serial capture rate [600]\n"
+ "\n"
+ 
+ " Files:\n"
+@@ -4987,6 +5000,8 @@ static void config_print_all(FILE *f, bool all) {
+ 	fputs("# Printing\n", f);
+ 	xroar_cfg_print_string(f, all, "lp-file", private_cfg.printer.file, NULL);
+ 	xroar_cfg_print_string(f, all, "lp-pipe", private_cfg.printer.pipe, NULL);
++	xroar_cfg_print_string(f, all, "serial-out", coco3_serial_out_file, NULL);
++	xroar_cfg_print_int(f, all, "serial-out-baud", coco3_serial_out_baud, 600);
+ 	fputs("\n", f);
+ 
+ 	fputs("# Debugging\n", f);

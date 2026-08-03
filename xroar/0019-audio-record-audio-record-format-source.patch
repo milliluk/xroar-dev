@@ -1,0 +1,270 @@
+From 25963292ee5fc1fa15ff4d49801b02ee854b1fb5 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:05 -0400
+Subject: [PATCH 19/44] audio-record: -audio-record[-format/-source] +
+
+---
+ src/Makefile.am    |  1 +
+ src/null/ao_null.c | 21 +++++++++++++-
+ src/sound.c        | 10 +++++++
+ src/xroar.c        | 69 ++++++++++++++++++++++++++++++++++++++++++++--
+ 4 files changed, 97 insertions(+), 4 deletions(-)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 0d0da94..5219d7c 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -18,6 +18,7 @@ xroar_LDADD = $(top_builddir)/portalib/libporta.a -lm
+ 
+ xroar_SOURCES = \
+ 	ao.c ao.h \
++	audiorec.c audiorec.h \
+ 	auto_kbd.c auto_kbd.h \
+ 	ay891x.c ay891x.h \
+ 	becker.c becker.h \
+diff --git a/src/null/ao_null.c b/src/null/ao_null.c
+index 1055d34..d5c72e3 100644
+--- a/src/null/ao_null.c
++++ b/src/null/ao_null.c
+@@ -39,6 +39,7 @@
+ #include "xalloc.h"
+ 
+ #include "ao.h"
++#include "audiorec.h"
+ #include "events.h"
+ #include "logging.h"
+ #include "module.h"
+@@ -57,6 +58,7 @@ struct ao_null_interface {
+ 
+ 	event_ticks last_pause_cycle;
+ 	unsigned int last_pause_ms;
++	void *rec_buffer;   // throwaway output buffer, only when capture is armed
+ };
+ 
+ static unsigned int current_time(void);
+@@ -73,8 +75,24 @@ static void *new(void *cfg) {
+ 
+ 	ao->free = DELEGATE_AS0(void, ao_null_free, ao);
+ 
+-	ao->sound_interface = sound_interface_new(NULL, SOUND_FMT_NULL, 44100, 1, 1024);
++	// Normally null asks for SOUND_FMT_NULL and the mixer skips rendering
++	// entirely. If audio capture is armed we need real samples to tee, so
++	// request a genuine format AND hand sound.c an output buffer: it uses
++	// the AO module's buffer (null usually passes none), and its mix loop
++	// only runs when output_buffer is non-NULL. The buffer is written and
++	// then discarded; our sound.c tap reads the float mix separately.
++	unsigned rate = 44100, chans = 1, frames = 1024;
++	int fmt = audiorec_armed() ? SOUND_FMT_S16_HE : SOUND_FMT_NULL;
++	void *buf = NULL;
++	if (fmt != SOUND_FMT_NULL) {
++		size_t bytes = (fmt == SOUND_FMT_FLOAT) ? sizeof(float) : sizeof(int16_t);
++		buf = xmalloc(frames * chans * bytes);
++		memset(buf, 0, frames * chans * bytes);
++		aonull->rec_buffer = buf;
++	}
++	ao->sound_interface = sound_interface_new(buf, fmt, rate, chans, frames);
+ 	if (!ao->sound_interface) {
++		free(buf);
+ 		free(aonull);
+ 		return NULL;
+ 	}
+@@ -112,6 +130,7 @@ static void sleep_ms(unsigned int ms) {
+ static void ao_null_free(void *sptr) {
+ 	struct ao_null_interface *aonull = sptr;
+ 	sound_interface_free(aonull->public.sound_interface);
++	free(aonull->rec_buffer);
+ 	free(aonull);
+ }
+ 
+diff --git a/src/sound.c b/src/sound.c
+index 552c3bb..103cadd 100644
+--- a/src/sound.c
++++ b/src/sound.c
+@@ -31,6 +31,7 @@
+ #include "pl-endian.h"
+ #include "xalloc.h"
+ 
++#include "audiorec.h"
+ #include "events.h"
+ #include "logging.h"
+ #include "messenger.h"
+@@ -478,6 +479,15 @@ void sound_update(struct sound_interface *sndp) {
+ 				for (int j = 0; j < snd->output_nchannels; j++) {
+ 					*(ptr++) = (mix_sample + snd->current.external[j]) * snd->gain;
+ 				}
++				// Debug capture tap. Records one mono sample per frame:
++				// the channel-0 speaker output, or (selected in audiorec)
++				// the raw DAC level or single-bit state. No-op unless a
++				// capture file is open.
++				if (audiorec_active) {
++					float ch0 = (mix_sample + snd->current.external[0]) * snd->gain;
++					audiorec_frame(ch0, snd->dac_level,
++					    snd->current.sbs_enabled, snd->current.sbs_level);
++				}
+ 			}
+ 		}
+ 		snd->buffer_frame += count;
+diff --git a/src/xroar.c b/src/xroar.c
+index 7ccaab8..b2bf9f5 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -71,6 +71,7 @@
+ #include "part.h"
+ #include "ram.h"
+ #include "path.h"
++#include "audiorec.h"
+ #include "printer.h"
+ #include "rom.h"
+ #include "romlist.h"
+@@ -129,6 +130,9 @@ struct trap_def {
+ 	// Actions
+ 	char *snap;
+ 	char *screenshot;   // -trap-screenshot FILE; PNG of rendered frame
++	char *audio_start;  // -trap-audio-start FILE; begin audio capture
++	int audio_stop;     // -trap-audio-stop; end audio capture
++	int audio_toggle;   // -trap-audio-toggle; pause/resume without closing
+ 	char *timeout;
+ 	int trace;
+ 	int no_trace;
+@@ -403,6 +407,9 @@ static int load_detect_format(const char *file);
+ static void load_blob(const char *spec);
+ static void add_run(const char *arg);
+ static void set_gain(double gain);
++static void set_audio_record(const char *arg);
++static void set_audio_record_source(const char *arg);
++static void set_audio_record_format(const char *arg);
+ static void set_kbd_bind(const char *spec);
+ static void set_joystick(const char *name);
+ static void set_joystick_axis(const char *spec);
+@@ -1333,6 +1340,12 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 		ui_update_state(-1, ui_tag_gain, 0, &gain_f);
+ 	}
+ 
++	// -audio-record FILE: begin whole-run capture now that the sound
++	// interface (and its output rate) exists. No-op unless the flag was set.
++	if (xroar.ao_interface->sound_interface) {
++		audiorec_start_whole_run(xroar.ao_interface->sound_interface->framerate);
++	}
++
+ 	// Default joystick mapping
+ 	{
+ 		struct joystick_config *dfl_jc0 = NULL;
+@@ -1599,6 +1612,7 @@ void xroar_shutdown(void) {
+ 	machine_config_remove_all();
+ 	rom_meta_remove_all();
+ 	xroar.machine_config = NULL;
++	audiorec_stop();   // flush and close any open -audio-record file
+ 	if (xroar.ao_interface) {
+ 		DELEGATE_SAFE_CALL(xroar.ao_interface->free);
+ 	}
+@@ -3109,6 +3123,12 @@ static void set_gain(double gain) {
+ 	private_cfg.ao.volume = -1;
+ }
+ 
++// -audio-record* wrappers. The audiorec setters return an int status; the
++// option table wants void(const char *). A bad value is logged by the setter.
++static void set_audio_record(const char *arg) { audiorec_set_whole_run_file(arg); }
++static void set_audio_record_source(const char *arg) { audiorec_set_source(arg); }
++static void set_audio_record_format(const char *arg) { audiorec_set_format(arg); }
++
+ static void cfg_mpi_load_cart(const char *arg) {
+ 	(void)arg;
+ #ifdef WANT_CART_ARCH_DRAGON
+@@ -3462,9 +3482,19 @@ static void handle_trap(void *sptr) {
+ 			++trap->screenshot_count;
+ 		}
+ 	}
+-	if (trap->timeout) {
+-		LOG_MOD_DEBUG(2, "trap", "timeout: %s\n", trap->timeout);
+-		trap->timeout_data = xroar_set_timeout(trap->timeout);
++	if (trap->audio_start) {
++		int rate = (xroar.ao_interface && xroar.ao_interface->sound_interface)
++		    ? xroar.ao_interface->sound_interface->framerate : 44100;
++		LOG_MOD_DEBUG(2, "trap", "audio capture start: %s\n", trap->audio_start);
++		audiorec_start(trap->audio_start, rate);
++	}
++	if (trap->audio_stop) {
++		LOG_MOD_DEBUG(2, "trap", "audio capture stop\n");
++		audiorec_stop();
++	}
++	if (trap->audio_toggle) {
++		LOG_MOD_DEBUG(2, "trap", "audio capture toggle\n");
++		audiorec_toggle();
+ 	}
+ 	if (trap->trace >= 0) {
+ 		LOG_MOD_DEBUG(2, "trap", "trace on\n");
+@@ -3505,6 +3535,14 @@ static void handle_trap(void *sptr) {
+ 	if (trap->load_spec) {
+ 		load_blob(trap->load_spec);
+ 	}
++	// Timeout goes last.  xroar_set_timeout("0") is synchronous: it calls
++	// xroar_quit(), which is exit().  Any action ordered after it on the
++	// same trap would be silently skipped, so -trap-timeout 0 must run
++	// after everything else to mean "finish this trap's actions, then quit".
++	if (trap->timeout) {
++		LOG_MOD_DEBUG(2, "trap", "timeout: %s\n", trap->timeout);
++		trap->timeout_data = xroar_set_timeout(trap->timeout);
++	}
+ 
+ 	if (range) {
+ 		if (range->last == (unsigned long)-1) {
+@@ -3559,6 +3597,19 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
+ 			private_cfg.debug.trap_def.screenshot = NULL;
+ 		}
++		if (private_cfg.debug.trap_def.audio_start) {
++			free(cur_trap_def->audio_start);
++			cur_trap_def->audio_start = private_cfg.debug.trap_def.audio_start;
++			private_cfg.debug.trap_def.audio_start = NULL;
++		}
++		if (private_cfg.debug.trap_def.audio_stop) {
++			cur_trap_def->audio_stop = private_cfg.debug.trap_def.audio_stop;
++			private_cfg.debug.trap_def.audio_stop = 0;
++		}
++		if (private_cfg.debug.trap_def.audio_toggle) {
++			cur_trap_def->audio_toggle = private_cfg.debug.trap_def.audio_toggle;
++			private_cfg.debug.trap_def.audio_toggle = 0;
++		}
+ 		if (private_cfg.debug.trap_def.timeout) {
+ 			free(cur_trap_def->timeout);
+ 			cur_trap_def->timeout = private_cfg.debug.trap_def.timeout;
+@@ -3797,6 +3848,9 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT("ao-buffer-frames", &xroar.cfg.ao.buffer_nframes) },
+ 	{ XC_CALL_DOUBLE("ao-gain", &set_gain) },
+ 	{ XC_SET_INT("ao-volume", &private_cfg.ao.volume) },
++	{ XC_CALL_STRING("audio-record", &set_audio_record) },
++	{ XC_CALL_STRING("audio-record-source", &set_audio_record_source) },
++	{ XC_CALL_STRING("audio-record-format", &set_audio_record_format) },
+ 	/* Deliberately undocumented: */
+ 	{ XC_SET_INT("volume", &private_cfg.ao.volume) },
+ 	/* Backwards-compatibility: */
+@@ -3850,6 +3904,9 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
+ 	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
+ 	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
++	{ XC_SET_STRING("trap-audio-start", &private_cfg.debug.trap_def.audio_start) },
++	{ XC_SET_INT1("trap-audio-stop", &private_cfg.debug.trap_def.audio_stop) },
++	{ XC_SET_INT1("trap-audio-toggle", &private_cfg.debug.trap_def.audio_toggle) },
+ 	{ XC_SET_STRING("trap-timeout", &private_cfg.debug.trap_def.timeout) },
+ 	{ XC_SET_INT0("trap-trace", &private_cfg.debug.trap_def.trace) },
+ 	{ XC_SET_INT("trap-trace-n", &private_cfg.debug.trap_def.trace) },
+@@ -4070,6 +4127,9 @@ static void helptext(void) {
+ "  -ao-buffer-frames N   set total audio buffer size in samples (if supported)\n"
+ "  -ao-gain DB           audio gain in dB relative to 0 dBFS [-3.0]\n"
+ "  -ao-volume VOLUME     older way to specify audio volume, linear (0-100)\n"
++"  -audio-record FILE    capture audio to FILE for the whole run\n"
++"  -audio-record-source S   dac, mix, or 1bit [mix]\n"
++"  -audio-record-format F   s16 or float [s16]\n"
+ "\n"
+ 
+ " Debugging:\n"
+@@ -4099,6 +4159,9 @@ static void helptext(void) {
+ "    -trap-snap FILE     write snapshot at trap\n"
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
+ "    -trap-screenshot-when next|now  capture next clean frame (default) or now\n"
++"    -trap-audio-start FILE  begin audio capture at trap\n"
++"    -trap-audio-stop    end audio capture at trap\n"
++"    -trap-audio-toggle  pause/resume capture (splice windows into one file)\n"
+ "    -trap-timeout N     quit emulator N seconds after trap\n"
+ "    -trap-trace         start trace mode at trap\n"
+ "    -trap-trace-n N     start trace mode at trap for N instructions\n"

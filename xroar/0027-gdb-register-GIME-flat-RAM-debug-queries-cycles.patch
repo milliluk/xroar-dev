@@ -1,0 +1,496 @@
+From 87e06c0ea453fe6950c97a8144306efea3a4db45 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:21 -0400
+Subject: [PATCH 27/44] gdb: register/GIME/flat-RAM debug queries + cycles
+
+The qxroar. namespace carries no raw chip registers. XRoar's own
+-gdb-pseudo-regs already exposes those as real registers in the target
+description -- SAM and both PIAs on a Dragon, the GIME and both PIAs on a
+CoCo 3 -- where GDB can name them and "info registers" shows them. An
+earlier version of this patch had a qxroar.sam get/set doing the same job
+through a vendor query, which is strictly worse: no name, no type, no XML,
+and a second way to spell a thing that already had one. It is gone.
+
+What is left here is what a register dump cannot express: the GIME's
+logical-to-physical translations, flat physical memory that bypasses the
+MMU map entirely, and the input side channels.
+---
+ src/gdb.c   | 371 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ src/xroar.c |   6 +
+ 2 files changed, 351 insertions(+), 26 deletions(-)
+
+diff --git a/src/gdb.c b/src/gdb.c
+index 209fd2e..faad5ce 100644
+--- a/src/gdb.c
++++ b/src/gdb.c
+@@ -30,10 +30,55 @@
+  *
+  * Breakpoints and watchpoints are supported ('Z' and 'z').
+  *
++ * This namespace deliberately holds NO raw chip registers. XRoar's own
++ * -gdb-pseudo-regs exposes those properly, as registers in the target
++ * description -- SAM and both PIAs on a Dragon, the GIME and both PIAs on a
++ * CoCo 3 -- so GDB can name them and 'info registers' shows them. There was a
++ * qxroar.sam here doing the same job worse; it is gone. What belongs here is
++ * what a register dump cannot express: the MMU translations below, flat
++ * physical memory, and the input side channels.
++ *
+  * Some standard, and some vendor-specific general queries are supported:
+ 
+- *      qSupported      | XX... | report PacketSize
+- *      qAttached       | 1     | always report attached
++ *      qxroar.trace-pc | XXXX    | get PC of current instruction -> 4 hex digits
++ *      qSupported      | XX...   | report PacketSize
++ *      qAttached       | 1       | always report attached
++
++ * GIME-machine-only (coco3) debug registers, alongside the standard PC/D/X/Y
++ * etc above. All read-only, all live state computed at query time unless
++ * noted:
++
++ *      qxroar.task     | XX      | active MMU task, 0 or 1 (live $FF91 TR bit)
++ *      qxroar.block    | XX      | 8K physical RAM block mapped at live $pc
++ *      qxroar.paddr    | XXXXX   | phys addr of the GIME's last bus cycle (gimep->Z, a snapshot, not recomputed)
++ *      qxroar.xpc      | XXXXX   | phys addr the live $pc maps to right now (computed fresh, not a snapshot)
++ *      qxroar.physmem:ADDR,LEN | hex bytes | read LEN bytes of flat physical
++ *                        RAM at ADDR (same addressing as -load-ram's addr=).
++ *                        LEN caps at 512: the reply buffer holds 512 hex
++ *                        pairs. Bigger reads answer E00; chunk them.
++ *                        Bypasses the CPU/MMU map entirely -- works on a
++ *                        bank that isn't currently windowed into any logical
++ *                        address. ADDR/LEN are hex, no 0x prefix.
++
++ * Only these vendor-specific general sets are supported:
++
++ *      Qxroar.physmem:ADDR,LEN:DATA | write hex-pair DATA (LEN bytes) to flat
++ *                                     physical RAM at ADDR. Same addressing/
++ *                                     bypass as the read side.
++ *      Qxroar.axis:A,V            | set synthetic-joystick axis A (0=X,1=Y) to
++ *                                     raw hex V (0..ffff, centre 8000)
++ *      Qxroar.button:N,S          | press (S!=0) / release (S=0) synth button N
++ *      Qxroar.stopin:N            | next continue stops after N more cycles
++ *                                     (hex), wherever PC is, unless a
++ *                                     breakpoint stops it first
++ *      Qxroar.key:SCAN,S          | press (S!=0)/release (S=0) raw matrix key
++ *                                     by DSCAN scancode (PIA path)
++ *      Qxroar.type:HEX            | queue hex-encoded text to auto_kbd typer
++
++ * The four derived values above are as far as this should go. Anything that is
++ * simply a chip register -- SAM, PIA, the GIME's own $FF9x -- belongs in
++ * -gdb-pseudo-regs, which already has the machine interface this TODO used to
++ * ask for. Add it there, not here.
+ 
+  */
+ 
+@@ -83,16 +128,29 @@
+ #include "breakpoint.h"
+ #include "events.h"
+ #include "gdb.h"
++#include "joystick_script.h"
++#include "auto_kbd.h"
++#include "keyboard.h"
++#include "dkbd.h"
++#include "screenshot.h"
++#include "vo.h"
+ #include "logging.h"
+ #include "machine.h"
+ #include "mc6809/hd6309.h"
+ #include "mc6809/mc6809.h"
+ #include "mc6883.h"
++#include "ram.h"
++#include "tcc1014/tcc1014.h"
+ #include "xroar.h"
+ 
+ struct gdb_interface_private {
+ 	struct machine *machine;
+ 
++	struct MC6809 *cpu;
++	struct TCC1014 *gime;  // NULL on non-GIME (e.g. Dragon) machines
++	struct ram *ram;       // motherboard RAM, for physical-memory access
++	bool is_6309;
++
+ 	// Thread info
+ 	int listenfd;
+ 	struct addrinfo *info;
+@@ -115,6 +173,17 @@ struct gdb_interface_private {
+ 	pthread_cond_t run_state_cv;
+ 	pthread_mutex_t run_state_mt;
+ 	int last_signal;
++
++	// gdb-driven cycle-bounded stop (Qxroar.stopin:N). A 1ms-poll event on
++	// MACHINE_EVENT_LIST checks xroar_cpu_cycles against a target and calls
++	// gdb_stop() when reached -- the same stop path a hardware breakpoint
++	// uses. Lets the harness "run N cycles then stop wherever the PC is",
++	// which a fixed-address breakpoint can't do once injected input diverts
++	// control flow off the idle loop.
++	struct event cycle_stop_event;
++	uint64_t cycle_stop_target;
++	_Bool cycle_stop_armed;
++	_Bool cycle_stop_event_init;
+ };
+ 
+ static void *handle_tcp_sock(void *sptr);
+@@ -170,10 +239,22 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
+ 	if (!m)
+ 		return NULL;
+ 
++	struct MC6809 *cpu = (struct MC6809 *)part_component_by_id_is_a(&m->part, "CPU", "MC6809");
++	if (!cpu) {
++		LOG_MOD_WARN("gdb", "MC6809 CPU not found - not enabling GDB support\n");
++		return NULL;
++	}
++
++	struct TCC1014 *gime = (struct TCC1014 *)part_component_by_id_is_a(&m->part, "GIME", "TCC1014");
++	struct ram *ram = (struct ram *)part_component_by_id_is_a(&m->part, "RAM", "ram");
++
+ 	struct gdb_interface_private *gip = xmalloc(sizeof(*gip));
+ 	*gip = (struct gdb_interface_private){0};
+ 
+ 	gip->machine = m;
++	gip->cpu = cpu;
++	gip->gime = gime;
++	gip->ram = ram;
+ 	gip->run_state = gdb_run_state_running;
+ 
+ 	struct addrinfo hints;
+@@ -206,7 +287,7 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
+ 	// quick restart with -gdb does not have to wait it out.  This does NOT
+ 	// cover the snapshot-load case, where two listeners are briefly live on
+ 	// the same port; that is handled by the deferred-bind retry below.
+-	{ int one = 1; setsockopt(gip->listenfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)); }
++	{ int one = 1; setsockopt(gip->listenfd, SOL_SOCKET, SO_REUSEADDR, (void const *)&one, sizeof(one)); }
+ 
+ 	// bind
+ 	gip->rebind_pending = 0;
+@@ -327,10 +408,36 @@ static void gdb_handle_signal(struct gdb_interface_private *gip, int sig, bool a
+ 
+ void gdb_stop(struct gdb_interface *gi, int sig) {
+ 	struct gdb_interface_private *gip = (struct gdb_interface_private *)gi;
++	// Any stop (breakpoint or our own deadline) cancels a pending cycle
++	// stop, so Qxroar.stopin is "until the next stop, whichever comes
++	// first" and never fires spuriously on a later run. Runs on the CPU
++	// thread, the same context that owns the event list while running.
++	if (gip->cycle_stop_armed) {
++		gip->cycle_stop_armed = 0;
++		event_dequeue(&gip->cycle_stop_event);
++	}
+ 	gip->run_state = gdb_run_state_stopped;
+ 	gdb_handle_signal(gip, sig, 1);
+ }
+ 
++// 1ms-poll handler for Qxroar.stopin. Mirrors xroar.c's handle_cycle_trigger
++// (patch 18): cycles don't map cleanly to event ticks, so poll every emulated
++// millisecond and compare the live counter. Overshoot is bounded by that 1ms
++// (~1789 cycles at the fast clock), fine for "advance ~a frame then observe"
++// and for click/drag edge spacing. Reaching the target calls gdb_stop (which
++// disarms), so this never requeues past the deadline.
++static void gdb_cycle_stop_poll(void *sptr) {
++	struct gdb_interface_private *gip = sptr;
++	if (!gip->cycle_stop_armed)
++		return;
++	if (xroar_cpu_cycles >= gip->cycle_stop_target) {
++		gdb_stop((struct gdb_interface *)gip, MACHINE_SIGTRAP);
++		return;
++	}
++	gip->cycle_stop_event.at_tick = event_current_tick + EVENT_MS(1);
++	event_queue(&gip->cycle_stop_event);
++}
++
+ void gdb_single_step(struct gdb_interface *gi) {
+ 	struct gdb_interface_private *gip = (struct gdb_interface_private *)gi;
+ 	gip->run_state = gdb_run_state_stopped;
+@@ -881,6 +988,99 @@ static void general_query(struct gdb_interface_private *gip, char *args) {
+ 		return;
+ 	}
+ 	char *query = strsep(&args, ":");
++	if (0 == strncmp(query, "xroar.", 6)) {
++		query += 6;
++#ifdef TRACE
++		if (0 == strcmp(query, "trace-pc")) {
++			LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.trace-pc\n");
++			sprintf((char *)packet, "%04x", mc6809_get_trace_pc(gip->cpu));
++			send_packet(gip, packet, 4);
++			return;
++		}
++#endif
++		// GIME-derived debug registers (coco3 only; gip->gime is NULL on
++		// non-MMU machines, in which case these just report E00 same as
++		// any other unrecognised query -- the run falls through below).
++		if (gip->gime) {
++			uint16_t pc = mc6809_get_pc(gip->cpu);
++			if (0 == strcmp(query, "task")) {
++				// $task: active MMU task mapping, 0 or 1 (live $FF91 TR bit).
++				LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.task\n");
++				sprintf((char *)packet, "%02x", tcc1014_get_task(gip->gime));
++				send_packet(gip, packet, 2);
++				return;
++			}
++			if (0 == strcmp(query, "block")) {
++				// $block: 8KB physical RAM block the MMU currently has
++				// mapped at the live $pc (top 6 bits of $xpc).
++				LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.block\n");
++				unsigned xpc = tcc1014_logical_to_physical(gip->gime, pc);
++				sprintf((char *)packet, "%02x", (xpc >> 13) & 0xff);
++				send_packet(gip, packet, 2);
++				return;
++			}
++			if (0 == strcmp(query, "paddr")) {
++				// $paddr: physical address of the GIME's last memory
++				// cycle (gimep->Z) -- the live bus target, instruction
++				// fetch or data, whichever happened most recently. 19-bit,
++				// 5 hex digits.
++				LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.paddr\n");
++				sprintf((char *)packet, "%05x", gip->gime->Z & 0x7ffff);
++				send_packet(gip, packet, 5);
++				return;
++			}
++			if (0 == strcmp(query, "xpc")) {
++				// $xpc: physical address the live logical $pc is mapped
++				// to right now. Computed fresh from $pc, not a stale bus
++				// snapshot -- always correct regardless of what the last
++				// bus cycle happened to be. 19-bit, 5 hex digits.
++				LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.xpc\n");
++				sprintf((char *)packet, "%05x", tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff);
++				send_packet(gip, packet, 5);
++				return;
++			}
++			if (0 == strcmp(query, "cycles")) {
++				// $cycles: master emulator tick counter
++				// (event_current_tick), 32-bit, 8 hex digits.
++				// Free-running; take deltas between two reads to
++				// measure elapsed cycles across a code region.
++				LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.cycles\n");
++				sprintf((char *)packet, "%08x", (unsigned)event_current_tick);
++				send_packet(gip, packet, 8);
++				return;
++			}
++		}
++		if (gip->ram && 0 == strcmp(query, "physmem")) {
++			// qxroar.physmem:ADDR,LEN -- read LEN bytes starting at flat
++			// physical ADDR (same addressing as -load-ram's addr=), raw
++			// hex pairs in the reply, same wire shape as a normal 'm'.
++			// Bypasses the CPU/MMU entirely: works on banks that aren't
++			// currently mapped into any logical window.
++			char *addrs = strsep(&args, ",");
++			if (!addrs || !args)
++				goto physmem_read_error;
++			size_t A = strtoul(addrs, NULL, 16);
++			unsigned long length = strtoul(args, NULL, 16);
++			if (length > sizeof(packet)/2)  // reply is hex pairs into packet[]: 2*len+NUL must fit
++				goto physmem_read_error;
++			LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.physmem\n");
++			char *p = (char *)packet;
++			for (unsigned long i = 0; i < length; i++) {
++				int b = ram_peek_flat(gip->ram, A + i);
++				if (b < 0)
++					goto physmem_read_error;
++				sprintf(p, "%02x", (unsigned)b);
++				p += 2;
++			}
++			send_packet(gip, packet, (size_t)(p - (char *)packet));
++			return;
++		physmem_read_error:
++			send_packet_string(gip, "E00");
++			return;
++		}
++		LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: unknown xroar vendor query\n");
++		send_packet(gip, NULL, 0);
++	} 
+ 	if (0 == strncmp(query, "Supported", 9) && (query[9] == 0 || query[9] == ':')) {
+ 		LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: Supported\n");
+ 		send_supported(gip, args);
+@@ -912,6 +1112,148 @@ static void general_query(struct gdb_interface_private *gip, char *args) {
+ 
+ static void general_set(struct gdb_interface_private *gip, char *args) {
+ 	char *set = strsep(&args, ":");
++	if (0 == strncmp(set, "xroar.", 6)) {
++		set += 6;
++		if (0 == strcmp(set, "physmem") && gip->ram) {
++			// Qxroar.physmem:ADDR,LEN:DATA -- write LEN hex-pair bytes
++			// from DATA starting at flat physical ADDR. Same addressing
++			// and same bypass-the-MMU rationale as the read side.
++			char *arglist = strsep(&args, ":");
++			char *data = args;
++			if (!arglist || !data)
++				goto physmem_write_error;
++			char *addrs = strsep(&arglist, ",");
++			if (!addrs || !arglist)
++				goto physmem_write_error;
++			size_t A = strtoul(addrs, NULL, 16);
++			unsigned long length = strtoul(arglist, NULL, 16);
++			for (unsigned long i = 0; i < length; i++) {
++				if (!*data || !*(data + 1))
++					goto physmem_write_error;
++				int v = hex8(data);
++				if (v < 0)
++					goto physmem_write_error;
++				if (!ram_poke_flat(gip->ram, A + i, (uint8_t)v))
++					goto physmem_write_error;
++				data += 2;
++			}
++			send_packet_string(gip, "OK");
++			return;
++		physmem_write_error:
++			send_packet_string(gip, "E00");
++			return;
++		}
++		if (0 == strcmp(set, "axis")) {
++			// Qxroar.axis:A,V -- set synthetic-joystick axis A (0=X, 1=Y)
++			// to raw value V (hex, 0..ffff, centre 8000). Drives
++			// script_js_set_axis(); the joystick module holds this as
++			// passive state that the CPU reads through joystick_read_axis
++			// on its next poll, so setting it while stopped and then
++			// continuing is how the harness moves the pointer. Only has an
++			// effect when -joy-right script is the active right-port
++			// pointer (same requirement as -input-script).
++			char *as = strsep(&args, ",");
++			if (!as || !args) { send_packet_string(gip, "E00"); return; }
++			unsigned axis = (unsigned)strtoul(as, NULL, 16);
++			int val = (int)strtoul(args, NULL, 16);
++			script_js_set_axis(axis, val);
++			send_packet_string(gip, "OK");
++			return;
++		}
++		if (0 == strcmp(set, "button")) {
++			// Qxroar.button:N,S -- press (S!=0) or release (S=0) synthetic
++			// button N (0 = the right fire button). Drives
++			// script_js_set_button(). A click is button down, continue a
++			// bounded amount of emulated time, button up; the M33ED
++			// double-click detector keys off the emulated-time spacing of
++			// these edges, so advance time by continuing, never by a host
++			// sleep.
++			char *ns = strsep(&args, ",");
++			if (!ns || !args) { send_packet_string(gip, "E00"); return; }
++			unsigned btn = (unsigned)strtoul(ns, NULL, 16);
++			_Bool down = strtoul(args, NULL, 16) != 0;
++			script_js_set_button(btn, down);
++			send_packet_string(gip, "OK");
++			return;
++		}
++		if (0 == strcmp(set, "stopin")) {
++			// Qxroar.stopin:N -- on the next continue, stop after N more
++			// emulated cycles (hex) wherever the PC is, unless a breakpoint
++			// stops it first. This is the harness's clock: set input, arm
++			// stopin, continue, observe -- no dependence on control flow
++			// returning to any particular address. Armed here on the
++			// listener thread while the machine is stopped (so touching the
++			// event list is safe), consumed by the following continue.
++			if (!gip->cycle_stop_event_init) {
++				event_init(&gip->cycle_stop_event, MACHINE_EVENT_LIST,
++				           DELEGATE_AS0(void, gdb_cycle_stop_poll, gip));
++				gip->cycle_stop_event_init = 1;
++			}
++			if (gip->cycle_stop_armed)
++				event_dequeue(&gip->cycle_stop_event);
++			gip->cycle_stop_target = xroar_cpu_cycles + strtoull(args, NULL, 16);
++			gip->cycle_stop_armed = 1;
++			gip->cycle_stop_event.at_tick = event_current_tick + EVENT_MS(1);
++			event_queue(&gip->cycle_stop_event);
++			send_packet_string(gip, "OK");
++			return;
++		}
++		if (0 == strcmp(set, "key")) {
++			// Qxroar.key:SCAN,S -- press (S!=0) / release (S=0) a raw
++			// keyboard-matrix key by DSCAN scancode (0x00..0x38; e.g.
++			// ENTER=0x30 CLEAR=0x31 BREAK=0x32 ALT=0x33 CTRL=0x34
++			// SHIFT=0x37 BACKSPACE=0x38, A=0x11..). This is the PIA-matrix
++			// path: the scancode maps through the live keymap to a col/row
++			// the CPU reads at $FF00, so GetModifierKeys and every direct
++			// matrix reader see it, unlike the auto_kbd ROM-poll `type`.
++			// Held until the matching release.
++			char *ks = strsep(&args, ",");
++			if (!ks || !args || !xroar.keyboard_interface) { send_packet_string(gip, "E00"); return; }
++			unsigned scan = (unsigned)strtoul(ks, NULL, 16);
++			if (scan >= DSCAN_INVALID) { send_packet_string(gip, "E00"); return; }
++			if (strtoul(args, NULL, 16))
++				KBD_MATRIX_PRESS(xroar.keyboard_interface, scan);
++			else
++				KBD_MATRIX_RELEASE(xroar.keyboard_interface, scan);
++			send_packet_string(gip, "OK");
++			return;
++		}
++		if (0 == strcmp(set, "type")) {
++			// Qxroar.type:HEX -- queue text to the ROM key-poll auto-typer
++			// (auto_kbd), the same path the -input-script `type` uses. Text
++			// is hex-encoded (2 digits/char) so spaces and specials survive
++			// the packet; \r (0d) is ENTER. Convenience over Qxroar.key for
++			// literal strings; use key= when you need matrix-level control.
++			if (!args || !xroar.auto_kbd) { send_packet_string(gip, "E00"); return; }
++			size_t hexlen = strlen(args);
++			if (hexlen & 1) { send_packet_string(gip, "E00"); return; }
++			char *txt = xmalloc(hexlen/2 + 1);
++			for (size_t i = 0; i < hexlen/2; i++) {
++				int v = hex8(args + 2*i);
++				if (v < 0) { free(txt); send_packet_string(gip, "E00"); return; }
++				txt[i] = (char)v;
++			}
++			txt[hexlen/2] = 0;
++			ak_parse_type_string(xroar.auto_kbd, txt);
++			free(txt);
++			send_packet_string(gip, "OK");
++			return;
++		}
++#ifdef SCREENSHOT
++		if (0 == strcmp(set, "screenshot")) {
++			// Qxroar.screenshot:FILE -- render the current frame to PNG, the
++			// same writer -trap-screenshot uses. Capture may defer to the next
++			// vsync (screenshot.c), so the harness should run a couple of frames
++			// after this for it to flush.
++			if (!args || !*args) { send_packet_string(gip, "E00"); return; }
++			if (!xroar.vo_interface || !xroar.vo_interface->renderer)
++				screenshot_setup_render(xroar.vo_interface);
++			screenshot_request(args, xroar.vo_interface);
++			send_packet_string(gip, "OK");
++			return;
++		}
++#endif
++	} 
+ 	if (0 == strcmp(set, "StartNoAckMode")) {
+ 		gip->no_ack_mode = 1;
+ 		send_packet_string(gip, "OK");
+@@ -1052,29 +1394,6 @@ static int qRcmd(struct gdb_interface_private *gip, char *args) {
+ 	return 0;
+ }
+ 
+-// Response handler for 'qXfer' (general query to read target special data bytes)
+-
+-static void qXfer(struct gdb_interface_private *gip,
+-		  const char *src, size_t src_length,
+-		  size_t offset, size_t length) {
+-	if (offset >= src_length) {
+-		offset = src_length;
+-		length = 0;
+-	} else if ((offset + length) > src_length) {
+-		length = src_length - offset;
+-	}
+-	if (length > (sizeof(packet) - 6)) {
+-		length = sizeof(packet) - 6;
+-	}
+-	if ((offset + length) >= src_length) {
+-		packet[0] = 'l';
+-	} else {
+-		packet[0] = 'm';
+-	}
+-	memcpy(packet + 1, src + offset, length);
+-	send_packet(gip, packet, length + 1);
+-}
+-
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ // Convert hex representation of a register to binary in-place and, if valid,
+diff --git a/src/xroar.c b/src/xroar.c
+index 897bf1e..d0b9164 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -1348,6 +1348,12 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 	// garbage.
+ 	if (xroar.cfg.debug.emuext)
+ 		screenshot_setup_render(xroar.vo_interface);
++	// A -gdb session can grab a live frame via Qxroar.screenshot, which has
++	// no trap to announce it at init either. Same reasoning: attach the
++	// render instance now so scanlines accumulate on it, or every live
++	// capture is blank.
++	if (xroar.cfg.debug.gdb)
++		screenshot_setup_render(xroar.vo_interface);
+ 	screenshot_set_defer(option_screenshot_when == 0);
+ #endif
+ 

@@ -1,0 +1,351 @@
+From bdebc754aa9c64822c5881d204d8fe51a3f2df3f Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:51 -0400
+Subject: [PATCH 41/44] symbols: -symbols FILE, @Name wherever an address is,
+
+---
+ src/Makefile.am            |   3 +-
+ src/gdb.c                  |  32 ++++++++++--
+ src/mc6809/hd6309.c        |   2 +
+ src/mc6809/mc6809.c        |   2 +
+ src/mc6809/mc6809_common.c |  26 ++++++++++
+ src/xroar.c                | 102 ++++++++++++++++++++++++++++++++-----
+ 6 files changed, 151 insertions(+), 16 deletions(-)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 61d49ed..6407ee1 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -21,6 +21,7 @@ xroar_SOURCES = \
+ 	audiorec.c audiorec.h \
+ 	auto_kbd.c auto_kbd.h \
+ 	audit.c audit.h \
++	symtab.c symtab.h \
+ 	ay891x.c ay891x.h \
+ 	becker.c becker.h \
+ 	blockdev.c blockdev.h \
+@@ -62,7 +63,7 @@ xroar_SOURCES = \
+ 	snapshot.c snapshot.h \
+ 	sndfile_compat.c sndfile_compat.h \
+ 	sound.c sound.h \
+-	symtab.c symtab.h \
++	symfile.c symfile.h \
+ 	tape.c tape.h \
+ 	tape_cas.c \
+ 	tape_sndfile.c \
+diff --git a/src/gdb.c b/src/gdb.c
+index 526f642..0a9f61f 100644
+--- a/src/gdb.c
++++ b/src/gdb.c
+@@ -104,6 +104,9 @@
+  * Use that, not paddr: paddr is the machine's last bus cycle, which by the
+  * time a stop reply is formatted has moved past the triggering access -- a
+  * 16-bit store to a watched byte reports the byte AFTER it.
++ * With -symbols loaded, a further sym: pair carries "Name+off (IMAGE)" and,
++ * if line records were loaded too, " file:line" -- hex-encoded, because an
++ * RSP value is hex.
+  * Unrecognised pairs are ignorable by protocol.  Machines with no GIME reply
+  * 'S' exactly as before.
+ 
+@@ -172,6 +175,8 @@
+ #include "mc6809/mc6809.h"
+ #include "mc6883.h"
+ #include "ram.h"
++#include "symtab.h"
++#include "symfile.h"
+ #include "tcc1014/tcc1014.h"
+ #include "xroar.h"
+ 
+@@ -910,7 +915,7 @@ static int send_char(struct gdb_interface_private *gip, char c) {
+ // stop rather than "whatever is mapped by the time you ask".  Machines with
+ // no MMU have nothing to add and reply 'S' as before.
+ static void send_last_signal(struct gdb_interface_private *gip) {
+-	char tmpbuf[96];
++	char tmpbuf[512];
+ 	if (gip->gime) {
+ 		uint16_t pc = mc6809_get_pc(gip->cpu);
+ 		unsigned xpc = tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff;
+@@ -927,8 +932,29 @@ static void send_last_signal(struct gdb_interface_private *gip) {
+ 		// so it describes this stop and not an earlier one.
+ 		if (n > 0 && (size_t)n < sizeof(tmpbuf) &&
+ 		    gip->machine->debug.wp_match_pending) {
+-			snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
+-				 gip->machine->debug.wp_match_address & 0x1fffff);
++			n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
++				      gip->machine->debug.wp_match_address & 0x1fffff);
++		}
++		// With -symbols, say where the stop is in the program's own
++		// terms.  An RSP value is hex, so the text goes over
++		// hex-encoded -- the pair is ignorable by protocol, and a
++		// client that does not decode it loses nothing.  This is the
++		// same reverse lookup the flight recorder and the profiler
++		// print, so a stop and a trace name a routine identically.
++		const char *where = symfile_whereis(xpc, 0);
++		if (where && n > 0 && (size_t)n < sizeof(tmpbuf)) {
++			const char *src = symfile_line(xpc);
++			char text[192];
++			snprintf(text, sizeof(text), "%s%s%s", where,
++				 src ? " " : "", src ? src : "");
++			size_t room = sizeof(tmpbuf) - (size_t)n;
++			if (room > 8 + strlen(text) * 2) {
++				n += snprintf(tmpbuf + n, room, "sym:");
++				for (const char *p = text; *p; p++)
++					n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n,
++						      "%02x", (unsigned char)*p);
++				snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, ";");
++			}
+ 		}
+ 		send_packet_string(gip, tmpbuf);
+ 		return;
+diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
+index b3c1d07..21764ac 100644
+--- a/src/mc6809/hd6309.c
++++ b/src/mc6809/hd6309.c
+@@ -51,6 +51,8 @@
+ #include "mc6809.h"
+ #include "part.h"
+ #include "serialise.h"
++#include "symfile.h"  // symfile_loaded/whereis, used by mc6809_common.c
++#include "symtab.h"   // ${sym} in an emuext LOG format string
+ 
+ #ifdef TRACE
+ #include "hd6309_trace.h"
+diff --git a/src/mc6809/mc6809.c b/src/mc6809/mc6809.c
+index 59b514f..74fe38e 100644
+--- a/src/mc6809/mc6809.c
++++ b/src/mc6809/mc6809.c
+@@ -61,6 +61,8 @@
+ #include "mc6809.h"
+ #include "part.h"
+ #include "serialise.h"
++#include "symfile.h"  // symfile_loaded/whereis, used by mc6809_common.c
++#include "symtab.h"   // ${sym} in an emuext LOG format string
+ 
+ #ifdef TRACE
+ #include "mc6809_trace.h"
+diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
+index 8ce35d5..fd6ff13 100644
+--- a/src/mc6809/mc6809_common.c
++++ b/src/mc6809/mc6809_common.c
+@@ -236,6 +236,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 		//   a b cc dp   8-bit  -> 2 hex     d x y u s pc  16-bit -> 4 hex
+ 		//   xpc paddr   phys   -> 5 hex     block task    -> 2 hex
+ 		//   cycles      event_current_tick -> decimal
++		//   sym         -> the routine the LOG itself is in, by name
+ 		// A bare '$' not followed by '{' is emitted literally.
+ 		if (c == '$') {
+ 			uint8_t n1 = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + i + 1);
+@@ -266,6 +267,31 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 			else if (0 == strcmp(name, "s"))   snprintf(piece, sizeof(piece), "%04x", REG_S);
+ 			else if (0 == strcmp(name, "pc"))  snprintf(piece, sizeof(piece), "%04x", REG_PC);
+ 			else if (0 == strcmp(name, "cycles")) snprintf(piece, sizeof(piece), "%u", (unsigned)event_current_tick);
++			else if (0 == strcmp(name, "sym")) {
++				// Where the guest is, in its own terms.  This is
++				// the one conversion whose answer is longer than
++				// the shared `piece` buffer, so it appends
++				// directly; and the one that can be unanswerable
++				// at runtime, when no -symbols was given.  It
++				// echoes back then, the same as any name this
++				// build does not know -- killing a running
++				// machine over a log conversion would be a poor
++				// trade, and a visible ${sym} is not a wrong
++				// answer.
++				const char *where = NULL;
++				if (cpu->debug.cpu.state_read.func && symfile_loaded()) {
++					int32_t x = DELEGATE_CALL(cpu->debug.cpu.state_read, "xpc");
++					if (x >= 0)
++						where = symfile_whereis((uint32_t)x & 0x7ffff, 0);
++				}
++				if (!where)
++					snprintf(piece, sizeof(piece), "${sym}");
++				else
++					for (unsigned k = 0; where[k] && o < sizeof(out) - 1; k++)
++						out[o++] = where[k];
++				if (where)
++					continue;
++			}
+ 			else if (cpu->debug.cpu.state_read.func) {
+ 				// xpc/paddr/block/task -- machine-specific, routed via a
+ 				// named state delegate wired in coco3.c.
+diff --git a/src/xroar.c b/src/xroar.c
+index dbe0d77..93a8a67 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -79,6 +79,8 @@
+ #include "screenshot.h"
+ #include "snapshot.h"
+ #include "sound.h"
++#include "symtab.h"
++#include "symfile.h"
+ #include "tape.h"
+ #include "tcc1014/tcc1014.h"  // tcc1014_logical_to_physical, for xpc=
+ #include "ui.h"
+@@ -1703,6 +1705,7 @@ void xroar_shutdown(void) {
+ 	disable_all_traps();
+ 	profile_dump();
+ 	audit_shutdown();
++	symfile_shutdown();   // after profile_dump(): that is a consumer of it
+ 	save_config();
+ 	messenger_shutdown();
+ 	if (xroar.auto_kbd) {
+@@ -3045,11 +3048,21 @@ static void add_load(const char *arg) {
+ // and not silently 0 -- it's an error). Base is always explicit (10 or 16):
+ // strtoul's base-0 auto-detect would also treat a leading "0" as octal,
+ // which is exactly the kind of silent wrong-base surprise this avoids.
++//
++// "@Name" is a symbol from -symbols, and resolves here so that every option
++// which takes an address gets it at once rather than one at a time: trap
++// conditions, -load-ram addr=, -trap-load addr=.  Unknown, ambiguous, or no
++// table loaded all exit loudly -- the whole point is that a name never
++// silently becomes some other address, which is what the shell substitution
++// it replaces did whenever it produced nothing.
+ static unsigned long parse_num_ul(const char *s) {
+ 	if (!s || !*s) {
+ 		fprintf(stderr, "xroar: expected a number, got nothing\n");
+ 		exit(EXIT_FAILURE);
+ 	}
++	struct symfile_addr sa;
++	if (symfile_resolve_token(s, &sa))
++		return sa.value;
+ 	int base = 10;
+ 	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+ 		s += 2;
+@@ -3471,6 +3484,14 @@ static void handle_seconds_trigger(void *sptr) {
+ static int trap_addr_space(const char *tok) {
+ 	if (!tok || !*tok)
+ 		return -1;
++	// A symbol says which space it is in and does not need classifying by
++	// spelling: a program symbol or a direct-page variable is physical,
++	// because that is what the symbol file records.  An equate is a bare
++	// number that happens to have a name -- an I/O port as often as
++	// anything else -- so it takes the same magnitude rule as a literal.
++	struct symfile_addr sa;
++	if (symfile_resolve_token(tok, &sa))
++		return sa.physical ? 1 : 0;
+ 	if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+ 		tok += 2;
+ 		int n = 0;
+@@ -3935,6 +3956,36 @@ static void trap_history_dump(void) {
+ 	unsigned start = (trap_history_pos + (unsigned)trap_history_size - n)
+ 	                 % (unsigned)trap_history_size;
+ 	fprintf(stderr, "trap-history: last %u physical PCs, oldest first:\n", n);
++	if (symfile_loaded()) {
++		// With names, the ring is a call trace and belongs one per line;
++		// the packed hex columns below are what it has to be without
++		// them.  Consecutive PCs inside one routine are the common case,
++		// so only the first of a run is named -- otherwise the routine
++		// name repeats for pages and the transitions, which are the
++		// interesting part, stop standing out.
++		// Held as a copy, not as the pointer: whereis() hands back one of
++		// a small rotation of static buffers.
++		char prev[128] = { 0 };
++		for (unsigned i = 0; i < n; ++i) {
++			unsigned long v = trap_history_ring[(start + i) % (unsigned)trap_history_size];
++			const char *where = symfile_whereis((uint32_t)v, 0);
++			const char *src = symfile_line((uint32_t)v);
++			// The run is judged on the routine, not on the formatted
++			// string, which carries an offset that changes every line.
++			// whereis() is "Name+off (IMAGE)" or "Name (IMAGE)", so the
++			// name ends at the first '+' or space either way.
++			char key[128] = { 0 };
++			if (where)
++				snprintf(key, sizeof(key), "%.*s",
++				         (int)strcspn(where, "+ "), where);
++			_Bool same = where && prev[0] && 0 == strcmp(prev, key);
++			fprintf(stderr, "trap-history: 0x%05lX  %s%s%s\n", v,
++			        same ? "\"" : (where ? where : "-"),
++			        (src && !same) ? "  " : "", (src && !same) ? src : "");
++			memcpy(prev, key, sizeof(prev));
++		}
++		return;
++	}
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		unsigned long v = trap_history_ring[(start + i) % (unsigned)trap_history_size];
+ 		if ((i % 8) == 0)
+@@ -3983,9 +4034,16 @@ static void profile_record(void *sptr, uint32_t A) {
+ }
+ 
+ // -profile-range NAME=LO-HI (repeatable).  LO/HI are physical addresses,
+-// 0x-prefixed or bare hex, inclusive.  A bare LO with no dash is a one-byte
+-// range.  Duplicate names are allowed; the caller resolves symbols to
+-// physical with cmaddr.py and passes the numbers.
++// inclusive: bare hex (this option predates the 0x-or-decimal grammar and
++// keeps its own spelling), or "@Symbol" from -symbols.  A bare LO with no
++// dash is a one-byte range.  Duplicate names are allowed.
++static unsigned long profile_parse_addr(const char *s) {
++	struct symfile_addr sa;
++	if (symfile_resolve_token(s, &sa))
++		return sa.value;
++	return strtoul(s, NULL, 16);
++}
++
+ static void profile_add_range(const char *spec) {
+ 	if (profile_num_ranges >= PROFILE_MAX_RANGES) {
+ 		LOG_MOD_WARN("profile", "too many -profile-range (max %d), ignoring %s\n",
+@@ -3999,11 +4057,14 @@ static void profile_add_range(const char *spec) {
+ 	}
+ 	char *name = xstrndup(spec, (size_t)(eq - spec));
+ 	const char *rng = eq + 1;
+-	char *dash = NULL;
+-	unsigned long lo = strtoul(rng, &dash, 16);
+-	unsigned long hi = lo;
+-	if (dash && *dash == '-')
+-		hi = strtoul(dash + 1, NULL, 16);
++	// Split before resolving.  A '-' here is always the range separator:
++	// it cannot occur in a symbol name, and resolving the unsplit string
++	// would fail on "@Lo-@Hi" before ever reaching the split.
++	const char *dash = strchr(rng, '-');
++	char *lostr = dash ? xstrndup(rng, (size_t)(dash - rng)) : xstrdup(rng);
++	unsigned long lo = profile_parse_addr(lostr);
++	unsigned long hi = dash ? profile_parse_addr(dash + 1) : lo;
++	free(lostr);
+ 	if (lo > 0x7ffff || hi > 0x7ffff || hi < lo) {
+ 		LOG_MOD_WARN("profile", "-profile-range %s: bad physical range\n", spec);
+ 		free(name);
+@@ -4071,11 +4132,16 @@ static void profile_dump(void) {
+ 			}
+ 		}
+ 		fprintf(f, "profile: top %d physical PCs by cycles:\n", have);
+-		fprintf(f, "profile: %-10s %12s %14s\n", "paddr", "hits", "cycles");
+-		for (int i = 0; i < have; ++i)
+-			fprintf(f, "profile: 0x%05lX   %12u %14llu\n",
++		fprintf(f, "profile: %-10s %12s %14s  %s\n", "paddr", "hits", "cycles",
++		        symfile_loaded() ? "where" : "");
++		for (int i = 0; i < have; ++i) {
++			const char *where = symfile_whereis((uint32_t)top[i], 0);
++			const char *src = symfile_line((uint32_t)top[i]);
++			fprintf(f, "profile: 0x%05lX   %12u %14llu  %s%s%s\n",
+ 			        top[i], profile_hist_hits ? profile_hist_hits[top[i]] : 0u,
+-			        profile_hist_cyc[top[i]]);
++			        profile_hist_cyc[top[i]], where ? where : "",
++			        src ? "  " : "", src ? src : "");
++		}
+ 		free(top);
+ 	}
+ 	if (f != stderr) fclose(f);
+@@ -4767,6 +4833,11 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_BOOL("gdb-pseudo-regs", &xroar.cfg.debug.gdb_pseudo_regs) },
+ 	{ XC_SET_BOOL("trace", &logging.trace_cpu) },
+ 	{ XC_SET_BOOL("trace-timing", &logging.trace_cpu_timing) },
++	// Not inside WANT_TRAPS: -load-ram and the gdb target take addresses
++	// too, and a build without traps still wants names on them.  Order
++	// matters on the command line -- see symtab.h.
++	{ XC_CALL_STRING("symbols", &symfile_load) },
++	{ XC_CALL_STRING("symbols-query", &symfile_query) },
+ #ifdef WANT_TRAPS
+ 	{ XC_CALL_STRING("trap", &set_trap) },
+ 	{ XC_CALL_STRING("trap-range", &set_trap_count) },
+@@ -5041,6 +5112,13 @@ static void helptext(void) {
+ "  -debug-ui FLAGS       UI debugging (see manual, or -1 for all)\n"
+ "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
+ "  -q, -quiet            equivalent to -verbose 0\n"
++"  -symbols FILE[,build=ID]  load a symbol file; then @Name is an address\n"
++"                          anywhere one is taken, and output is symbolized.\n"
++"                          Repeatable (symbols and line records are separate\n"
++"                          files).  MUST precede any option that uses @.\n"
++"                          @Name, @IMAGE:Name, either +OFFSET.  A bare name\n"
++"                          two images define is an error, not a guess.\n"
++"  -symbols-query N[,N]  resolve names (or numbers, backwards) and exit\n"
+ #ifdef WANT_TRAPS
+ "  -trap CONDITION       configure trap (write=A may add ,value=V; decimal by\n"
+ "                          default, 0x prefix for hex; 0x + 1-4 digits =\n"

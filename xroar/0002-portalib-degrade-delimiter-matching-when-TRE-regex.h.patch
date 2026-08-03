@@ -1,0 +1,148 @@
+From 6ed3c92ef147adbc422cdfef07a1449e352c1710 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:39:37 -0400
+Subject: [PATCH 02/44] portalib: degrade delimiter matching when TRE/regex.h
+
+---
+ portalib/sdsx.c | 94 ++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 89 insertions(+), 5 deletions(-)
+
+diff --git a/portalib/sdsx.c b/portalib/sdsx.c
+index cd4abce..2d05ada 100644
+--- a/portalib/sdsx.c
++++ b/portalib/sdsx.c
+@@ -594,6 +594,77 @@ sds sdsx_cat_parse_str_len(sds s, const char *str, size_t len) {
+ 
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
++// Match the small set of delimiter expressions used by XRoar without requiring
++// a full regular-expression library.  This is only used on systems with neither
++// a POSIX regex.h nor TRE (notably MinGW).
++
++#if !defined(HAVE_TRE) && !defined(HAVE_REGEX_H)
++
++static size_t delimiter_hspace_span(const char *p, size_t len) {
++	size_t n = 0;
++	while (n < len && (p[n] == ' ' || p[n] == '\t'))
++		n++;
++	return n;
++}
++
++static _Bool delimiter_match(const char *ere, const char *p, size_t len,
++			      size_t *match_len) {
++	if (strcmp(ere, ":") == 0 || strcmp(ere, "=") == 0 || strcmp(ere, ",") == 0) {
++		if (len > 0 && p[0] == ere[0]) {
++			*match_len = 1;
++			return 1;
++		}
++		return 0;
++	}
++
++	size_t n = delimiter_hspace_span(p, len);
++
++	if (strcmp(ere, "[ \t]+") == 0) {
++		if (n > 0) {
++			*match_len = n;
++			return 1;
++		}
++		return 0;
++	}
++
++	if (strcmp(ere, "[ \t]*$") == 0) {
++		if (n == len) {
++			*match_len = n;
++			return 1;
++		}
++		return 0;
++	}
++
++	if (strcmp(ere, "([ \t]*=[ \t]*|[ \t]+)") == 0) {
++		if (n < len && p[n] == '=') {
++			size_t m = n + 1;
++			m += delimiter_hspace_span(p + m, len - m);
++			*match_len = m;
++			return 1;
++		}
++		if (n > 0) {
++			*match_len = n;
++			return 1;
++		}
++		return 0;
++	}
++
++	if (strcmp(ere, "[ \t]*,[ \t]*") == 0) {
++		if (n < len && p[n] == ',') {
++			size_t m = n + 1;
++			m += delimiter_hspace_span(p + m, len - m);
++			*match_len = m;
++			return 1;
++		}
++		return 0;
++	}
++
++	fprintf(stderr, "Unsupported delimiter expression without regex support: %s\n", ere);
++	abort();
++}
++
++#endif
++
+ // Tokenise a string, accounting for quoted sections and escape sequences.
+ //
+ // Token is all characters up to the next match of 'ere' (a POSIX Extended
+@@ -620,6 +691,7 @@ sds sdsx_tok_str_len(const char **s, size_t *lenp, const char *ere, bool parse)
+ 	}
+ 	const char *p = *s;
+ 
++#if defined(HAVE_TRE) || defined(HAVE_REGEX_H)
+ 	int errcode;
+ 	regex_t preg;
+ 	regmatch_t pmatch;
+@@ -627,6 +699,7 @@ sds sdsx_tok_str_len(const char **s, size_t *lenp, const char *ere, bool parse)
+ 		fprintf(stderr, "Error in regex: %d\n", errcode);
+ 		abort();
+ 	}
++#endif
+ 
+ 	int quote = 0;
+ 
+@@ -654,16 +727,25 @@ sds sdsx_tok_str_len(const char **s, size_t *lenp, const char *ere, bool parse)
+ 			// delimiter?
+ 			// TODO: there's definitely a better way of doing this,
+ 			// but for now, run the match every time we get here.
+-			if (regexec(&preg, p, 1, &pmatch, 0) == 0 && pmatch.rm_so == 0) {
++			size_t delimiter_len = 0;
++#if defined(HAVE_TRE) || defined(HAVE_REGEX_H)
++			_Bool delimiter_found =
++				(regexec(&preg, p, 1, &pmatch, 0) == 0 && pmatch.rm_so == 0);
++			if (delimiter_found)
++				delimiter_len = pmatch.rm_eo;
++#else
++			_Bool delimiter_found = delimiter_match(ere, p, len, &delimiter_len);
++#endif
++			if (delimiter_found) {
+ 				if (parse)
+ 					r = sdsx_cat_parse_str_len(r, sp, p - sp);
+ 				else
+ 					r = sdscatlen(r, sp, p - sp);
+ 				// sanity check
+-				if ((size_t)pmatch.rm_eo > len)
+-					pmatch.rm_eo = len;
+-				p += pmatch.rm_eo;
+-				len -= pmatch.rm_eo;
++				if (delimiter_len > len)
++					delimiter_len = len;
++				p += delimiter_len;
++				len -= delimiter_len;
+ 				sp = p;
+ 				break;
+ 			}
+@@ -708,7 +790,9 @@ sds sdsx_tok_str_len(const char **s, size_t *lenp, const char *ere, bool parse)
+ 
+ 	} while (len > 0);
+ 
++#if defined(HAVE_TRE) || defined(HAVE_REGEX_H)
+ 	regfree(&preg);
++#endif
+ 
+ 	// if we're still in quote mode by the end of the string, that's an
+ 	// error.

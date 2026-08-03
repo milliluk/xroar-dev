@@ -1,0 +1,186 @@
+From 4ef8c40da47fce15dc29e895de0160b97a00074b Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:42:27 -0400
+Subject: [PATCH 44/44] headless: -headless, one flag for an automation run
+
+An automation run wants no window, no audio device, no wall-clock throttle
+and no emulated floppy seek latency. That was four things to remember, and
+forgetting the throttle costs the whole difference between a run that takes
+seconds and one that takes minutes -- note it is the null *audio* driver
+that enforces real time, with nanosleep, so "there is no display to sync
+to" was never the reprieve it sounds like.
+
+-headless supplies all four. Each is a default and never an override, so
+naming one explicitly wins from either side of it: -headless -ratelimit and
+-ratelimit -headless both keep the throttle. That needs to distinguish "set
+to 1" from "left at 1", which a plain XC_SET_BOOL cannot, so -disk-fast and
+-ratelimit now record that the command line named them.
+
+A build with no windowing UI compiled in can only run this way, so it
+defaults to -headless; -no-headless puts the interactive behaviour back.
+The build decides that one flag and nothing else -- every consequence
+follows from it, rather than from defaults scattered across the file.
+
+-config-print reports the flag and what it resolved to, since the resolution
+happens before the print. A GUI build still needs -headless to be told; the
+UI compiled in is not evidence of how this particular run is meant to go.
+---
+ src/xroar.c | 68 +++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 64 insertions(+), 4 deletions(-)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index ac57dd3..0e89bec 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -97,6 +97,16 @@
+ #include "windows32/common_windows32.h"
+ #endif
+ 
++// A build with no windowing UI compiled in can only ever run headless, so
++// -headless is its default. This is the only thing the build decides; every
++// consequence follows from the one flag, and -no-headless undoes all of it.
++#if defined(HAVE_GTK3) || defined(HAVE_GTK2) || defined(WINDOWS32_UI) || \
++    defined(HAVE_WASM) || defined(HAVE_COCOA) || defined(WANT_UI_SDL)
++#define XROAR_DEFAULT_HEADLESS (0)
++#else
++#define XROAR_DEFAULT_HEADLESS (1)
++#endif
++
+ // Global emulator state
+ 
+ struct xroar xroar = {
+@@ -349,6 +359,18 @@ struct private_cfg {
+ 	// User interface
+ 	char *ui_module;
+ 
++	// -headless: this run is automation. Implies the null UI, null audio, no
++	// rate limit and fast disk -- each only where the command line did not
++	// say otherwise, so order on the command line never matters. Defaults on
++	// in a build with no windowing UI compiled in, which can only run this
++	// way; -no-headless puts the interactive behaviour back.
++	bool headless;
++
++	// Set when the command line named these itself, so -headless knows not to
++	// overrule a stated preference.
++	bool ratelimit_given;
++	bool disk_fast_given;
++
+ 	// Video
+ 	struct {
+ 		bool fullscreen;
+@@ -450,6 +472,7 @@ static struct private_cfg private_cfg = {
+ 	.debug.trap_def.no_trace = -1,
+ #endif
+ 	.debug.ratelimit = 1,
++	.headless = XROAR_DEFAULT_HEADLESS,
+ };
+ 
+ static struct ui_cfg xroar_ui_cfg = {
+@@ -1247,6 +1270,25 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 
+ 	// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
++	// -headless: an automation run wants no window, no audio device, no
++	// wall-clock throttle and no emulated floppy seek latency. Each of those
++	// is supplied as a default and never as an override, so naming one
++	// explicitly wins no matter which side of -headless it appeared on.
++	//
++	// Resolved here, after parsing and before anything reads these: the UI
++	// and audio modules are chosen further down, and -config-print below
++	// reports what the run will actually use rather than what was typed.
++	if (private_cfg.headless) {
++		if (!private_cfg.ui_module)
++			private_cfg.ui_module = xstrdup("null");
++		if (!private_cfg.ao_module)
++			private_cfg.ao_module = xstrdup("null");
++		if (!private_cfg.ratelimit_given)
++			private_cfg.debug.ratelimit = 0;
++		if (!private_cfg.disk_fast_given)
++			xroar.cfg.disk.fast = 1;
++	}
++
+ 	// Help text
+ 
+ #ifndef HAVE_WASM
+@@ -4722,6 +4764,20 @@ static union {
+ extern char *coco3_serial_out_file;
+ extern int coco3_serial_out_baud;
+ 
++// These two go through a callback purely to record that the command line said
++// something, so -headless can supply a default without ever overruling one.
++// A plain XC_SET_BOOL cannot distinguish "set to 1" from "left at 1".
++
++static void set_ratelimit(bool value) {
++	private_cfg.debug.ratelimit = value;
++	private_cfg.ratelimit_given = 1;
++}
++
++static void set_disk_fast(bool value) {
++	xroar.cfg.disk.fast = value;
++	private_cfg.disk_fast_given = 1;
++}
++
+ static struct xconfig_option const xroar_options[] = {
+ 	/* Machines: */
+ 	{ XC_CALL_STRING("default-machine", &set_default_machine) },
+@@ -4807,7 +4863,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_BOOL("disk-write-back", &xroar.cfg.disk.write_back) },
+ 	{ XC_SET_BOOL("disk-auto-os9", &xroar.cfg.disk.auto_os9) },
+ 	{ XC_SET_BOOL("disk-auto-sd", &xroar.cfg.disk.auto_sd) },
+-	{ XC_SET_BOOL("disk-fast", &xroar.cfg.disk.fast) },
++	{ XC_CALL_BOOL("disk-fast", &set_disk_fast) },
+ 
+ 	/* Firmware ROM images: */
+ 	{ XC_SET_STRING_NE("rompath", &xroar.cfg.file.rompath) },
+@@ -4819,6 +4875,7 @@ static struct xconfig_option const xroar_options[] = {
+ 
+ 	/* User interface: */
+ 	{ XC_SET_STRING("ui", &private_cfg.ui_module) },
++	{ XC_SET_BOOL("headless", &private_cfg.headless) },
+ 	/* Deliberately undocumented: */
+ 	{ XC_SET_STRING("filereq", &xroar_ui_cfg.filereq) },
+ 
+@@ -4895,7 +4952,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT("serial-out-baud", &coco3_serial_out_baud) },
+ 
+ 	/* Emulator actions: */
+-	{ XC_SET_BOOL("ratelimit", &private_cfg.debug.ratelimit) },
++	{ XC_CALL_BOOL("ratelimit", &set_ratelimit) },
+ 	{ XC_SET_STRING_LIST("type", &private_cfg.kbd.type_list) },
+ 	{ XC_SET_DOUBLE("init-delay", &xroar.cfg.kbd.init_delay) },
+ 	{ XC_SET_BOOL("init-delay-random", &xroar.cfg.kbd.init_delay_random) },
+@@ -5067,7 +5124,7 @@ static void helptext(void) {
+ "  -no-disk-write-back   don't default to enabling write-back for disk images\n"
+ "  -no-disk-auto-os9     don't try to detect headerless OS-9 JVC disk images\n"
+ "  -no-disk-auto-sd      don't assume single density for 10 sec/track disks\n"
+-"  -disk-fast            skip FDC seek/settle/rotational delays\n"
++"  -disk-fast            skip FDC seek/settle/rotational delays (implied by -headless)\n"
+ "\n"
+ 
+ " Hard disks:\n"
+@@ -5133,6 +5190,8 @@ static void helptext(void) {
+ 
+ " User interface:\n"
+ "  -ui MODULE            user-interface module (-ui help for list)\n"
++"  -headless             automation run: null UI/audio, no rate limit, fast disk\n"
++"                        (default in a build with no windowing UI; -no-headless undoes it)\n"
+ "\n"
+ 
+ " Video:\n"
+@@ -5182,7 +5241,7 @@ static void helptext(void) {
+ "  -gdb-pseudo-regs      enable pseudo-registers (e.g. SAM, PIA) for GDB\n"
+ #endif
+ "  -emuext               enable lwasm emuext opcodes (BREAK, LOG)\n"
+-"  -no-ratelimit         run cpu as fast as possible\n"
++"  -no-ratelimit         run cpu as fast as possible (implied by -headless)\n"
+ #ifdef TRACE
+ "  -trace                start with trace mode on\n"
+ "  -trace-timing         print timings in trace mode\n"
+@@ -5370,6 +5429,7 @@ static void config_print_all(FILE *f, bool all) {
+ 	xroar_cfg_print_bool(f, all, "disk-write-back", xroar.cfg.disk.write_back, 1);
+ 	xroar_cfg_print_bool(f, all, "disk-auto-os9", xroar.cfg.disk.auto_os9, 1);
+ 	xroar_cfg_print_bool(f, all, "disk-auto-sd", xroar.cfg.disk.auto_sd, 1);
++	xroar_cfg_print_bool(f, all, "headless", private_cfg.headless, XROAR_DEFAULT_HEADLESS);
+ 	xroar_cfg_print_bool(f, all, "disk-fast", xroar.cfg.disk.fast, 0);
+ 	fputs("\n", f);
+ 

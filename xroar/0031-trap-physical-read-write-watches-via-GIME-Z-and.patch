@@ -1,0 +1,535 @@
+From e35c8ac1b9ba97f839184873b34c0d6cd215baf8 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:30 -0400
+Subject: [PATCH 31/44] trap: physical read=/write= watches via GIME Z, and
+
+---
+ src/breakpoint.h    |  14 ++++
+ src/coco3.c         |  45 ++++++++++++
+ src/dragon/dragon.c |  24 +++++++
+ src/dragon/dragon.h |   1 +
+ src/machine.h       |  13 ++++
+ src/mc10.c          |  25 +++++++
+ src/xroar.c         | 171 +++++++++++++++++++++++++++++++++++++++-----
+ 7 files changed, 276 insertions(+), 17 deletions(-)
+
+diff --git a/src/breakpoint.h b/src/breakpoint.h
+index a07c29b..beeee97 100644
+--- a/src/breakpoint.h
++++ b/src/breakpoint.h
+@@ -122,4 +122,18 @@ inline void bp_check_watchpoints(struct bp_watchpoint_set *set, bool RnW, uint32
+ 	}
+ }
+ 
++// Physical watchpoints.  addr/addr_end are flat physical addresses; the
++// machine calls the hooks with the decode's own final physical address for
++// each CPU RAM cycle while the corresponding list is non-empty.
++// Opaque here: this header does not include the definition, so declare
++// the tag at file scope, or each prototype below invents its own
++// incompatible one and -Werror rejects the lot.
++struct bp_session;
++void bp_wp_phys_add_range(struct bp_session *bps, unsigned type,
++			  unsigned addr, unsigned addr_end, DELEGATE_T0(void) handler);
++void bp_wp_phys_remove_range(struct bp_session *bps, unsigned type,
++			     unsigned addr, unsigned addr_end);
++void bp_wp_phys_read_hook(struct bp_session *bps, unsigned phys, uint8_t value);
++void bp_wp_phys_write_hook(struct bp_session *bps, unsigned phys, uint8_t value);
++
+ #endif
+diff --git a/src/coco3.c b/src/coco3.c
+index c4d69ca..8bb5726 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -177,6 +177,7 @@ struct coco3 {
+ #endif
+ 	struct bp_breakpoint_set breakpoint_set;
+ 	struct bp_watchpoint_set watchpoint_set;
++	struct bp_watchpoint_set pwatchpoint_set;  // physical-address watchpoints
+ 
+ 	struct tape_interface *tape_interface;
+ 	DELEGATE_T1(void, float) tape_update_audio;
+@@ -377,9 +378,29 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+ 				 DELEGATE_T2(void, bool, uint32) handler);
+ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+ 				    DELEGATE_T2(void, bool, uint32) handler);
++static void coco3_add_pwatchpoint(struct machine *m, bool RnW,
++				 uint32_t Astart, uint32_t Aend,
++				 DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct coco3 *mcc3 = (struct coco3 *)m;
++	bp_watchpoint_add(&mcc3->pwatchpoint_set, RnW, Astart, Aend, handler);
++}
++
++static void coco3_remove_pwatchpoint(struct machine *m, int RnW,
++				    int32_t Astart, uint32_t Aend,
++				    DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct coco3 *mcc3 = (struct coco3 *)m;
++	bp_watchpoint_remove(&mcc3->pwatchpoint_set, RnW, Astart, Aend, handler);
++}
++
+ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+ 				 uint32_t Astart, uint32_t Aend,
+ 				 DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void coco3_add_pwatchpoint(struct machine *m, bool RnW,
++				 uint32_t Astart, uint32_t Aend,
++				 DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void coco3_remove_pwatchpoint(struct machine *m, int RnW,
++				    int32_t Astart, uint32_t Aend,
++				    DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void coco3_remove_watchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+ 				    DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -483,6 +504,8 @@ static struct part *coco3_allocate(void) {
+ 	m->debug.remove_instruction_hook = coco3_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = coco3_remove_breakpoint;
+ 	m->debug.add_watchpoint = coco3_add_watchpoint;
++	m->debug.add_pwatchpoint = coco3_add_pwatchpoint;
++	m->debug.remove_pwatchpoint = coco3_remove_pwatchpoint;
+ 	m->debug.remove_watchpoint = coco3_remove_watchpoint;
+ 
+ 	m->keyboard.type = dkbd_layout_coco3;
+@@ -1453,10 +1476,21 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 		if (!mcc3->dat.MMUEN || (mcc3->dat.MC3 && A >= 0xfe00 && A < 0xff00)) {
+ 			// MMU not enabled, or CRM enabled and CRM region
+ 			ram_d8(mcc3->RAM, nWE, 0, Zrow, Zcol, &mcc3->CPU->D);
++#ifdef WANT_GDB_TARGET
++			// Physical watchpoint: GIME Z is the decode's own flat
++			// physical address for this cycle; no re-translation.
++			if (mcc3->pwatchpoint_set.list[1])
++				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, mcc3->GIME->Z, mcc3->CPU->D);
++#endif
+ 		} else {
+ 			// Otherwise, translate
+ 			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
+ 			ram_d8(mcc3->RAM, nWE, bank, Zrow, Zcol, &mcc3->CPU->D);
++#ifdef WANT_GDB_TARGET
++			// DAT board: the extra bank bits extend the flat address.
++			if (mcc3->pwatchpoint_set.list[1])
++				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
++#endif
+ 		}
+ 	}
+ }
+@@ -1525,10 +1559,21 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+ 		if (!mcc3->dat.MMUEN || (mcc3->dat.MC3 && A >= 0xfe00 && A < 0xff00)) {
+ 			// MMU not enabled, or CRM enabled and CRM region
+ 			ram_d8(mcc3->RAM, nWE, 0, Zrow, Zcol, &mcc3->CPU->D);
++#ifdef WANT_GDB_TARGET
++			// Physical watchpoint: GIME Z is the decode's own flat
++			// physical address for this cycle; no re-translation.
++			if (mcc3->pwatchpoint_set.list[0])
++				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, mcc3->GIME->Z, mcc3->CPU->D);
++#endif
+ 		} else {
+ 			// Otherwise, translate
+ 			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
+ 			ram_d8(mcc3->RAM, nWE, bank, Zrow, Zcol, &mcc3->CPU->D);
++#ifdef WANT_GDB_TARGET
++			// DAT board: the extra bank bits extend the flat address.
++			if (mcc3->pwatchpoint_set.list[0])
++				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
++#endif
+ 		}
+ 	}
+ }
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 4bd5fc3..3b08c0b 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -255,6 +255,12 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+ static void dragon_add_watchpoint(struct machine *m, bool RnW,
+ 				  uint32_t Astart, uint32_t Aend,
+ 				  DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void dragon_add_pwatchpoint(struct machine *m, bool RnW,
++				 uint32_t Astart, uint32_t Aend,
++				 DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void dragon_remove_pwatchpoint(struct machine *m, int RnW,
++				    int32_t Astart, uint32_t Aend,
++				    DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ 				     int32_t Astart, uint32_t Aend,
+ 				     DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -320,6 +326,8 @@ void dragon_allocate_common(struct dragon *md) {
+ 	m->debug.remove_instruction_hook = dragon_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = dragon_remove_breakpoint;
+ 	m->debug.add_watchpoint = dragon_add_watchpoint;
++	m->debug.add_pwatchpoint = dragon_add_pwatchpoint;
++	m->debug.remove_pwatchpoint = dragon_remove_pwatchpoint;
+ 	m->debug.remove_watchpoint = dragon_remove_watchpoint;
+ 
+ 	m->keyboard.type = dkbd_layout_dragon;
+@@ -1092,6 +1100,8 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+ 
+ 	// Check watchpoints
+ 	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
++	if (md->pwatchpoint_set.list[0] || md->pwatchpoint_set.list[1])
++		bp_check_watchpoints(&md->pwatchpoint_set, RnW, A, md->CPU->D);
+ 	xroar_cpu_cycles += 1;  // one call per 6809 bus cycle = one CPU cycle
+ 
+ 	// SAM decode / timing
+@@ -1368,6 +1378,20 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+ 	}
+ }
+ 
++static void dragon_add_pwatchpoint(struct machine *m, bool RnW,
++				 uint32_t Astart, uint32_t Aend,
++				 DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct dragon *md = (struct dragon *)m;
++	bp_watchpoint_add(&md->pwatchpoint_set, RnW, Astart, Aend, handler);
++}
++
++static void dragon_remove_pwatchpoint(struct machine *m, int RnW,
++				    int32_t Astart, uint32_t Aend,
++				    DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct dragon *md = (struct dragon *)m;
++	bp_watchpoint_remove(&md->pwatchpoint_set, RnW, Astart, Aend, handler);
++}
++
+ static void dragon_add_watchpoint(struct machine *m, bool RnW,
+ 				  uint32_t Astart, uint32_t Aend,
+ 				  DELEGATE_T3(void, bool, uint32, uint8) handler) {
+diff --git a/src/dragon/dragon.h b/src/dragon/dragon.h
+index 36cc61c..26b2bd8 100644
+--- a/src/dragon/dragon.h
++++ b/src/dragon/dragon.h
+@@ -94,6 +94,7 @@ struct dragon {
+ #endif
+ 	struct bp_breakpoint_set breakpoint_set;
+ 	struct bp_watchpoint_set watchpoint_set;
++	struct bp_watchpoint_set pwatchpoint_set;  // physical == CPU address here
+ 
+ 	struct tape_interface *tape_interface;
+ 	DELEGATE_T1(void, float) tape_update_audio;
+diff --git a/src/machine.h b/src/machine.h
+index 04299e0..9bab82c 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -250,6 +250,17 @@ struct machine {
+ 					  int32_t Astart, uint32_t Aend,
+ 					  DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
++		// Physical watchpoints: matched against the flat physical
++		// address the machine's own decode produced for the cycle (GIME
++		// Z on the CoCo 3), so they see a byte wherever it is banked.
++		// On machines with no MMU these match the CPU address.
++		void (*add_pwatchpoint)(struct machine *, bool RnW,
++				       uint32_t Astart, uint32_t Aend,
++				       DELEGATE_T3(void, bool, uint32, uint8) handler);
++		void (*remove_pwatchpoint)(struct machine *, int RnW,
++					  int32_t Astart, uint32_t Aend,
++					  DELEGATE_T3(void, bool, uint32, uint8) handler);
++
+ 		// CPU debug information copied from main CPU (the one that
+ 		// would be debugged)
+ 		struct debug_cpu cpu;
+@@ -301,6 +312,8 @@ void machine_remove_hbreak(struct machine *m, int32_t A);
+ #define machine_add_instruction_hook(m,h) (m)->debug.add_instruction_hook((m), (h))
+ #define machine_remove_instruction_hook(m,h) (m)->debug.remove_instruction_hook((m), (h))
+ #define machine_add_watchpoint(m,rnw,as,ae,h) (m)->debug.add_watchpoint((m), (rnw), (as), (ae), (h))
++#define machine_add_pwatchpoint(m,rnw,as,ae,h) (m)->debug.add_pwatchpoint((m), (rnw), (as), (ae), (h))
++#define machine_remove_pwatchpoint(m,rnw,as,ae,h) (m)->debug.remove_pwatchpoint((m), (rnw), (as), (ae), (h))
+ #define machine_remove_watchpoint(m,rnw,as,ae,h) (m)->debug.remove_watchpoint((m), (rnw), (as), (ae), (h))
+ 
+ #define machine_remove_watchpoint_all(m,s) machine_remove_watchpoint((m), -1, 0, DELEGATE_AS3(void, bool, uint32, uint8, NULL, (s)))
+diff --git a/src/mc10.c b/src/mc10.c
+index c9c87cd..b9d3ae9 100644
+--- a/src/mc10.c
++++ b/src/mc10.c
+@@ -92,6 +92,7 @@ struct mc10 {
+ #endif
+ 	struct bp_breakpoint_set breakpoint_set;
+ 	struct bp_watchpoint_set watchpoint_set;
++	struct bp_watchpoint_set pwatchpoint_set;  // physical == CPU address here
+ 
+ 	struct tape_interface *tape_interface;
+ 	DELEGATE_T1(void, float) tape_update_audio;
+@@ -226,6 +227,12 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+ static void mc10_add_watchpoint(struct machine *m, bool RnW,
+ 				uint32_t Astart, uint32_t Aend,
+ 				DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void mc10_add_pwatchpoint(struct machine *m, bool RnW,
++				 uint32_t Astart, uint32_t Aend,
++				 DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void mc10_remove_pwatchpoint(struct machine *m, int RnW,
++				    int32_t Astart, uint32_t Aend,
++				    DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void mc10_remove_watchpoint(struct machine *m, int RnW,
+ 				   int32_t Astart, uint32_t Aend,
+ 				   DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -300,6 +307,8 @@ static struct part *mc10_allocate(void) {
+ 	m->debug.remove_instruction_hook = mc10_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = mc10_remove_breakpoint;
+ 	m->debug.add_watchpoint = mc10_add_watchpoint;
++	m->debug.add_pwatchpoint = mc10_add_pwatchpoint;
++	m->debug.remove_pwatchpoint = mc10_remove_pwatchpoint;
+ 	m->debug.remove_watchpoint = mc10_remove_watchpoint;
+ 
+ 	m->get_interface = mc10_get_interface;
+@@ -920,6 +929,20 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+ 	}
+ }
+ 
++static void mc10_add_pwatchpoint(struct machine *m, bool RnW,
++				 uint32_t Astart, uint32_t Aend,
++				 DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct mc10 *mp = (struct mc10 *)m;
++	bp_watchpoint_add(&mp->pwatchpoint_set, RnW, Astart, Aend, handler);
++}
++
++static void mc10_remove_pwatchpoint(struct machine *m, int RnW,
++				    int32_t Astart, uint32_t Aend,
++				    DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct mc10 *mp = (struct mc10 *)m;
++	bp_watchpoint_remove(&mp->pwatchpoint_set, RnW, Astart, Aend, handler);
++}
++
+ static void mc10_add_watchpoint(struct machine *m, bool RnW,
+ 				  uint32_t Astart, uint32_t Aend,
+ 				  DELEGATE_T3(void, bool, uint32, uint8) handler) {
+@@ -1095,6 +1118,8 @@ static void mc10_mem_cycle(void *sptr, bool RnW, uint16_t A) {
+ 	}
+ #ifdef WANT_GDB_TARGET
+ 	bp_check_watchpoints(&mp->watchpoint_set, RnW, A, mp->CPU->D);
++	if (mp->pwatchpoint_set.list[0] || mp->pwatchpoint_set.list[1])
++		bp_check_watchpoints(&mp->pwatchpoint_set, RnW, A, mp->CPU->D);
+ #endif
+ 
+ 	int ncycles = 16;
+diff --git a/src/xroar.c b/src/xroar.c
+index b56cfa7..f677d52 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -155,6 +155,11 @@ struct trap_def {
+ 	int screenshot_kind;         // 0=unset, 1=single, 2=bounded, 3=unbounded
+ 	unsigned long screenshot_last;   // captured upper bound when bounded
+ 	long match_value;   // value= qualifier for write traps, or -1 for none
++	char *byte_path;    // -trap-byte FILE; append the satisfying byte
++	FILE *byte_stream;  // open stream for byte_path
++	int wp_dir;         // 1 read=, 0 write=, 2 access=, else -1
++	bool wp_phys;       // the read=/write=/access= range is physical
++	unsigned long wp_lo, wp_hi;  // armed range, for the disable path
+ 	long xpcr_lo;       // xpcrange= physical range low, or -1 for none
+ 	long xpcr_hi;       // xpcrange= physical range high
+ 	bool xpcr_inside;   // xpcrange= edge state: PC was inside on the last fetch
+@@ -3418,6 +3423,57 @@ static void handle_seconds_trigger(void *sptr) {
+ 	event_queue(&trg->event);
+ }
+ 
++// Address-space classification by digit count, applied uniformly to every
++// address a trap condition takes: 1-4 hex digits is a 16-bit LOGICAL address,
++// 5-6 digits is PHYSICAL (leading zeros meaningful: 0x08000 is physical, low
++// 512K; 0x8000 is logical).  Decimal gets the same rule by magnitude as a
++// fallback, but hex is the documented form.  Returns 0 logical, 1 physical,
++// -1 unclassifiable.  A range must not mix spaces; the caller errors on that.
++static int trap_addr_space(const char *tok) {
++	if (!tok || !*tok)
++		return -1;
++	if (tok[0] == '$') {
++		tok++;
++	} else if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
++		tok += 2;
++	} else {
++		// Decimal (or garbage; parse_range_ul will decide): classify by
++		// magnitude so plain numbers keep working.
++		char *end;
++		unsigned long v = strtoul(tok, &end, 10);
++		if (end == tok)
++			return -1;
++		return (v > 0xffff) ? 1 : 0;
++	}
++	int n = 0;
++	while (isxdigit((unsigned char)tok[n]))
++		n++;
++	if (n < 1 || n > 6)
++		return -1;
++	return (n >= 5) ? 1 : 0;
++}
++
++// Classify a condition's value: a single address or LO-HI range.  Both sides
++// of a range must agree on address space.  Returns 0/1 as above; exits loudly
++// on a mixed-space range, per the strict-checks convention.
++static int trap_addr_space_range(const char *cond, const char *val) {
++	const char *dash = strchr(val, '-');
++	if (!dash) {
++		return trap_addr_space(val);
++	}
++	char *lo = xstrdup(val);
++	lo[dash - val] = 0;
++	int a = trap_addr_space(lo);
++	int b = trap_addr_space(dash + 1);
++	free(lo);
++	if (a >= 0 && b >= 0 && a != b) {
++		fprintf(stderr, "xroar: -trap %s: range mixes logical (1-4 hex digits) "
++		        "and physical (5-6 digits) addresses\n", cond);
++		exit(EXIT_FAILURE);
++	}
++	return (a >= 0) ? a : b;
++}
++
+ static void enable_trap(struct trap_def *trap, bool enable) {
+ 	if (0 == c_strcasecmp(trap->cond, "immediate") ||
+ 	    0 == strcmp(trap->cond, "-")) {
+@@ -3527,6 +3583,14 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 		unsigned long a = -1UL, b = -1UL;
+ 		parse_range_ul(val, &a, &b);
+ 
++		// One address grammar for every condition: 1-4 hex digits is
++		// logical, 5-6 is physical.  pc= with a physical address is
++		// exactly the xpc= machinery, so reroute rather than duplicate.
++		int addr_phys = trap_addr_space_range(trap->cond, val);
++		if (addr_phys == 1 && 0 == c_strcasecmp(key, "pc")) {
++			key = "xpc";
++		}
++
+ 		if (a != -1UL) {
+ 			if (b == -1UL) {
+ 				b = a;
+@@ -3567,30 +3631,86 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 					machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_xpcrange_check, trap));
+ 					trap->xpcr_hooked = 0;
+ 				}
+-			} else if (0 == c_strcasecmp(key, "read")) {
+-				if (enable) {
+-					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+-				} else {
+-					machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+-				}
+-			} else if (0 == c_strcasecmp(key, "write")) {
+-				if (enable) {
+-					machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+-				} else {
+-					machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++			} else if (0 == c_strcasecmp(key, "read") ||
++			           0 == c_strcasecmp(key, "write") ||
++			           0 == c_strcasecmp(key, "access")) {
++				int rd = (0 == c_strcasecmp(key, "read")) ? 1
++				       : (0 == c_strcasecmp(key, "write")) ? 0 : 2;
++				int addr_phys = trap_addr_space_range(trap->cond, val);
++				// Physical bounds: 19 bits stock, 21 with a DAT board.
++				if (addr_phys == 1 && b > 0x1fffff) {
++					fprintf(stderr, "xroar: -trap %s: physical address > 0x1fffff\n",
++					        trap->cond);
++					exit(EXIT_FAILURE);
+ 				}
+-			} else if (0 == c_strcasecmp(key, "access")) {
++				trap->wp_dir = rd;
++				trap->wp_phys = (addr_phys == 1);
++				trap->wp_lo = a;
++				trap->wp_hi = b;
+ 				if (enable) {
+-					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+-					machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					if (rd == 1 || rd == 2) {
++						if (trap->wp_phys)
++							machine_add_pwatchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++						else
++							machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					}
++					if (rd == 0 || rd == 2) {
++						if (trap->wp_phys)
++							machine_add_pwatchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++						else
++							machine_add_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					}
+ 				} else {
+-					machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+-					machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					if (rd == 1 || rd == 2) {
++						if (trap->wp_phys)
++							machine_remove_pwatchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++						else
++							machine_remove_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					}
++					if (rd == 0 || rd == 2) {
++						if (trap->wp_phys)
++							machine_remove_pwatchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++						else
++							machine_remove_watchpoint(xroar.machine, 0, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
++					}
+ 				}
+ 			}
+ 		}
+ 		free(cond_copy);
+ 	}
++
++	// -trap-byte: append the byte that satisfied a read=/write=/access=
++	// condition.  Meaningless on any other condition; refuse loudly, per
++	// the strict-checks convention, instead of silently never writing.
++	if (trap->byte_path) {
++		// A byte stream means continuous capture: a one-shot byte file is
++		// never what was asked for.  With no explicit -trap-range, keep
++		// the trap armed forever (an open 1- range); an explicit range
++		// still bounds it.
++		if (enable && !trap->count) {
++			struct trap_count_range *r = xmalloc(sizeof(*r));
++			r->first = 1;
++			r->last = (unsigned long)-1;
++			trap->count = slist_append(trap->count, r);
++		}
++		if (!trap->wp_dir) {
++			fprintf(stderr, "xroar: -trap-byte %s: only valid on a "
++			        "read=/write=/access= trap (got %s)\n",
++			        trap->byte_path, trap->cond);
++			exit(EXIT_FAILURE);
++		}
++		if (enable && !trap->byte_stream) {
++			trap->byte_stream = fopen(trap->byte_path, "ab");
++			if (!trap->byte_stream) {
++				fprintf(stderr, "xroar: -trap-byte %s: %s\n",
++				        trap->byte_path, strerror(errno));
++				exit(EXIT_FAILURE);
++			}
++		} else if (!enable && trap->byte_stream) {
++			fclose(trap->byte_stream);
++			trap->byte_stream = NULL;
++		}
++	}
+ }
+ 
+ static void enable_all_traps(void) {
+@@ -3977,6 +4097,15 @@ static void handle_trap(void *sptr) {
+ 		return;
+ 	}
+ 
++	// -trap-byte: append the satisfying byte, flushed so the stream is
++	// complete after a kill and live for a tail -f.  Direction picks the
++	// value: a write trap's byte went out on the bus, a read trap's byte
++	// just came off it; access= follows whichever this dispatch was.
++	if (trap->byte_stream && trap->wp_ctx) {
++		putc(trap->wp_value, trap->byte_stream);
++		fflush(trap->byte_stream);
++	}
++
+ 	// Flight recorder: a real trap fire dumps the -trap-history ring,
+ 	// newest entry last.  Both range bounds are checked here: the engine's
+ 	// disable-at-tail design lets one trigger past range->last reach the
+@@ -4181,6 +4310,11 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->ram = private_cfg.debug.trap_def.ram;
+ 			private_cfg.debug.trap_def.ram = NULL;
+ 		}
++		if (private_cfg.debug.trap_def.byte_path) {
++			free(cur_trap_def->byte_path);
++			cur_trap_def->byte_path = private_cfg.debug.trap_def.byte_path;
++			private_cfg.debug.trap_def.byte_path = NULL;
++		}
+ 		if (private_cfg.debug.trap_def.screenshot) {
+ 			free(cur_trap_def->screenshot);
+ 			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
+@@ -4526,6 +4660,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT1("trap-ratelimit-off", &private_cfg.debug.trap_def.ratelimit_off) },
+ 	{ XC_SET_INT1("trap-ratelimit-on", &private_cfg.debug.trap_def.ratelimit_on) },
+ 	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
++	{ XC_SET_STRING("trap-byte", &private_cfg.debug.trap_def.byte_path) },
+ 	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
+ 	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
+ 	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
+@@ -4781,7 +4916,9 @@ static void helptext(void) {
+ "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
+ "  -q, -quiet            equivalent to -verbose 0\n"
+ #ifdef WANT_TRAPS
+-"  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
++"  -trap CONDITION       configure trap (write=A may add ,value=V; 1-4 hex\n"
++"                          digits = logical address, 5-6 = physical)\n"
++"  -trap-byte FILE       append the byte satisfying a read=/write= trap to FILE\n"
+ "  -trap-history N       ring of last N executed physical PCs; dump on any trap\n"
+ "  -profile-range NAME=LO-HI  count fetches and cycles in a physical range\n"
+ "                          (repeatable; LO/HI hex or @Symbol from -symbols)\n"

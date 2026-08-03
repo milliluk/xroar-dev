@@ -1,0 +1,591 @@
+From b5eef5b1e8c63d2c2f747368b55d231c74700c81 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:03 -0400
+Subject: [PATCH 18/44] trap-screenshot: -trap-screenshot +
+
+---
+ src/coco3.c                |  97 +++++++++++++++++++++++++++++++++
+ src/debug.h                |   1 +
+ src/mc6809/mc6809_common.c |  83 +++++++++++++++++++++++++++++
+ src/screenshot.c           |  89 +++++++++++++++++++++++++++++++
+ src/screenshot.h           |  23 ++++++++
+ src/vo.h                   |   5 ++
+ src/xroar.c                | 106 +++++++++++++++++++++++++++++++++++++
+ 7 files changed, 404 insertions(+)
+
+diff --git a/src/coco3.c b/src/coco3.c
+index 399bc40..88b88b7 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -61,6 +61,7 @@
+ #include "tcc1014/tcc1014.h"
+ #include "ui.h"
+ #include "vo.h"
++#include "screenshot.h"
+ #include "xroar.h"
+ 
+ #ifndef M_PI
+@@ -398,6 +399,7 @@ static void coco3_free(struct part *p);
+ // lwasm emuext opcode handlers (wired into the CPU's debug_cpu delegates)
+ static void coco3_emubreak(void *sptr);
+ static void coco3_emulog(void *sptr, const char *s);
++static void coco3_emushot(void *sptr, const char *tmpl);
+ static uint8_t coco3_emuread(void *sptr, uint16_t A);
+ static int32_t coco3_emustate(void *sptr, const char *name);
+ 
+@@ -755,6 +757,7 @@ static bool coco3_finish(struct part *p) {
+ 	mcc3->CPU->debug.cpu.emuext = xroar.cfg.debug.emuext;
+ 	mcc3->CPU->debug.cpu.instruction_break = DELEGATE_AS0(void, coco3_emubreak, mcc3);
+ 	mcc3->CPU->debug.cpu.instruction_log = DELEGATE_AS1(void, charcp, coco3_emulog, mcc3);
++	mcc3->CPU->debug.cpu.instruction_shot = DELEGATE_AS1(void, charcp, coco3_emushot, mcc3);
+ 	mcc3->CPU->debug.cpu.debug_read = DELEGATE_AS1(uint8, uint16, coco3_emuread, mcc3);
+ 	mcc3->CPU->debug.cpu.state_read = DELEGATE_AS1(int32, charcp, coco3_emustate, mcc3);
+ 
+@@ -1023,6 +1026,100 @@ static void coco3_emubreak(void *sptr) {
+ 	LOG_MOD_DEBUG(1, "emu", "BREAK at $%04x\n", pc);
+ }
+ 
++// lwasm emuext LOG screenshot commands (CMD 1 = now, CMD 2 = next frame).  The
++// core hands over one byte of defer flag (0 = now, 1 = defer to vsync) followed
++// by the raw filename template from ROM; everything policy-shaped lives here.
++//
++// Template tokens:
++//   {##}   two-digit auto index, 00 upward, one step per shot this run.
++//   an optional "basename:" prefix is stripped -- it is a readability marker
++//   in ROM source, nothing more; the output is always a basename in a fixed
++//   directory regardless.
++//
++// Safety: the template comes from emulated RAM, so a wild pointer must not be
++// able to scribble outside the sandbox.  Any '/' in the template is rewritten
++// to '_' and the result is dropped into a fixed output dir ($XROAR_DEV_SHOT_DIR,
++// or the current directory).  ROM cannot choose an absolute path through a
++// debug opcode, by design.
++//
++// Cap: 99 shots per process, counted at REQUEST time.  A deferred shot that
++// never reaches its vsync (the run ends first) still burns an index -- the cap
++// is a runaway guard, and counting requests is what stops a deferred loop from
++// queueing thousands of names.  The cost is that a CMD 2 fired on the very last
++// instruction of a run may not land on disk; shoot it CMD 1, or leave the
++// machine a frame to run.  Hit 99 and the command stops writing and stays
++// silent, no wrap, no overwrite.
++#define COCO3_SHOT_CAP 99
++
++static void coco3_emushot(void *sptr, const char *arg) {
++	struct coco3 *mcc3 = sptr;
++	static unsigned shot_count = 0;
++
++	if (shot_count >= COCO3_SHOT_CAP)
++		return;                          // cap reached: silent, as specified
++
++	int defer = (arg[0] != 0);               // byte 0: 0 = now, 1 = next frame
++	const char *tmpl = arg + 1;
++
++	// Drop an optional "basename:" readability prefix.
++	const char *src = tmpl;
++	const char *colon = strchr(tmpl, ':');
++	if (colon && (size_t)(colon - tmpl) == strlen("basename") &&
++	    0 == strncmp(tmpl, "basename", strlen("basename")))
++		src = colon + 1;
++
++	// Expand into a basename buffer: {##} -> two-digit index, '/' -> '_'.
++	char base[256];
++	unsigned b = 0;
++	_Bool had_index = 0;
++	for (unsigned i = 0; src[i] && b < sizeof(base) - 3; i++) {
++		if (src[i] == '{' && src[i+1] == '#' && src[i+2] == '#' && src[i+3] == '}') {
++			b += snprintf(base + b, sizeof(base) - b, "%02u", shot_count);
++			had_index = 1;
++			i += 3;                      // step past "##}" (loop's i++ eats '{')
++			continue;
++		}
++		base[b++] = (src[i] == '/') ? '_' : src[i];
++	}
++	base[b] = 0;
++	if (b == 0) {                            // empty template: give it a name
++		snprintf(base, sizeof(base), "emushot-%02u", shot_count);
++		had_index = 1;
++	}
++	if (!strchr(base, '.')) {                // no extension: it is a PNG
++		size_t l = strlen(base);
++		snprintf(base + l, sizeof(base) - l, ".png");
++	}
++
++	// "." and not "/tmp": this fork builds for Windows as a first-class
++	// target, where /tmp does not exist and guest-requested shots would
++	// land nowhere at all, silently.  The cwd exists everywhere, and the
++	// sandbox property is unchanged -- base is still a sanitised basename.
++	const char *dir = getenv("XROAR_DEV_SHOT_DIR");
++	if (!dir || !*dir) dir = ".";
++	char path[512];
++	snprintf(path, sizeof(path), "%s/%s", dir, base);
++
++	// The headless render instance is normally attached at init when a
++	// screenshot trap is present (see xroar.c).  With -emuext we attach it
++	// there too, so by here vo_interface->renderer exists and holds a real
++	// frame.  Belt and braces: attach on demand if somehow missing.
++	if (!xroar.vo_interface || !xroar.vo_interface->renderer)
++		screenshot_setup_render(xroar.vo_interface);
++
++	// CMD 1 grabs the buffer as-is at the LOG instant; CMD 2 parks the name
++	// and lets screenshot_on_vsync fire it at the next completed frame, so a
++	// page flip / VIEW this code just did is actually visible.
++	screenshot_set_defer(defer);
++	screenshot_request(path, xroar.vo_interface);
++
++	LOG_MOD_DEBUG(1, "emu", "SHOT %u (%s) -> %s%s\n", shot_count,
++	              defer ? "next" : "now", path,
++	              had_index ? "" : " (no {##}: each shot overwrites)");
++	shot_count++;
++	(void)mcc3;
++}
++
+ // lwasm emuext LOG ($103E).  The core has already formatted the text; emit it
+ // verbatim to stderr and, with -emuext and a client attached, mirror it to the
+ // gdb console.
+diff --git a/src/debug.h b/src/debug.h
+index 083575e..efec80d 100644
+--- a/src/debug.h
++++ b/src/debug.h
+@@ -66,6 +66,7 @@ struct debug_cpu {
+ 	_Bool emuext;                               // -emuext: consume + act
+ 	DELEGATE_T0(void) instruction_break;        // BREAK
+ 	DELEGATE_T1(void, charcp) instruction_log;  // LOG, arg = formatted text
++	DELEGATE_T1(void, charcp) instruction_shot;  // SHOT, arg = filename
+ 
+ 	// Side-effect-free memory read for the LOG handler.  Routes to the
+ 	// machine's debug read_byte (no clock advance, no interrupt latching),
+diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
+index 419fcd1..8692414 100644
+--- a/src/mc6809/mc6809_common.c
++++ b/src/mc6809/mc6809_common.c
+@@ -105,11 +105,94 @@ static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
+  * to keep a disabled program running.
+  */
+ 
++// LOG command forms.  A format string whose FIRST byte is 0 is not text (an
++// empty string prints nothing) so it is free to mean "command".  Byte 0 is the
++// sentinel, byte 1 selects the command, the rest is that command's payload.
++// Only 0-then-nonzero is a command; a lone 0 stays an empty text log.  Each
++// command consumes no argument pointers, so PC advances past just the single
++// format pointer (the 2 opcode bytes were already stepped over by the decoder).
++//
++//   CMD 1  screenshot NOW.   Grab the rendered buffer at the instant this LOG
++//                            executes.  Point sample for a specific moment.
++//   CMD 2  screenshot NEXT.  Defer to the next completed video frame, so a
++//                            page flip / VIEW this code just did is visible.
++//          Both take a filename template, NUL-terminated:
++//          "basename:my-shot-{##}".  {##} expands to a two-digit auto index,
++//          00 upward, one per shot this run.  The machine side clamps the
++//          path to a basename in a fixed output dir and caps the run at 99.
++//
++// Extend by claiming another CMD byte; the text path never sees any of this.
++#define EMUEXT_CMD_SHOT_NOW  1
++#define EMUEXT_CMD_SHOT_NEXT 2
++
++static _Bool mc6809_emuext_command(struct MC6809 *cpu, uint16_t fmt, uint16_t after) {
++	uint8_t b0 = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt);
++	if (b0 != 0)
++		return 0;                        // ordinary text (or an empty log)
++	uint8_t cmd = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + 1);
++	if (cmd == 0)
++		return 0;                        // bare 0: an empty text log, not a command
++
++	// -emuext off: a command can't run, and there is nothing useful to
++	// print.  Warn ONCE, then leave PC on the operands so the program runs
++	// into its own data and faults -- same "you forgot -emuext" outcome as a
++	// text log, so the failure teaches the same lesson.  The warning explains
++	// the crash that is about to happen.
++	if (!cpu->debug.cpu.emuext) {
++		static _Bool warned = 0;
++		if (!warned) {
++			warned = 1;
++			fprintf(stderr, "[emu] LOG command hit with -emuext off; "
++			        "PC not advanced, the program will now crash. "
++			        "Pass -emuext.\n");
++		}
++		return 1;                        // handled: do NOT advance PC
++	}
++
++	if (cmd == EMUEXT_CMD_SHOT_NOW || cmd == EMUEXT_CMD_SHOT_NEXT) {
++		// Read the template (byte 2 onward) into a local buffer, with the
++		// defer flag as a one-byte prefix so the single instruction_shot
++		// delegate carries both.  The machine-side handler does token
++		// expansion, the path clamp and the 99 cap; the core just ferries
++		// the string across, same shape as instruction_log.
++		char arg[258];
++		arg[0] = (cmd == EMUEXT_CMD_SHOT_NEXT) ? 1 : 0;   // 1 = defer to vsync
++		unsigned t = 1;
++		for (unsigned i = 2; t < sizeof(arg) - 1; i++) {
++			uint8_t c = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + i);
++			if (c == 0) break;
++			arg[t++] = c;
++		}
++		arg[t] = 0;
++		REG_PC = after;                  // consume the format pointer
++		DELEGATE_SAFE_CALL(cpu->debug.cpu.instruction_shot, arg);
++		return 1;
++	}
++
++	// Unknown command: advance past the pointer so a newer ROM talking to an
++	// older emulator skips cleanly instead of crashing, and say so once.
++	{
++		static _Bool warned_unknown = 0;
++		if (!warned_unknown) {
++			warned_unknown = 1;
++			fprintf(stderr, "[emu] LOG command %u unknown to this build; "
++			        "skipped.\n", (unsigned)cmd);
++		}
++	}
++	REG_PC = after;
++	return 1;
++}
++
+ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 	uint16_t p = REG_PC;             // cursor over operands; REG_PC untouched
+ 	uint16_t fmt = DELEGATE_CALL(cpu->debug.cpu.debug_read, p) << 8; p++;
+ 	fmt |= DELEGATE_CALL(cpu->debug.cpu.debug_read, p); p++;
+ 
++	// Command form (format string starts 0, CMD): handled entirely here, no
++	// text formatting.  p already points past the single format pointer.
++	if (mc6809_emuext_command(cpu, fmt, p))
++		return;
++
+ 	char out[1024];
+ 	unsigned o = 0;
+ 	_Bool terminated = 0;
+diff --git a/src/screenshot.c b/src/screenshot.c
+index 167074d..9ddab3d 100644
+--- a/src/screenshot.c
++++ b/src/screenshot.c
+@@ -112,3 +112,92 @@ int screenshot_write_png(const char *filename, struct vo_interface *vo) {
+ 	return 0;
+ }
+ #endif
++
++// Headless render instance for -trap-screenshot.  The null UI hands back a
++// vo_interface with no renderer, so the machine's per-scanline render calls go
++// to a no-op and nothing is buffered to capture.  When a screenshot trap is
++// configured we attach a software vo_render here (no display, no GL): the
++// machine's palette / active-area / render delegates then land on it via
++// vo_set_renderer(), every frame is rasterised into a CPU buffer, and
++// screenshot_write_png() reads it through line_to_rgb().  This mirrors the
++// renderer setup in vo_opengl_new() with the GL texture path removed.
++
++#define SS_MAX_VIEWPORT_WIDTH  (800)
++#define SS_MAX_VIEWPORT_HEIGHT (300)
++
++int screenshot_setup_render(struct vo_interface *vo) {
++	if (!vo)
++		return -1;
++	if (vo->renderer)
++		return 0;               // real display build already has one
++
++	struct vo_render *vr = vo_render_new(VO_RENDER_FMT_RGBA8);
++	if (!vr) {
++		LOG_MOD_ERROR("screenshot", "could not create render instance\n");
++		return -1;
++	}
++	// Wires render_line + the palette/active-area delegates the machine
++	// drives, and sets vo->renderer.
++	vo_set_renderer(vo, vr);
++
++	void *buffer = xmalloc(SS_MAX_VIEWPORT_WIDTH * SS_MAX_VIEWPORT_HEIGHT * 4);
++	memset(buffer, 0, SS_MAX_VIEWPORT_WIDTH * SS_MAX_VIEWPORT_HEIGHT * 4);
++	vo_render_set_buffer(vr, buffer);
++
++	// Full CoCo3/Dragon viewport, same defaults vo_opengl uses before any
++	// UI resize.  buffer_pitch must match the viewport width.
++	vo_render_set_viewport(vr, 640, 240);
++	vr->buffer_pitch = 640;
++
++	LOG_MOD_DEBUG(1, "screenshot", "headless render instance ready\n");
++	return 0;
++}
++
++// --- Deferred ("when=next") capture -----------------------------------------
++// By default a trap screenshot is deferred to the next fully-rendered frame so
++// a page flip / VIEW the trap-triggering code just performed is actually
++// visible.  "when=now" restores the historical behaviour of grabbing the buffer
++// as-is at the trap instant.  The buffer, the renderer and the pending slot are
++// all global (one VO), so this state is module-global too.
++
++static int ss_defer = 1;          // 1 = wait for next clean frame (default)
++static char *ss_pending = NULL;   // filename awaiting a clean frame, or NULL
++static int ss_wait_fields = 0;    // rendered fields still to wait
++
++void screenshot_set_defer(int defer) {
++	ss_defer = defer ? 1 : 0;
++}
++
++void screenshot_flush(struct vo_interface *vo) {
++	if (!ss_pending)
++		return;
++	screenshot_write_png(ss_pending, vo);
++	free(ss_pending);
++	ss_pending = NULL;
++	ss_wait_fields = 0;
++}
++
++void screenshot_request(const char *filename, struct vo_interface *vo) {
++	if (!ss_defer) {
++		screenshot_write_png(filename, vo);
++		return;
++	}
++	// Don't drop an earlier pending capture if a second trap fires first.
++	if (ss_pending)
++		screenshot_flush(vo);
++	ss_pending = xstrdup(filename);
++	// The field in progress at the trap latched the old GIME state and may be
++	// torn, so it finishes at the next vsync but isn't trustworthy.  The field
++	// after that is the first one rendered wholly post-trap: capture it.
++	ss_wait_fields = 2;
++}
++
++void screenshot_on_vsync(struct vo_interface *vo, int draw) {
++	if (!ss_pending || !draw)
++		return;
++	if (--ss_wait_fields > 0)
++		return;
++	screenshot_write_png(ss_pending, vo);
++	free(ss_pending);
++	ss_pending = NULL;
++}
+diff --git a/src/screenshot.h b/src/screenshot.h
+index 2f2a2c4..2e0f4d2 100644
+--- a/src/screenshot.h
++++ b/src/screenshot.h
+@@ -23,4 +23,27 @@ struct vo_interface;
+ 
+ int screenshot_write_png(const char *filename, struct vo_interface *vo);
+ 
++// Attach a display-less software render instance to VO if it has none, so that
++// frames are rasterised into a CPU buffer screenshot_write_png() can read in a
++// headless (null UI) build.  Safe to call repeatedly; a no-op if VO already has
++// a renderer.  Returns 0 on success.
++int screenshot_setup_render(struct vo_interface *vo);
++
++// Capture timing for trap screenshots.  defer != 0 (the default) waits for the
++// next fully-rendered frame after the trap so a page flip / VIEW the
++// trap-triggering code just performed is visible; defer == 0 grabs the buffer
++// as-is at the trap instant (historical behaviour).
++void screenshot_set_defer(int defer);
++
++// Take a screenshot per the current timing mode: write now, or arm a deferred
++// capture serviced by screenshot_on_vsync().
++void screenshot_request(const char *filename, struct vo_interface *vo);
++
++// Service a pending deferred capture; call once per field sync.  draw matches
++// vo_vsync()'s draw flag (0 during frameskip) so only rendered fields count.
++void screenshot_on_vsync(struct vo_interface *vo, int draw);
++
++// Write any pending deferred capture immediately (e.g. at shutdown).
++void screenshot_flush(struct vo_interface *vo);
++
+ #endif
+diff --git a/src/vo.h b/src/vo.h
+index 6733695..6101935 100644
+--- a/src/vo.h
++++ b/src/vo.h
+@@ -275,10 +275,15 @@ void vo_set_draw_area(struct vo_interface *, int x, int y, int w, int h);
+ // vo_render_vsync().  Called with draw=0 during frameskip, as we still want to
+ // count scanlines.
+ 
++// Defined in screenshot.c; services any pending deferred trap screenshot once
++// the post-trap frame is fully rasterised.
++void screenshot_on_vsync(struct vo_interface *vo, int draw);
++
+ inline void vo_vsync(struct vo_interface *vo, bool draw) {
+ 	if (draw)
+ 		DELEGATE_SAFE_CALL(vo->draw);
+ 	vo_render_vsync(vo->renderer);
++	screenshot_on_vsync(vo, draw);
+ }
+ 
+ // Refresh the display by calling draw().  Useful while single-stepping, where
+diff --git a/src/xroar.c b/src/xroar.c
+index 6bffbfc..7ccaab8 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -128,6 +128,7 @@ struct trap_def {
+ 
+ 	// Actions
+ 	char *snap;
++	char *screenshot;   // -trap-screenshot FILE; PNG of rendered frame
+ 	char *timeout;
+ 	int trace;
+ 	int no_trace;
+@@ -137,6 +138,9 @@ struct trap_def {
+ 
+ 	// Internal
+ 	unsigned long counter;
++	unsigned screenshot_count;   // images written so far
++	int screenshot_kind;         // 0=unset, 1=single, 2=bounded, 3=unbounded
++	unsigned long screenshot_last;   // captured upper bound when bounded
+ 	long match_value;   // value= qualifier for write traps, or -1 for none
+ 	struct xroar_timeout *timeout_data;
+ 	// Context of the access that fired a WATCH trap, recorded by
+@@ -915,6 +919,10 @@ static struct {
+  * Returns the UI interface to the caller (probably main()).
+  */
+ 
++// -trap-screenshot-when storage; option table (XC_SET_ENUM) and xroar_init both
++// reference it, so it lives ahead of both.  0 = next (default), 1 = now.
++static int option_screenshot_when = 0;
++
+ struct ui_interface *xroar_init(int argc, char **argv) {
+ 	int argn = 1, ret;
+ 	char *conffile = NULL;
+@@ -1244,6 +1252,30 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 	}
+ 	xroar.vo_interface = xroar.ui_interface->vo_interface;
+ 
++#ifdef WANT_TRAPS
++	// If any trap will take a screenshot, make sure there is a renderer for
++	// it to capture.  A headless (null UI) build hands back a vo_interface
++	// with no renderer, so the machine's scanlines would be discarded and
++	// there would be nothing to grab at trap time.  Attaching the render
++	// instance here, before the machine configures video, means its palette
++	// and active-area setup lands on the renderer.  No extra command-line
++	// flag: the presence of -trap-screenshot is the trigger.
++	for (unsigned ti = 0; ti < num_trap_defs; ++ti) {
++		if (trap_defs[ti].screenshot) {
++			screenshot_setup_render(xroar.vo_interface);
++			break;
++		}
++	}
++	// -emuext lets ROM take screenshots via a LOG command, which has no trap
++	// to announce it at init.  Attach the render instance here too, on the
++	// same reasoning: it must exist before the machine configures video so
++	// the palette and active-area land on it, or the first captured frame is
++	// garbage.
++	if (xroar.cfg.debug.emuext)
++		screenshot_setup_render(xroar.vo_interface);
++	screenshot_set_defer(option_screenshot_when == 0);
++#endif
++
+ 	// Joysticks
+ 	if (private_cfg.joy.db_file) {
+ 		sds filename = path_interp(private_cfg.joy.db_file);
+@@ -1550,6 +1582,7 @@ void xroar_shutdown(void) {
+ 	if (shutting_down)
+ 		return;
+ 	shutting_down = 1;
++	screenshot_flush(xroar.vo_interface);
+ 	disable_all_traps();
+ 	save_config();
+ 	messenger_shutdown();
+@@ -3351,6 +3384,22 @@ static void handle_trap_watch(void *sptr, bool RnW, uint32_t A, uint8_t D) {
+ 	handle_trap(trap);
+ }
+ 
++// Build a screenshot filename for the Nth trigger by inserting the number
++// before the file extension: "shot.png" + 4 -> "shot4.png".  No extension ->
++// number appended.  Caller frees.
++
++static char *screenshot_numbered_name(const char *base, unsigned long n) {
++	const char *dot = strrchr(base, '.');
++	const char *slash = strrchr(base, '/');
++	char *out = xmalloc(strlen(base) + 24);
++	if (dot && (!slash || dot > slash)) {
++		sprintf(out, "%.*s%lu%s", (int)(dot - base), base, n, dot);
++	} else {
++		sprintf(out, "%s%lu", base, n);
++	}
++	return out;
++}
++
+ static void handle_trap(void *sptr) {
+ 	struct trap_def *trap = sptr;
+ 
+@@ -3373,6 +3422,46 @@ static void handle_trap(void *sptr) {
+ 		LOG_MOD_DEBUG(2, "trap", "write snapshot: %s\n", trap->snap);
+ 		write_snapshot(trap->snap);
+ 	}
++	if (trap->screenshot) {
++		// Classify the range once, on the first fire, and remember it: xroar
++		// frees a bounded range as soon as it is exhausted, after which a
++		// NULL range is indistinguishable from "unbounded from the start".
++		// Capturing here keeps single/bounded/unbounded stable for the life
++		// of the trap.
++		//   kind 1 single   (-trap-range N-N): one image, plain filename.
++		//   kind 2 bounded  (M-N, N>M): one numbered image per trigger M..N.
++		//   kind 3 unbounded(M-, or no -trap-range): numbered, capped at 10.
++		if (trap->screenshot_kind == 0) {
++			if (!range || range->last == (unsigned long)-1) {
++				trap->screenshot_kind = 3;
++			} else if (range->first == range->last) {
++				trap->screenshot_kind = 1;
++			} else {
++				trap->screenshot_kind = 2;
++				trap->screenshot_last = range->last;
++			}
++		}
++		int do_write = 0, numbered = 0;
++		switch (trap->screenshot_kind) {
++		case 1: do_write = (trap->screenshot_count == 0); break;
++		case 2: do_write = (trap->counter <= trap->screenshot_last); numbered = 1; break;
++		case 3: do_write = (trap->screenshot_count < 10); numbered = 1; break;
++		}
++		if (do_write) {
++			char *nm = numbered ?
++			        screenshot_numbered_name(trap->screenshot, trap->counter) : NULL;
++			const char *fn = nm ? nm : trap->screenshot;
++			// Normally the render instance is attached at init when a
++			// screenshot trap is present; spin one up here as a fallback.
++			if (!xroar.vo_interface || !xroar.vo_interface->renderer) {
++				screenshot_setup_render(xroar.vo_interface);
++			}
++			LOG_MOD_DEBUG(2, "trap", "write screenshot: %s\n", fn);
++			screenshot_request(fn, xroar.vo_interface);
++			free(nm);
++			++trap->screenshot_count;
++		}
++	}
+ 	if (trap->timeout) {
+ 		LOG_MOD_DEBUG(2, "trap", "timeout: %s\n", trap->timeout);
+ 		trap->timeout_data = xroar_set_timeout(trap->timeout);
+@@ -3465,6 +3554,11 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->snap = private_cfg.debug.trap_def.snap;
+ 			private_cfg.debug.trap_def.snap = NULL;
+ 		}
++		if (private_cfg.debug.trap_def.screenshot) {
++			free(cur_trap_def->screenshot);
++			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
++			private_cfg.debug.trap_def.screenshot = NULL;
++		}
+ 		if (private_cfg.debug.trap_def.timeout) {
+ 			free(cur_trap_def->timeout);
+ 			cur_trap_def->timeout = private_cfg.debug.trap_def.timeout;
+@@ -3558,6 +3652,14 @@ static struct xconfig_enum ao_format_list[] = {
+ 	{ XC_ENUM_END() }
+ };
+ 
++// -trap-screenshot-when next|now.  next (default) defers the capture to the
++// first frame fully rendered after the trap; now grabs the buffer as-is.
++static struct xconfig_enum screenshot_when_list[] = {
++	{ XC_ENUM_INT("next", 0, "next fully-rendered frame after the trap (default)") },
++	{ XC_ENUM_INT("now",  1, "frame buffer as-is at the trap instant") },
++	{ XC_ENUM_END() }
++};
++
+ /* Configuration directives */
+ 
+ static struct xconfig_option const xroar_options[] = {
+@@ -3746,6 +3848,8 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_CALL_STRING("trap", &set_trap) },
+ 	{ XC_CALL_STRING("trap-range", &set_trap_count) },
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
++	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
++	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
+ 	{ XC_SET_STRING("trap-timeout", &private_cfg.debug.trap_def.timeout) },
+ 	{ XC_SET_INT0("trap-trace", &private_cfg.debug.trap_def.trace) },
+ 	{ XC_SET_INT("trap-trace-n", &private_cfg.debug.trap_def.trace) },
+@@ -3993,6 +4097,8 @@ static void helptext(void) {
+ "  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
+ "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
+ "    -trap-snap FILE     write snapshot at trap\n"
++"    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
++"    -trap-screenshot-when next|now  capture next clean frame (default) or now\n"
+ "    -trap-timeout N     quit emulator N seconds after trap\n"
+ "    -trap-trace         start trace mode at trap\n"
+ "    -trap-trace-n N     start trace mode at trap for N instructions\n"

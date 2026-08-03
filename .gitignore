@@ -1,0 +1,45 @@
+# Build trees: extracted from the vendored tarballs by build/*.sh, never edited
+# in place. Everything here is reproducible from xroar/ and lwasm/.
+#
+# GLOBBED, NOT PINNED. These used to name 1.12.1 and 4.25 exactly, which meant
+# that the first person to drop in a newer tarball made a 24 MB autotools tree
+# committable -- and `git add -A` would have taken it without a word. The
+# scripts derive the directory from $VER; this is the one place that cannot.
+/xroar-[0-9]*/
+/lwasm/lwtools-[0-9]*/
+
+# Built binaries: reproducible from the tarballs + patches
+/bin/
+
+# Cross-build output
+*.exe
+*.dll
+*.o
+*.a
+*.so
+*.dylib
+*.d
+*.la
+*.lo
+
+# Run artefacts. Every recipe in README.md and BUILD.md writes into the cwd,
+# which is the repo root -- traps, profiles, audits and snapshots all land here.
+/*.sna
+/*.ram
+/*.png
+/*.log
+/*.sym
+/*.lines
+/audit.bin
+/profile.txt
+/obj/
+
+__pycache__/
+*.pyc
+
+# Editor and OS litter
+*~
+*.swp
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,202 @@
+From 5017967aa5e7565936ba2afa156c1aec87e03b1a Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:17 -0400
+Subject: [PATCH 25/44] trap: -trap-ram writes flat physical RAM when a trap
+
+---
+ src/xroar.c | 94 +++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 66 insertions(+), 28 deletions(-)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index 52fdfca..70b0722 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -135,6 +135,7 @@ struct trap_def {
+ 
+ 	// Actions
+ 	char *snap;
++	char *ram;          // -trap-ram FILE; flat physical RAM (same writer as -export-ram)
+ 	char *screenshot;   // -trap-screenshot FILE; PNG of rendered frame
+ 	char *audio_start;  // -trap-audio-start FILE; begin audio capture
+ 	int audio_stop;     // -trap-audio-stop; end audio capture
+@@ -228,14 +229,13 @@ static int profile_hist_top = 0;              // -profile-hist N: report top N P
+ static char *profile_out_path = NULL;         // -profile-out FILE (default stderr)
+ static uint32_t *profile_hist_hits = NULL;    // [PROFILE_PADDR_SPAN] hits
+ static unsigned long long *profile_hist_cyc = NULL; // [PROFILE_PADDR_SPAN] cycles
+-static struct breakpoint profile_bp;
+-static _Bool profile_installed = 0;
++static bool profile_installed = 0;
+ static int profile_prev_range = -1;           // range inside on the last fetch
+ static long profile_prev_pc = -1;             // physical PC of the last fetch
+ static uint32_t profile_prev_tick = 0;        // event_current_tick at last fetch
+ static unsigned long long profile_total_instrs = 0;
+ static unsigned long long profile_total_cycles = 0;
+-static void profile_record(void *);
++static void profile_record(void *, uint32_t A);
+ static void profile_add_range(const char *);  // XC_CALL_STRING callback
+ static void profile_dump(void);
+ static _Bool profile_active(void) {
+@@ -3601,20 +3601,12 @@ static void enable_all_traps(void) {
+ 	// installed once per machine connect.  Histogram tables are allocated
+ 	// here on first install and kept across a reconnect, like the ring.
+ 	if (profile_active() && !profile_installed && xroar.machine) {
+-		struct bp_session *bps = xroar.machine->get_interface(xroar.machine, "bp-session");
+-		if (bps) {
+-			if (profile_hist_top > 0 && !profile_hist_hits) {
+-				profile_hist_hits = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_hits));
+-				profile_hist_cyc  = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_cyc));
+-			}
+-			profile_bp = (struct breakpoint){
+-				.address = 0x0000,
+-				.address_end = 0xffff,
+-				.handler = DELEGATE_AS0(void, profile_record, NULL),
+-			};
+-			bp_add_range(bps, &profile_bp);
+-			profile_installed = 1;
++		if (profile_hist_top > 0 && !profile_hist_hits) {
++			profile_hist_hits = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_hits));
++			profile_hist_cyc  = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_cyc));
+ 		}
++		machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, profile_record, NULL));
++		profile_installed = 1;
+ 	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+ 		enable_trap(&trap_defs[i], 1);
+@@ -3627,9 +3619,7 @@ static void disable_all_traps(void) {
+ 		trap_history_installed = 0;
+ 	}
+ 	if (profile_installed && xroar.machine) {
+-		struct bp_session *bps = xroar.machine->get_interface(xroar.machine, "bp-session");
+-		if (bps)
+-			bp_remove(bps, &profile_bp);
++		machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, profile_record, NULL));
+ 		profile_installed = 0;
+ 	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+@@ -3762,7 +3752,7 @@ static void trap_history_dump(void) {
+ // fetch.  Ranges are disjoint in practice, so a PC matches at most one; a
+ // range-to-range transition counts as an entry into the new range, which is
+ // what "traversed the trampoline" means.
+-static void profile_record(void *sptr) {
++static void profile_record(void *sptr, uint32_t A) {
+ 	(void)sptr;
+ 	uint32_t now = (uint32_t)event_current_tick;
+ 	if (profile_prev_pc >= 0) {
+@@ -3774,7 +3764,7 @@ static void profile_record(void *sptr) {
+ 		profile_total_cycles += delta;
+ 	}
+ 	profile_prev_tick = now;
+-	long phys = trap_fast_phys_pc();
++	long phys = trap_fast_phys((uint16_t)A);
+ 	if (phys < 0) { profile_prev_pc = -1; profile_prev_range = -1; return; }
+ 	int r = -1;
+ 	for (int i = 0; i < profile_num_ranges; ++i) {
+@@ -3923,6 +3913,26 @@ static void trap_xpcrange_check(void *sptr, uint32_t A) {
+ // from the instruction fetch hook, where PC is at an opcode boundary by
+ // construction.  pc= traps already fire from that hook and write directly.
+ static char *deferred_snap_path;
++static char *deferred_ram_path;
++
++// Flat physical RAM dump, the same writer -export-ram uses.  RAM bytes are
++// coherent between bus cycles, but a scheduled trap can land between the two
++// bytes of a 16-bit store; deferring to the instruction boundary costs
++// nothing and makes a paired -trap-snap and -trap-ram describe the same
++// machine instant, so both actions ride the same deferred hook.
++static void write_ram_dump(const char *path) {
++	if (!xroar.machine || !xroar.machine->dump_ram) {
++		LOG_MOD_WARN("trap", "-trap-ram: machine does not support RAM dump\n");
++		return;
++	}
++	FILE *fd = fopen(path, "wb");
++	if (!fd) {
++		LOG_MOD_WARN("trap", "-trap-ram %s: %s\n", path, strerror(errno));
++		return;
++	}
++	xroar.machine->dump_ram(xroar.machine, fd);
++	fclose(fd);
++}
+ 
+ static void deferred_snap_fire(void *sptr, uint32_t A) {
+ 	(void)A;
+@@ -3934,6 +3944,12 @@ static void deferred_snap_fire(void *sptr, uint32_t A) {
+ 		free(deferred_snap_path);
+ 		deferred_snap_path = NULL;
+ 	}
++	if (deferred_ram_path) {
++		LOG_MOD_DEBUG(2, "trap", "write RAM dump (deferred to instruction boundary): %s\n", deferred_ram_path);
++		write_ram_dump(deferred_ram_path);
++		free(deferred_ram_path);
++		deferred_ram_path = NULL;
++	}
+ }
+ 
+ static void handle_trap(void *sptr) {
+@@ -3962,18 +3978,31 @@ static void handle_trap(void *sptr) {
+ 		trap_history_dump();
+ 
+ 	// Break action
+-	if (trap->snap) {
++	if (trap->snap || trap->ram) {
+ 		// -trap-timeout 0 exits synchronously at the end of this handler;
+ 		// a deferred write would be skipped, so take the mid-instruction
+-		// snapshot over no snapshot at all in that one case.
++		// state over no file at all in that one case.
+ 		bool quits_now = trap->timeout && 0 == strcmp(trap->timeout, "0");
+-		if (trap->trigger && !quits_now && !deferred_snap_path) {
+-			LOG_MOD_DEBUG(2, "trap", "defer snapshot to instruction boundary: %s\n", trap->snap);
+-			deferred_snap_path = xstrdup(trap->snap);
++		if (trap->trigger && !quits_now &&
++		    !deferred_snap_path && !deferred_ram_path) {
++			if (trap->snap) {
++				LOG_MOD_DEBUG(2, "trap", "defer snapshot to instruction boundary: %s\n", trap->snap);
++				deferred_snap_path = xstrdup(trap->snap);
++			}
++			if (trap->ram) {
++				LOG_MOD_DEBUG(2, "trap", "defer RAM dump to instruction boundary: %s\n", trap->ram);
++				deferred_ram_path = xstrdup(trap->ram);
++			}
+ 			machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, deferred_snap_fire, NULL));
+ 		} else {
+-			LOG_MOD_DEBUG(2, "trap", "write snapshot: %s\n", trap->snap);
+-			write_snapshot(trap->snap);
++			if (trap->snap) {
++				LOG_MOD_DEBUG(2, "trap", "write snapshot: %s\n", trap->snap);
++				write_snapshot(trap->snap);
++			}
++			if (trap->ram) {
++				LOG_MOD_DEBUG(2, "trap", "write RAM dump: %s\n", trap->ram);
++				write_ram_dump(trap->ram);
++			}
+ 		}
+ 	}
+ 	if (trap->screenshot) {
+@@ -4129,6 +4158,11 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->snap = private_cfg.debug.trap_def.snap;
+ 			private_cfg.debug.trap_def.snap = NULL;
+ 		}
++		if (private_cfg.debug.trap_def.ram) {
++			free(cur_trap_def->ram);
++			cur_trap_def->ram = private_cfg.debug.trap_def.ram;
++			private_cfg.debug.trap_def.ram = NULL;
++		}
+ 		if (private_cfg.debug.trap_def.screenshot) {
+ 			free(cur_trap_def->screenshot);
+ 			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
+@@ -4452,6 +4486,8 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT("profile-hist", &profile_hist_top) },
+ 	{ XC_SET_STRING("profile-out", &profile_out_path) },
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
++	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
++	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
+ 	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
+ 	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
+ 	{ XC_SET_STRING("trap-audio-start", &private_cfg.debug.trap_def.audio_start) },
+@@ -4712,6 +4748,8 @@ static void helptext(void) {
+ "  -profile-out FILE     write the profile report here (default stderr)\n"
+ "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
+ "    -trap-snap FILE     write snapshot at trap\n"
++"    -trap-ram FILE      write flat physical RAM at trap (see -export-ram)\n"
++"    -export-ram FILE    dump flat physical RAM of -load snapshot, then exit\n"
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
+ "    -trap-screenshot-when next|now  capture next clean frame (default) or now\n"
+ "    -trap-audio-start FILE  begin audio capture at trap\n"

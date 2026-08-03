@@ -1,0 +1,104 @@
+From fe60669bcef1d15200e97dcdb7479185f8d132b6 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:39 -0400
+Subject: [PATCH 07/44] gdb: tolerate re-binding the target port instead of
+
+---
+ src/gdb.c | 59 +++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 55 insertions(+), 4 deletions(-)
+
+diff --git a/src/gdb.c b/src/gdb.c
+index 0bd9f7f..78ce7d5 100644
+--- a/src/gdb.c
++++ b/src/gdb.c
+@@ -56,6 +56,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <sys/time.h>
++#include <time.h>		// struct timespec / nanosleep (POSIX rebind retry)
+ 
+ #include "pl-string.h"
+ #include "xalloc.h"
+@@ -98,6 +99,11 @@ struct gdb_interface_private {
+ 	pthread_t sock_thread;
+ 	int sockfd;
+ 
++	// Set if bind() hit EADDRINUSE at creation (e.g. a snapshot was loaded
++	// while the previous machine's listener was still being torn down).
++	// The listener thread retries bind+listen before accepting.
++	_Bool rebind_pending;
++
+ 	// Session state
+ 	bool no_ack_mode;
+ 
+@@ -193,14 +199,32 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
+ 		goto failed;
+ 	}
+ 
++	// Allow rebinding a port still in TIME_WAIT from a previous run, so a
++	// quick restart with -gdb does not have to wait it out.  This does NOT
++	// cover the snapshot-load case, where two listeners are briefly live on
++	// the same port; that is handled by the deferred-bind retry below.
++	{ int one = 1; setsockopt(gip->listenfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)); }
++
+ 	// bind
++	gip->rebind_pending = 0;
+ 	if (bind(gip->listenfd, gip->info->ai_addr, gip->info->ai_addrlen) < 0) {
+-		LOG_MOD_WARN("gdb", "bind %s:%s failed\n", hostname, portname);
+-		goto failed;
++		if (errno == EADDRINUSE) {
++			// Almost certainly a snapshot load: the previous
++			// machine's listener is still open and will close as
++			// soon as the old machine is freed (just after the new
++			// one is deserialised).  Two live listeners can't share
++			// a port, and SO_REUSEADDR doesn't help, so defer the
++			// bind+listen to the listener thread, which retries.
++			LOG_MOD_DEBUG(1, "gdb", "%s:%s busy, deferring bind to listener thread\n", hostname, portname);
++			gip->rebind_pending = 1;
++		} else {
++			LOG_MOD_WARN("gdb", "bind %s:%s failed: %s (family=%d)\n", hostname, portname, strerror(errno), gip->info->ai_family);
++			goto failed;
++		}
+ 	}
+ 
+-	// ... and listen
+-	if (listen(gip->listenfd, 1) < 0) {
++	// ... and listen (deferred to the thread if the bind is pending)
++	if (!gip->rebind_pending && listen(gip->listenfd, 1) < 0) {
+ 		LOG_MOD_WARN("gdb", "failed to listen to socket\n");
+ 		goto failed;
+ 	}
+@@ -318,6 +342,33 @@ static void gdb_continue(struct gdb_interface_private *gip) {
+ static void *handle_tcp_sock(void *sptr) {
+ 	struct gdb_interface_private *gip = sptr;
+ 
++	// If the port was busy when the interface was created (snapshot load
++	// racing the old machine's teardown), retry bind+listen here.  By now
++	// read_snapshot() has freed the old machine and closed its listener.
++	if (gip->rebind_pending) {
++		for (int tries = 0; tries < 10; tries++) {
++#ifdef WINDOWS32
++			Sleep(100);  // ms
++#else
++			struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };  // 100ms
++			nanosleep(&ts, NULL);
++#endif
++			if (bind(gip->listenfd, gip->info->ai_addr, gip->info->ai_addrlen) == 0) {
++				gip->rebind_pending = 0;
++				break;
++			}
++		}
++		if (gip->rebind_pending) {
++			LOG_MOD_WARN("gdb", "port still busy after retries; gdb target unavailable\n");
++			return NULL;
++		}
++		if (listen(gip->listenfd, 1) < 0) {
++			LOG_MOD_WARN("gdb", "failed to listen to socket\n");
++			return NULL;
++		}
++		LOG_MOD_DEBUG(1, "gdb", "deferred bind succeeded; target listening\n");
++	}
++
+ 	for (;;) {
+ 
+ 		/* Work around an oddness in Windows or MinGW where (struct

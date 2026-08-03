@@ -1,0 +1,269 @@
+From 04501e19ad8c21aabd55c23116e4593544768cf5 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:57 -0400
+Subject: [PATCH 16/44] physical-ram: -load-ram (raw/decb/hex/srec loader) +
+
+---
+ src/xroar.c | 214 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 214 insertions(+)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index bf2065a..a2b9ee6 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -233,6 +233,8 @@ struct private_cfg {
+ 		char *snapshot;  // snapshot
+ 		_Bool reset_snap;  // -reset-snap: soft reset reloads .snapshot
+ 		char *reset_snap_file;  // -reset-snap-filename: explicit reset target, no -load needed
++		struct slist *load_ram;  // -load-ram ADDR:FILE specs, applied after snapshot
++		char *export_ram;  // -export-ram FILE: dump flat physical RAM of the -load snapshot, exit
+ 	} file;
+ 
+ 	// User interface
+@@ -367,6 +369,12 @@ static void set_machine(const char *name);
+ static void apply_cart_options(void);
+ static void set_cart(const char *name);
+ static void add_load(const char *arg);
++static void add_load_ram(const char *arg);
++static void load_ram_apply(void);
++enum load_format { LOAD_FMT_AUTO, LOAD_FMT_RAW, LOAD_FMT_DECB, LOAD_FMT_HEX, LOAD_FMT_SREC };
++static unsigned long parse_num_ul(const char *s);
++static int load_detect_format(const char *file);
++static void load_blob(const char *spec);
+ static void add_run(const char *arg);
+ static void set_gain(double gain);
+ static void set_kbd_bind(const char *spec);
+@@ -1439,6 +1447,36 @@ void xroar_init_finish(void) {
+ 		}
+ 	}
+ 
++	// Inject raw binaries straight into RAM (-load-ram), after any snapshot.
++	load_ram_apply();
++
++	// -export-ram FILE: tool mode. Dump the loaded snapshot's flat physical
++	// RAM (machine->dump_ram, same writer as a .ram trap-snap) and exit.
++	// This is the ONE supported way to get at snapshot RAM from outside;
++	// external tools must not parse the serialised snapshot format.
++	if (private_cfg.file.export_ram) {
++		if (!private_cfg.file.snapshot) {
++			fprintf(stderr, "xroar: -export-ram requires -load SNAPSHOT\n");
++			exit(1);
++		}
++		if (!xroar.machine || !xroar.machine->dump_ram) {
++			fprintf(stderr, "xroar: -export-ram: machine does not support RAM dump\n");
++			exit(1);
++		}
++		FILE *xfd = fopen(private_cfg.file.export_ram, "wb");
++		if (!xfd) {
++			fprintf(stderr, "xroar: -export-ram %s: %s\n",
++			        private_cfg.file.export_ram, strerror(errno));
++			exit(1);
++		}
++		xroar.machine->dump_ram(xroar.machine, xfd);
++		long xlen = ftell(xfd);
++		fclose(xfd);
++		fprintf(stderr, "[export-ram] wrote %s (%ld bytes)\n",
++		        private_cfg.file.export_ram, xlen);
++		exit(0);
++	}
++
+ 	// Type strings into machine
+ 	while (private_cfg.kbd.type_list) {
+ 		sds data = private_cfg.kbd.type_list->data;
+@@ -2826,6 +2864,180 @@ static void add_load(const char *arg) {
+ 	}
+ }
+ 
++// Parse a single unsigned number: "0x" for hex (via base 0) or decimal.
++static unsigned long parse_num_ul(const char *s) {
++	if (!s || !*s)
++		return 0;
++	return strtoul(s, NULL, 0);
++}
++
++// Shared loader for -load-ram and -trap-load.
++//
++// Spec grammar:  FILE[,format=F][,addr=A][,max=N]
++//   format = auto (default) | raw | decb | hex | srec
++//   addr=  raw only, REQUIRED; flat physical RAM offset; 0xhex or decimal
++//   max=   raw only; cap on bytes written
++//
++// auto resolves by extension (.ram=raw, .bin/.dgn/.cco=decb, .hex=hex,
++// .s19=srec); failing that, by content (':'=hex, 'S'=srec, else raw).
++//
++// raw is copied flat into physical RAM (ram_load_flat).  decb/hex/srec are
++// handed to XRoar's existing loaders, which write through the CPU map at the
++// address each file specifies; addr=/max= do not apply to them.  No path
++// validation: the host command line is trusted.  Loaders load only, never
++// execute, so a DECB exec address is read and ignored.
++
++static int load_detect_format(const char *file) {
++	const char *ext = strrchr(file, '.');
++	if (ext) {
++		ext++;
++		if (0 == c_strcasecmp(ext, "ram")) return LOAD_FMT_RAW;
++		if (0 == c_strcasecmp(ext, "bin") || 0 == c_strcasecmp(ext, "dgn") ||
++		    0 == c_strcasecmp(ext, "cco")) return LOAD_FMT_DECB;
++		if (0 == c_strcasecmp(ext, "hex")) return LOAD_FMT_HEX;
++		if (0 == c_strcasecmp(ext, "s19")) return LOAD_FMT_SREC;
++	}
++	FILE *f = fopen(file, "rb");
++	if (f) {
++		int c = fgetc(f);
++		fclose(f);
++		if (c == ':') return LOAD_FMT_HEX;
++		if (c == 'S' || c == 's') return LOAD_FMT_SREC;
++	}
++	return LOAD_FMT_RAW;
++}
++
++static void load_blob(const char *spec) {
++	if (!spec || !*spec || !xroar.machine)
++		return;
++	char *s = xstrdup(spec);
++	char *opts = s;
++	char *file = strsep(&opts, ",");
++	if (!file || !*file) {
++		LOG_MOD_WARN("load", "%s: no filename\n", spec);
++		free(s);
++		return;
++	}
++	int fmt = LOAD_FMT_AUTO;
++	int have_addr = 0;
++	unsigned long addr = 0;
++	size_t maxlen = 0;
++	int bad = 0;
++	while (opts && *opts) {
++		char *kv = strsep(&opts, ",");
++		if (!kv || !*kv)
++			continue;
++		char *val = kv;
++		char *key = strsep(&val, "=");
++		if (!key || !val) {
++			LOG_MOD_WARN("load", "%s: bad option '%s'\n", file, kv);
++			bad = 1;
++			break;
++		}
++		if (0 == c_strcasecmp(key, "format")) {
++			if (0 == c_strcasecmp(val, "auto")) fmt = LOAD_FMT_AUTO;
++			else if (0 == c_strcasecmp(val, "raw")) fmt = LOAD_FMT_RAW;
++			else if (0 == c_strcasecmp(val, "decb")) fmt = LOAD_FMT_DECB;
++			else if (0 == c_strcasecmp(val, "hex")) fmt = LOAD_FMT_HEX;
++			else if (0 == c_strcasecmp(val, "srec")) fmt = LOAD_FMT_SREC;
++			else {
++				LOG_MOD_WARN("load", "%s: unknown format '%s'\n", file, val);
++				bad = 1;
++				break;
++			}
++		} else if (0 == c_strcasecmp(key, "addr")) {
++			addr = parse_num_ul(val);
++			have_addr = 1;
++		} else if (0 == c_strcasecmp(key, "max")) {
++			maxlen = (size_t)parse_num_ul(val);
++		} else {
++			LOG_MOD_WARN("load", "%s: unknown option '%s'\n", file, key);
++			bad = 1;
++			break;
++		}
++	}
++	if (bad) {
++		free(s);
++		return;
++	}
++
++	if (fmt == LOAD_FMT_AUTO)
++		fmt = load_detect_format(file);
++
++	if (fmt == LOAD_FMT_RAW) {
++		if (!have_addr) {
++			LOG_MOD_WARN("load", "%s: raw load requires addr=\n", file);
++			free(s);
++			return;
++		}
++		struct ram *ram = (struct ram *)part_component_by_id_is_a(
++			(struct part *)xroar.machine, "RAM", "ram");
++		if (!ram) {
++			LOG_MOD_WARN("load", "machine has no RAM to load into\n");
++			free(s);
++			return;
++		}
++		FILE *f = fopen(file, "rb");
++		if (!f) {
++			LOG_MOD_WARN("load", "%s: cannot open\n", file);
++			free(s);
++			return;
++		}
++		fseek(f, 0, SEEK_END);
++		long sz = ftell(f);
++		fseek(f, 0, SEEK_SET);
++		if (sz <= 0) {
++			fclose(f);
++			LOG_MOD_WARN("load", "%s: empty or unreadable\n", file);
++			free(s);
++			return;
++		}
++		size_t want = (size_t)sz;
++		if (maxlen && want > maxlen)
++			want = maxlen;
++		uint8_t *buf = xmalloc(want);
++		size_t got = fread(buf, 1, want, f);
++		fclose(f);
++		size_t n = ram_load_flat(ram, addr, buf, got);
++		free(buf);
++		LOG_MOD_PRINT("load", "%s -> phys:0x%06lX, %zu bytes (raw)\n", file, addr, n);
++		if (n < got)
++			LOG_MOD_WARN("load", "%s: only %zu of %zu bytes loaded (ran off end of RAM)\n",
++				     file, n, got);
++		free(s);
++		return;
++	}
++
++	// Formatted loads carry their own addresses.
++	if (have_addr || maxlen)
++		LOG_MOD_WARN("load", "%s: addr=/max= ignored for non-raw formats\n", file);
++
++	int rc;
++	const char *fn;
++	switch (fmt) {
++	case LOAD_FMT_DECB: rc = bin_load(file, 0); fn = "decb"; break;
++	case LOAD_FMT_HEX:  rc = intel_hex_read(file, 0); fn = "hex"; break;
++	case LOAD_FMT_SREC: rc = motorola_s19_read(file, 0); fn = "srec"; break;
++	default: rc = -1; fn = "?"; break;
++	}
++	if (rc >= 0)
++		LOG_MOD_PRINT("load", "%s -> CPU memory (%s)\n", file, fn);
++	else
++		LOG_MOD_WARN("load", "%s: %s load failed\n", file, fn);
++	free(s);
++}
++
++// -load-ram FILE[,opts] - queue a file to load into RAM after the machine (and
++// any snapshot) is set up.  See load_blob() for the grammar.
++static void add_load_ram(const char *arg) {
++	private_cfg.file.load_ram = slist_append(private_cfg.file.load_ram, xstrdup(arg));
++}
++
++static void load_ram_apply(void) {
++	for (struct slist *l = private_cfg.file.load_ram; l; l = l->next)
++		load_blob((const char *)l->data);
++}
++
+ // Add a file to load and mark its slot to autorun.
+ 
+ static void add_run(const char *arg) {
+@@ -3275,6 +3487,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_CALL_STRING_NE("load", &add_load) },
+ 	{ XC_SET_BOOL("reset-snap", &private_cfg.file.reset_snap) },
+ 	{ XC_SET_STRING_NE("reset-snap-filename", &private_cfg.file.reset_snap_file) },
++	{ XC_CALL_STRING_NE("load-ram", &add_load_ram) },
+ 	{ XC_CALL_STRING_NE("run", &add_run) },
+ 	{ XC_SET_STRING_NE("load-fd0", &private_cfg.file.fd[0]) },
+ 	{ XC_SET_STRING_NE("load-fd1", &private_cfg.file.fd[1]) },
+@@ -3563,6 +3776,7 @@ static void helptext(void) {
+ "  -load FILE            load or attach FILE\n"
+ "  -reset-snap          soft reset reloads the -load snapshot (hard reset = cold boot)\n"
+ "  -reset-snap-filename FILE  soft reset reloads FILE (no -load needed; overrides -reset-snap target)\n"
++"  -load-ram FILE[,opts] load FILE into RAM after snapshot; opts: format= addr= max=\n"
+ "  -run FILE             load or attach FILE and attempt autorun\n"
+ "  -load-fdX FILE        insert disk image FILE into floppy drive X (0-3)\n"
+ "  -load-hdX FILE        use hard disk image FILE as drive X (0-1, e.g. for ide)\n"

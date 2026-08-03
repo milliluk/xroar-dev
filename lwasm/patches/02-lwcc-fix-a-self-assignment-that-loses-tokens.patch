@@ -1,0 +1,39 @@
+Subject: [PATCH 2/2] lwcc: fix a self-assignment that loses skipped tokens
+
+The compiler flags it as noise:
+
+  lwcc/preproc.c:1462: explicitly assigning value of variable of type
+                       'struct token *' to itself [-Wself-assign]
+
+but it is a real bug, not a redundant line. The loop is collecting the
+whitespace tokens it skips while looking for an opening paren, pushing each
+onto a list:
+
+      t -> next = t2;
+      t2 = t2;          <- never advances the head
+
+`t2 = t;` is the other half of the push. As written the head stays NULL
+forever, so the cleanup below -- `while (t2) { ... preproc_unget_token(pp,
+t2); ... }` -- never runs, and the skipped tokens are neither ungot nor freed
+when the macro turns out not to be function-like.
+
+Scope, stated plainly: this is in **lwcc**, lwtools' C preprocessor, not in
+**lwasm**, which is the tool this repo actually builds and uses. Nothing here
+exercises the affected path, so the fix is correct by inspection -- it is the
+standard push-onto-list idiom, and the cleanup loop below walks the list the
+same way -- but it is not verified by running lwcc. It cannot be worse than
+the code it replaces, which provably does nothing.
+
+Found building on macOS 2026-08-02.
+
+--- a/lwcc/preproc.c
++++ b/lwcc/preproc.c
+@@ -1459,7 +1459,7 @@
+ 		if (t -> ttype != TOK_WSPACE && t -> ttype != TOK_EOL)
+ 			break;
+ 		t -> next = t2;
+-		t2 = t2;
++		t2 = t;
+ 	}
+ 	if (t -> ttype != TOK_OPAREN)
+ 	{

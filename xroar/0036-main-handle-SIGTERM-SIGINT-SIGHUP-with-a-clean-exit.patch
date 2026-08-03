@@ -1,0 +1,51 @@
+From 6f4692121e335723fd36973e6b5972ce3893eef8 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:40 -0400
+Subject: [PATCH 36/44] main: handle SIGTERM/SIGINT/SIGHUP with a clean exit
+
+---
+ src/main_unix.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/main_unix.c b/src/main_unix.c
+index 17b616e..32116b9 100644
+--- a/src/main_unix.c
++++ b/src/main_unix.c
+@@ -34,6 +34,25 @@
+ 
+ #include "wasm/wasm.h"
+ 
++#include <signal.h>
++
++/** \brief Translate a termination signal into a clean exit.
++ *
++ * atexit(xroar_shutdown) only runs on a normal return from main() or a call
++ * to exit() -- it does NOT run when the process is killed by a signal.
++ * Without this, any external termination (a plain `kill`, Ctrl-C, a
++ * supervising script giving up on a hung run) skips xroar_shutdown()
++ * entirely: audio/video interfaces never get torn down, the GDB socket is
++ * never closed, config is never saved. SIGKILL still bypasses this --
++ * that's enforced by the kernel, not fixable here -- so prefer a plain kill
++ * or Ctrl-C over -9 when a run needs to be stopped rather than abandoned.
++ */
++
++static void handle_term_signal(int sig) {
++	(void)sig;
++	exit(EXIT_FAILURE);
++}
++
+ /** \brief Entry point.
+  *
+  * Sets up the exit handler and calls xroar_init(), which will process all
+@@ -46,6 +65,11 @@
+ 
+ int main(int argc, char **argv) {
+ 	atexit(xroar_shutdown);
++	signal(SIGTERM, handle_term_signal);
++	signal(SIGINT, handle_term_signal);
++#ifdef SIGHUP
++	signal(SIGHUP, handle_term_signal);
++#endif
+ 
+ 	srand(getpid() ^ time(NULL));
+ 

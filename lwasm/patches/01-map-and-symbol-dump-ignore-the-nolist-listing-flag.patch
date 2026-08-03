@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Date: Tue, 28 Jul 2026 00:00:00 +0000
+Subject: [PATCH 1/2] lwasm: stop `nolist` deciding what --map and
+ --symbol-dump contain
+
+`symbol_flag_nolist` records that `opt nolist` (or --pragma=nolist) was in
+force where a symbol was defined.  Three places consulted it: the symbol table
+printed in the LISTING, the `--map` file, and `--symbol-dump`.  Only the first
+is a listing.
+
+The other two are machine-readable artifacts, asked for explicitly and consumed
+by a program afterwards, and a listing pragma should not decide what they
+contain.  The failure this causes is silent and hard to trace: `incl` a file
+from inside a nolist region -- an entirely normal thing to do, since nolist
+exists to keep a large shared header out of every listing -- and every symbol
+that file defines vanishes from the map, with nothing printed to say so.  A
+downstream tool asking for one of those names gets "not found" and no reason to
+suspect the listing state at the point of definition.
+
+Found in a project whose entire direct page is declared in a file included from
+inside its constants header's nolist region: no direct-page variable had ever
+appeared in a map, and the workaround was scanning listings for instructions
+that happened to reference one, which cannot see a variable nothing references.
+
+The listing's own symbol table still honours the flag, which is the one place
+honouring it means something.
+
+Note for adopters: on a tree that has been living with the old behaviour, this
+makes previously-invisible symbols appear in every map that includes the
+region -- typically a constants header's equates.  Consumers that assumed a map
+contains only labels may need to learn to tell an equate from a label.
+---
+--- a/lwasm/symbol.c
++++ b/lwasm/symbol.c
+@@ -347,9 +347,9 @@
+ 	{	
+ 		if (s -> flags & symbol_flag_nolist)
+ 			continue;
+-
+-		if ((as -> flags & FLAG_SYMBOLS_NOLOCALS) && (s -> context >= 0))
+-			continue;
++
++		if ((as -> flags & FLAG_SYMBOLS_NOLOCALS) && (s -> context >= 0))
++			continue;
+ 
+ 		lwasm_reduce_expr(as, s -> value);
+ 		fputc('[', of);
+@@ -411,76 +411,85 @@
+ 	list_symbols_aux(as, of, as -> symtab.head);
+ }
+ 
+-void map_symbols(asmstate_t *as, FILE *of, struct symtabe *se)
+-{
+-	struct symtabe *s;
+-	lw_expr_t te;
+-	struct listinfo li;
+-
+-	li.as = as;
+-
+-	if (!se)
+-		return;
+-
+-	map_symbols(as, of, se -> left);
+-
+-	for (s = se; s; s = s -> nextver)
+-	{
+-		if (s -> flags & symbol_flag_nolist)
+-			continue;
+-		lwasm_reduce_expr(as, s -> value);
+-
+-		te = lw_expr_copy(s -> value);
+-		li.complex = 0;
+-		li.sect = NULL;
+-		lw_expr_testterms(te, list_symbols_test, &li);
+-		if (li.sect)
+-		{
+-			as -> exportcheck = 1;
+-			as -> csect = li.sect;
+-			lwasm_reduce_expr(as, te);
+-			as -> exportcheck = 0;
+-		}
+-
+-		if (lw_expr_istype(te, lw_expr_type_int))
+-		{
+-			fprintf(of, "Symbol: %s", s -> symbol);
+-			if (s -> context != -1)
+-				fprintf(of, "_%04X", lw_expr_intval(te));
+-			fprintf(of, " (%s) = %04X\n", as -> output_file, lw_expr_intval(te));
+-
+-		}
+-		lw_expr_destroy(te);
+-	}
+-
+-	map_symbols(as, of, se -> right);
+-}
+-
+-void do_map(asmstate_t *as)
+-{
+-	FILE *of = NULL;
+-
+-	if (!(as -> flags & FLAG_MAP))
+-		return;
+-
+-	if (as -> map_file)
+-	{
+-		if (strcmp(as -> map_file, "-") == 0)
+-		{
+-			of = stdout;
+-		}
+-		else
+-			of = fopen(as -> map_file, "w");
+-	}
+-	else
+-		of = stdout;
+-	if (!of)
+-	{
++void map_symbols(asmstate_t *as, FILE *of, struct symtabe *se)
++{
++	struct symtabe *s;
++	lw_expr_t te;
++	struct listinfo li;
++
++	li.as = as;
++
++	if (!se)
++		return;
++
++	map_symbols(as, of, se -> left);
++
++	for (s = se; s; s = s -> nextver)
++	{
++		/* symbol_flag_nolist is a LISTING property: it records that the
++		   source had `opt nolist` (or --pragma=nolist) in force where the
++		   symbol was defined.  It used to suppress the symbol here as well,
++		   which conflates two different artifacts -- a listing is for a
++		   human reading the assembly, a --map is for a program resolving
++		   names afterwards.  The practical effect was that including a file
++		   from inside a nolist region silently removed every symbol it
++		   defined from the map, with nothing to indicate it: a downstream
++		   tool asking for one of those names got "not found" and no reason.
++		   The listing's own symbol table (list_symbols_aux, above) still
++		   honours the flag, which is where honouring it means something. */
++		lwasm_reduce_expr(as, s -> value);
++
++		te = lw_expr_copy(s -> value);
++		li.complex = 0;
++		li.sect = NULL;
++		lw_expr_testterms(te, list_symbols_test, &li);
++		if (li.sect)
++		{
++			as -> exportcheck = 1;
++			as -> csect = li.sect;
++			lwasm_reduce_expr(as, te);
++			as -> exportcheck = 0;
++		}
++
++		if (lw_expr_istype(te, lw_expr_type_int))
++		{
++			fprintf(of, "Symbol: %s", s -> symbol);
++			if (s -> context != -1)
++				fprintf(of, "_%04X", lw_expr_intval(te));
++			fprintf(of, " (%s) = %04X\n", as -> output_file, lw_expr_intval(te));
++
++		}
++		lw_expr_destroy(te);
++	}
++
++	map_symbols(as, of, se -> right);
++}
++
++void do_map(asmstate_t *as)
++{
++	FILE *of = NULL;
++
++	if (!(as -> flags & FLAG_MAP))
++		return;
++
++	if (as -> map_file)
++	{
++		if (strcmp(as -> map_file, "-") == 0)
++		{
++			of = stdout;
++		}
++		else
++			of = fopen(as -> map_file, "w");
++	}
++	else
++		of = stdout;
++	if (!of)
++	{
+ 		fprintf(stderr, "Cannot open map file '%s' for output\n", as -> map_file);
+-		return;
+-	}
+-
+-	map_symbols(as, of, as -> symtab.head);
+-
+-	fclose(of);
+-}
++		return;
++	}
++
++	map_symbols(as, of, as -> symtab.head);
++
++	fclose(of);
++}
+--- a/lwasm/symdump.c
++++ b/lwasm/symdump.c
+@@ -75,9 +75,9 @@
+ 	
+ 	for (s = se; s; s = s -> nextver)
+ 	{	
+-		if (s -> flags & symbol_flag_nolist)
+-			continue;
+-
++		/* Same reasoning as map_symbols(): --symbol-dump is asked for
++		   explicitly and consumed by a program, so a listing pragma should
++		   not decide what it contains. */
+ 		if (s -> context >= 0)
+ 			continue;
+ 
+-- 
+2.34.1

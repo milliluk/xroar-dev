@@ -1,0 +1,84 @@
+From 4cb83662771534d94ac6909e85810e760cd1d050 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:43 -0400
+Subject: [PATCH 09/44] flat-physical-ram: ram_load/peek/poke_flat (orig 01-ram
+
+---
+ src/ram.c | 37 +++++++++++++++++++++++++++++++++++++
+ src/ram.h | 15 +++++++++++++++
+ 2 files changed, 52 insertions(+)
+
+diff --git a/src/ram.c b/src/ram.c
+index 6973691..9d563c6 100644
+--- a/src/ram.c
++++ b/src/ram.c
+@@ -305,6 +305,43 @@ void ram_clear(struct ram *ram, int method) {
+ 	}
+ }
+ 
++size_t ram_load_flat(struct ram *ram, size_t offset, const uint8_t *src, size_t len) {
++	if (!ram || ram->d_width != 8 || ram->bank_nelems == 0)
++		return 0;
++	size_t written = 0;
++	for (size_t i = 0; i < len; i++) {
++		size_t o = offset + i;
++		unsigned bank = o / ram->bank_nelems;
++		size_t idx = o % ram->bank_nelems;
++		if (bank >= ram->nbanks || !ram->d[bank])
++			break;
++		((uint8_t *)ram->d[bank])[idx] = src[i];
++		written++;
++	}
++	return written;
++}
++
++int ram_peek_flat(struct ram *ram, size_t offset) {
++	if (!ram || ram->d_width != 8 || ram->bank_nelems == 0)
++		return -1;
++	unsigned bank = offset / ram->bank_nelems;
++	size_t idx = offset % ram->bank_nelems;
++	if (bank >= ram->nbanks || !ram->d[bank])
++		return -1;
++	return ((uint8_t *)ram->d[bank])[idx];
++}
++
++_Bool ram_poke_flat(struct ram *ram, size_t offset, uint8_t value) {
++	if (!ram || ram->d_width != 8 || ram->bank_nelems == 0)
++		return 0;
++	unsigned bank = offset / ram->bank_nelems;
++	size_t idx = offset % ram->bank_nelems;
++	if (bank >= ram->nbanks || !ram->d[bank])
++		return 0;
++	((uint8_t *)ram->d[bank])[idx] = value;
++	return 1;
++}
++
+ // Read data from serialisation handle into RAM bank only if that bank is
+ // present.
+ 
+diff --git a/src/ram.h b/src/ram.h
+index 683e4c2..9202ac5 100644
+--- a/src/ram.h
++++ b/src/ram.h
+@@ -99,6 +99,21 @@ void ram_add_bank(struct ram *ram, unsigned bank);
+ 
+ void ram_clear(struct ram *ram, int method);
+ 
++// Write a block of bytes into RAM at a flat, bank-major byte offset (bank N
++// occupies [N*bank_nelems, (N+1)*bank_nelems)).  Only 8-bit RAM is supported.
++// Returns the number of bytes written, short of len if it runs off the end.
++
++size_t ram_load_flat(struct ram *ram, size_t offset, const uint8_t *src, size_t len);
++
++// Single-byte peek/poke at a flat, bank-major physical byte offset (same
++// addressing as ram_load_flat).  Used by the gdb stub's physical-memory
++// query/set so a debugger can read or write a byte that isn't necessarily
++// visible through the live CPU/MMU logical map right now.  ram_peek_flat
++// returns -1 (not 0-255) if the offset is out of range; ram_poke_flat
++// returns false if the offset is out of range.
++int ram_peek_flat(struct ram *ram, size_t offset);
++_Bool ram_poke_flat(struct ram *ram, size_t offset, uint8_t value);
++
+ // Read data from serialisation handle into RAM bank only if that bank is
+ // present.
+ 

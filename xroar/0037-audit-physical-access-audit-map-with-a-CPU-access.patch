@@ -1,0 +1,545 @@
+From 08c9de8c37298506cee49df1d4fd5b392b0db693 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:42 -0400
+Subject: [PATCH 37/44] audit: physical access-audit map, with a CPU access
+
+---
+ src/Makefile.am            |  1 +
+ src/coco3.c                | 46 ++++++++++++++++++++++++
+ src/mc6809/hd6309.c        | 29 ++++++++++++++--
+ src/mc6809/mc6809.c        | 29 ++++++++++++++--
+ src/mc6809/mc6809.h        | 27 +++++++++++++++
+ src/mc6809/mc6809_common.c | 71 +++++++++++++++++++++++++++++---------
+ src/xroar.c                | 54 +++++++++++++++++++++++++++++
+ 7 files changed, 237 insertions(+), 20 deletions(-)
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 5219d7c..61d49ed 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -20,6 +20,7 @@ xroar_SOURCES = \
+ 	ao.c ao.h \
+ 	audiorec.c audiorec.h \
+ 	auto_kbd.c auto_kbd.h \
++	audit.c audit.h \
+ 	ay891x.c ay891x.h \
+ 	becker.c becker.h \
+ 	blockdev.c blockdev.h \
+diff --git a/src/coco3.c b/src/coco3.c
+index f025e2b..2097189 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -36,6 +36,7 @@
+ #include "xalloc.h"
+ 
+ #include "ao.h"
++#include "audit.h"
+ #include "breakpoint.h"
+ #include "cart.h"
+ #include "crc32.h"
+@@ -1446,6 +1447,43 @@ static void coco3_instruction_posthook(void *sptr) {
+ 	mcc3->single_step = 0;
+ }
+ 
++// Compose one audit byte from the CPU's access class for the cycle.  The core
++// is the only place that knows an instruction fetch from a data read or a dead
++// bus cycle from a real one; this is where that knowledge meets the physical
++// address the GIME's own decode produced.
++//
++// EXEC and READ are deliberately exclusive: an instruction fetch is a read, but
++// conflating them would make READ useless for finding the data reads, which is
++// most of what the flag is for.
++static inline uint8_t coco3_audit_bits(struct coco3 *mcc3, _Bool RnW) {
++	uint8_t cls = mcc3->CPU->mem_class;
++	if (cls & MC6809_MC_DEAD)
++		return 0;
++	uint8_t bits;
++	if (cls & MC6809_MC_VECTOR) {
++		// A vector read is a read, not an instruction fetch.  On this
++		// machine the vectors are in ROM, so this branch never fires
++		// for a RAM cycle; it is here so that it cannot be wrong on a
++		// machine where they are not.
++		bits = AUDIT_READ;
++	} else if (cls & MC6809_MC_FETCH) {
++		bits = AUDIT_EXEC;
++		if (cls & MC6809_MC_OPCODE)
++			bits |= AUDIT_OPCODE;
++	} else {
++		bits = RnW ? AUDIT_READ : AUDIT_WRITE;
++	}
++	if (cls & MC6809_MC_STACK_S)
++		bits |= AUDIT_STACK_S;
++	if (cls & MC6809_MC_STACK_U)
++		bits |= AUDIT_STACK_U;
++	if (cls & MC6809_MC_PUSHPULL)
++		bits |= AUDIT_PUSHPULL;
++	if (mcc3->CPU->irq_depth)
++		bits |= AUDIT_IRQ;
++	return bits;
++}
++
+ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 	if (mcc3->cart) {
+ 		mcc3->CPU->D = mcc3->cart->read(mcc3->cart, A, 0, 0, mcc3->CPU->D);
+@@ -1510,6 +1548,8 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[1])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
++			if (audit_map)
++				audit_mark(mcc3->GIME->Z, coco3_audit_bits(mcc3, 1));
+ 		} else {
+ 			// Otherwise, translate
+ 			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
+@@ -1519,6 +1559,8 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[1])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
++			if (audit_map)
++				audit_mark((bank << 19) | mcc3->GIME->Z, coco3_audit_bits(mcc3, 1));
+ 		}
+ 	}
+ }
+@@ -1593,6 +1635,8 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[0])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
++			if (audit_map)
++				audit_mark(mcc3->GIME->Z, coco3_audit_bits(mcc3, 0));
+ 		} else {
+ 			// Otherwise, translate
+ 			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
+@@ -1602,6 +1646,8 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[0])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
++			if (audit_map)
++				audit_mark((bank << 19) | mcc3->GIME->Z, coco3_audit_bits(mcc3, 0));
+ 		}
+ 	}
+ }
+diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
+index 7d1bfaa..b3c1d07 100644
+--- a/src/mc6809/hd6309.c
++++ b/src/mc6809/hd6309.c
+@@ -312,6 +312,11 @@ static bool hd6309_is_a(struct part *p, const char *name) {
+ 
+ static void hd6309_reset(struct MC6809 *cpu) {
+ 	struct HD6309 *hcpu = (struct HD6309 *)cpu;
++	cpu->mem_class = MC6809_MC_DATA;
++	cpu->fetch_class = MC6809_MC_FETCH;
++	cpu->ea_class = 0;
++	cpu->op_first = 0;
++	cpu->irq_depth = 0;
+ 	cpu->halt = 0;
+ 	cpu->nmi_armed = 0;
+ 	cpu->nmi = cpu->nmi_latch = cpu->nmi_active = 0;
+@@ -377,6 +382,12 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 			} else {
+ 				hcpu->state = hd6309_state_next_instruction;
+ 				cpu->page = 0;
++				// Start of an instruction, before any page prefix, so
++				// the opcode bit lands on the byte the instruction
++				// really starts at and the EA class from the previous
++				// instruction cannot leak into this one.
++				cpu->op_first = 1;
++				cpu->ea_class = 0;
+ 				// Instruction fetch hook called here so that machine
+ 				// can be stopped beforehand.
+ 				DELEGATE_SAFE_CALL(cpu->instruction_hook, REG_PC);
+@@ -993,6 +1004,8 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 					REG_PC = pull_s_word(cpu);
+ 				}
+ 				cpu->nmi_armed = 1;
++				if (cpu->irq_depth)
++					--cpu->irq_depth;
+ 				peek_byte(cpu, REG_S);
+ 				break;
+ 
+@@ -2067,8 +2080,8 @@ static uint16_t ea_indexed(struct MC6809 *cpu) {
+ 	switch ((postbyte >> 5) & 3) {
+ 		case 0: reg = REG_X; break;
+ 		case 1: reg = REG_Y; break;
+-		case 2: reg = REG_U; break;
+-		case 3: reg = REG_S; break;
++		case 2: reg = REG_U; cpu->ea_class = MC6809_MC_STACK_U; break;
++		case 3: reg = REG_S; cpu->ea_class = MC6809_MC_STACK_S; break;
+ 		default: reg = 0; break;
+ 	}
+ 	if ((postbyte & 0x80) == 0) {
+@@ -2173,7 +2186,19 @@ static void take_interrupt(struct MC6809 *cpu, uint8_t mask, uint16_t vec) {
+ 	cpu->trace_next_pc = vec;
+ 	cpu->trace_nbytes = 0;
+ #endif
++	// The vector read goes through the traced fetch like any instruction
++	// byte, so it is reclassed here rather than routed around the tracer.
++	// Depth is inferred from vector-taken/RTI pairing: a handler that
++	// unwinds any other way leaves it high, which the report should say
++	// rather than pretend to know better.
++	cpu->fetch_class = MC6809_MC_VECTOR;
+ 	REG_PC = fetch_word(cpu, vec);
++	cpu->fetch_class = MC6809_MC_FETCH;
++	// RESET arrives through this path too and never returns via RTI, so
++	// counting it would peg the depth at 1 for the life of the run and
++	// mark every subsequent access as interrupt context.
++	if (vec != MC6809_INT_VEC_RESET && cpu->irq_depth < 255)
++		++cpu->irq_depth;
+ 	hcpu->state = hd6309_state_label_a;
+ 	NVMA_CYCLE;
+ #ifdef TRACE
+diff --git a/src/mc6809/mc6809.c b/src/mc6809/mc6809.c
+index b0a5679..59b514f 100644
+--- a/src/mc6809/mc6809.c
++++ b/src/mc6809/mc6809.c
+@@ -246,6 +246,11 @@ bool mc6809_is_a(struct part *p, const char *name) {
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ static void mc6809_reset(struct MC6809 *cpu) {
++	cpu->mem_class = MC6809_MC_DATA;
++	cpu->fetch_class = MC6809_MC_FETCH;
++	cpu->ea_class = 0;
++	cpu->op_first = 0;
++	cpu->irq_depth = 0;
+ 	cpu->halt = cpu->nmi = 0;
+ 	cpu->nmi_armed = 0;
+ 	cpu->nmi = cpu->nmi_latch = cpu->nmi_active = 0;
+@@ -313,6 +318,12 @@ static void mc6809_run(struct MC6809 *cpu) {
+ 			} else {
+ 				cpu->state = mc6809_state_next_instruction;
+ 				cpu->page = 0;
++				// Start of an instruction, before any page prefix, so
++				// the opcode bit lands on the byte the instruction
++				// really starts at and the EA class from the previous
++				// instruction cannot leak into this one.
++				cpu->op_first = 1;
++				cpu->ea_class = 0;
+ 				// Instruction fetch hook called here so that machine
+ 				// can be stopped beforehand.
+ 				DELEGATE_SAFE_CALL(cpu->instruction_hook, REG_PC);
+@@ -937,6 +948,8 @@ static void mc6809_run(struct MC6809 *cpu) {
+ 					REG_PC = pull_s_word(cpu);
+ 				}
+ 				cpu->nmi_armed = 1;
++				if (cpu->irq_depth)
++					--cpu->irq_depth;
+ 				peek_byte(cpu, REG_S);
+ 				break;
+ 
+@@ -1419,8 +1432,8 @@ static uint16_t ea_indexed(struct MC6809 *cpu) {
+ 	switch ((postbyte >> 5) & 3) {
+ 		case 0: reg = REG_X; break;
+ 		case 1: reg = REG_Y; break;
+-		case 2: reg = REG_U; break;
+-		case 3: reg = REG_S; break;
++		case 2: reg = REG_U; cpu->ea_class = MC6809_MC_STACK_U; break;
++		case 3: reg = REG_S; cpu->ea_class = MC6809_MC_STACK_S; break;
+ 		default: reg = 0; break;
+ 	}
+ 	if ((postbyte & 0x80) == 0) {
+@@ -1502,7 +1515,19 @@ static void take_interrupt(struct MC6809 *cpu, uint8_t mask, uint16_t vec) {
+ 	cpu->trace_next_pc = vec;
+ 	cpu->trace_nbytes = 0;
+ #endif
++	// The vector read goes through the traced fetch like any instruction
++	// byte, so it is reclassed here rather than routed around the tracer.
++	// Depth is inferred from vector-taken/RTI pairing: a handler that
++	// unwinds any other way leaves it high, which the report should say
++	// rather than pretend to know better.
++	cpu->fetch_class = MC6809_MC_VECTOR;
+ 	REG_PC = fetch_word(cpu, vec);
++	cpu->fetch_class = MC6809_MC_FETCH;
++	// RESET arrives through this path too and never returns via RTI, so
++	// counting it would peg the depth at 1 for the life of the run and
++	// mark every subsequent access as interrupt context.
++	if (vec != MC6809_INT_VEC_RESET && cpu->irq_depth < 255)
++		++cpu->irq_depth;
+ 	cpu->state = mc6809_state_label_a;
+ 	NVMA_CYCLE;
+ #ifdef TRACE
+diff --git a/src/mc6809/mc6809.h b/src/mc6809/mc6809.h
+index 7f89955..87e51b3 100644
+--- a/src/mc6809/mc6809.h
++++ b/src/mc6809/mc6809.h
+@@ -68,6 +68,25 @@ enum mc6809_state {
+ };
+ 
+ /* Interface shared with all 6809-compatible CPUs */
++// Access class of the memory cycle in progress.  Set by the core immediately
++// before each mem_cycle delegate call and read by the machine, which is the
++// only place that knows the physical address the cycle resolved to.
++//
++// Bits, not an enum: one cycle can be both an instruction-stream byte and the
++// opcode that starts an instruction, or both a write and S-derived.  Without
++// this the machine sees a direction and an address and nothing else -- and in
++// particular cannot tell a real read from the dead bus cycles the 6809
++// performs at PC, which reach RAM with RAS asserted and would otherwise record
++// as reads of bytes nothing read.
++#define MC6809_MC_DATA    (0x00)  // ordinary data access through an EA
++#define MC6809_MC_FETCH   (0x01)  // byte consumed from the instruction stream
++#define MC6809_MC_OPCODE  (0x02)  // ... and it is the first byte of one
++#define MC6809_MC_STACK_S (0x04)  // address derived from S
++#define MC6809_MC_STACK_U (0x08)  // address derived from U
++#define MC6809_MC_DEAD    (0x10)  // dead bus cycle (VMA); not a real access
++#define MC6809_MC_VECTOR  (0x20)  // interrupt vector fetch
++#define MC6809_MC_PUSHPULL (0x40) // stack push/pull, not indexed addressing
++
+ struct MC6809 {
+ 	// Is a part
+ 	struct part part;
+@@ -113,6 +132,14 @@ struct MC6809 {
+ 	bool nmi_latch, firq_latch, irq_latch;
+ 	bool nmi_active, firq_active, irq_active;
+ 
++	/* Access classification, for the machine's audit map.  Host-side debug
++	 * state: deliberately not serialised, so snapshots stay compatible. */
++	uint8_t mem_class;    // class of the cycle in progress
++	uint8_t fetch_class;  // class traced fetches use: FETCH, or VECTOR mid-vector
++	uint8_t ea_class;     // S/U stickiness of this instruction's EA, cleared per instruction
++	bool op_first;        // next traced fetch is an opcode's first byte
++	uint8_t irq_depth;    // interrupt nesting: vector taken minus RTI
++
+ 	struct {
+ 		struct debug_cpu cpu;
+ 		struct debug_part part;
+diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
+index 8692414..8ce35d5 100644
+--- a/src/mc6809/mc6809_common.c
++++ b/src/mc6809/mc6809_common.c
+@@ -49,21 +49,42 @@
+  * Memory interface
+  */
+ 
+-static uint8_t fetch_byte_notrace(struct MC6809 *cpu, uint16_t a) {
++// One read cycle, tagged with its access class.  Every read in both cores
++// lands here, so the class is set exactly once per cycle and can never be
++// left over from the cycle before.
++static uint8_t mem_read_class(struct MC6809 *cpu, uint16_t a, uint8_t cls) {
+ 	cpu->nmi_latch |= (cpu->nmi_armed && cpu->nmi);
+ 	cpu->firq_latch = cpu->firq;
+ 	cpu->irq_latch = cpu->irq;
++	cpu->mem_class = cls;
+ 	DELEGATE_CALL(cpu->mem_cycle, 1, a);
+ 	return cpu->D;
+ }
+ 
++// Data read through an effective address.  ea_class carries the S/U
++// stickiness the current instruction's EA computation established, so
++// `lda 4,s` records as an S-derived read without this path knowing how the
++// address was reached.
++static uint8_t fetch_byte_notrace(struct MC6809 *cpu, uint16_t a) {
++	return mem_read_class(cpu, a, MC6809_MC_DATA | cpu->ea_class);
++}
++
+ static uint16_t fetch_word_notrace(struct MC6809 *cpu, uint16_t a) {
+ 	unsigned v = fetch_byte_notrace(cpu, a);
+ 	return (v << 8) | fetch_byte_notrace(cpu, a+1);
+ }
+ 
++// The traced fetch is the instruction stream, in every core and every
++// addressing mode -- opcode, postbyte, offset, immediate operand.  The one
++// exception is take_interrupt()'s vector read, which parks MC6809_MC_VECTOR in
++// fetch_class for the duration rather than being routed around the tracer.
+ static uint8_t fetch_byte(struct MC6809 *cpu, uint16_t a) {
+-	unsigned v = fetch_byte_notrace(cpu, a);
++	uint8_t cls = cpu->fetch_class;
++	if (cpu->op_first) {
++		cls |= MC6809_MC_OPCODE;
++		cpu->op_first = 0;
++	}
++	unsigned v = mem_read_class(cpu, a, cls);
+ #ifdef TRACE
+ 	cpu->trace_bytes[cpu->trace_nbytes++] = v;
+ 	++cpu->trace_next_pc;
+@@ -76,15 +97,23 @@ static uint16_t fetch_word(struct MC6809 *cpu, uint16_t a) {
+ 	return (v << 8) | fetch_byte(cpu, a + 1);
+ }
+ 
+-static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
++static void mem_write_class(struct MC6809 *cpu, uint16_t a, uint8_t d, uint8_t cls) {
+ 	cpu->nmi_latch |= (cpu->nmi_armed && cpu->nmi);
+ 	cpu->firq_latch = cpu->firq;
+ 	cpu->irq_latch = cpu->irq;
+ 	cpu->D = d;
++	cpu->mem_class = cls;
+ 	DELEGATE_CALL(cpu->mem_cycle, 0, a);
+ }
+ 
+-#define peek_byte(c,a) ((void)fetch_byte_notrace(c,a))
++static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
++	mem_write_class(cpu, a, d, MC6809_MC_DATA | cpu->ea_class);
++}
++
++// A dead bus cycle.  It reaches RAM with RAS asserted and is indistinguishable
++// from a real read at the machine's memory path, which is the whole reason the
++// class travels down with the cycle.
++#define peek_byte(c,a) ((void)mem_read_class(c,a,MC6809_MC_DEAD))
+ #define NVMA_CYCLE (peek_byte(cpu, 0xffff))
+ 
+ /*
+@@ -329,38 +358,48 @@ static void mc6809_emuext_break(struct MC6809 *cpu) {
+  * Stack operations
+  */
+ 
++// Stack traffic is classed at the source rather than inferred from the address,
++// so a push to S is S-derived even when S is pointing somewhere unexpected --
++// which, for a program whose stack has been destroyed by a bank remap, is
++// exactly the case worth catching.
++//
++// PUSHPULL separates this from `sta 4,s` and `lda ,u+`, which ea_indexed also
++// marks S- or U-derived.  Measured on one boot, U-as-general-pointer outweighs
++// U-as-stack by more than two hundred to one, so a flag that merged them would
++// answer "how deep did the stack get" with the size of a page copy.
++
+ static void push_s_byte(struct MC6809 *cpu, uint8_t v) {
+-	store_byte(cpu, --REG_S, v);
++	mem_write_class(cpu, --REG_S, v, MC6809_MC_STACK_S | MC6809_MC_PUSHPULL);
+ }
+ 
+ static void push_s_word(struct MC6809 *cpu, uint16_t v) {
+-	store_byte(cpu, --REG_S, v);
+-	store_byte(cpu, --REG_S, v >> 8);
++	mem_write_class(cpu, --REG_S, v, MC6809_MC_STACK_S | MC6809_MC_PUSHPULL);
++	mem_write_class(cpu, --REG_S, v >> 8, MC6809_MC_STACK_S | MC6809_MC_PUSHPULL);
+ }
+ 
+ static uint8_t pull_s_byte(struct MC6809 *cpu) {
+-	return fetch_byte_notrace(cpu, REG_S++);
++	return mem_read_class(cpu, REG_S++, MC6809_MC_STACK_S | MC6809_MC_PUSHPULL);
+ }
+ 
+ static uint16_t pull_s_word(struct MC6809 *cpu) {
+-	unsigned v = fetch_byte_notrace(cpu, REG_S++);
+-	return (v << 8) | fetch_byte_notrace(cpu, REG_S++);
++	unsigned v = mem_read_class(cpu, REG_S++, MC6809_MC_STACK_S | MC6809_MC_PUSHPULL);
++	return (v << 8) | mem_read_class(cpu, REG_S++, MC6809_MC_STACK_S | MC6809_MC_PUSHPULL);
+ }
+ 
+ static void push_u_byte(struct MC6809 *cpu, uint8_t v) {
+-	store_byte(cpu, --REG_U, v);
++	mem_write_class(cpu, --REG_U, v, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
+ }
+ 
+ static void push_u_word(struct MC6809 *cpu, uint16_t v) {
+-	store_byte(cpu, --REG_U, v);
+-	store_byte(cpu, --REG_U, v >> 8);
++	mem_write_class(cpu, --REG_U, v, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
++	mem_write_class(cpu, --REG_U, v >> 8, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
+ }
+ 
+ static uint8_t pull_u_byte(struct MC6809 *cpu) {
+-	return fetch_byte_notrace(cpu, REG_U++);
++	return mem_read_class(cpu, REG_U++, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
+ }
+ 
+ static uint16_t pull_u_word(struct MC6809 *cpu) {
+-	unsigned v = fetch_byte_notrace(cpu, REG_U++);
+-	return (v << 8) | fetch_byte_notrace(cpu, REG_U++);
++	unsigned v = mem_read_class(cpu, REG_U++, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
++	return (v << 8) | mem_read_class(cpu, REG_U++, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
+ }
+diff --git a/src/xroar.c b/src/xroar.c
+index 557a25b..12d13c7 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -52,6 +52,7 @@
+ #include "xalloc.h"
+ 
+ #include "ao.h"
++#include "audit.h"
+ #include "auto_kbd.h"
+ #include "joystick_script.h"
+ #include "becker.h"
+@@ -148,6 +149,10 @@ struct trap_def {
+ 	char *load_spec;    // -trap-load FILE[,opts]; see load_blob()
+ 	int ratelimit_off;  // -trap-ratelimit-off: run unrestricted from this trap
+ 	int ratelimit_on;   // -trap-ratelimit-on: back to real time from this trap
++	int audit_on;       // -trap-audit-on: start recording into the audit map
++	int audit_off;      // -trap-audit-off: stop recording
++	int audit_clear;    // -trap-audit-clear: zero the map
++	char *audit_write;  // -trap-audit-write FILE: write the map at this trap
+ 
+ 	// Internal
+ 	unsigned long counter;
+@@ -1697,6 +1702,7 @@ void xroar_shutdown(void) {
+ #endif
+ 	disable_all_traps();
+ 	profile_dump();
++	audit_shutdown();
+ 	save_config();
+ 	messenger_shutdown();
+ 	if (xroar.auto_kbd) {
+@@ -4257,6 +4263,27 @@ static void handle_trap(void *sptr) {
+ 		ui_update_state(-1, ui_tag_ratelimit_latch, 1, NULL);
+ 	}
+ 
++	// Audit map actions.  Clear before on, so
++	// `-trap-audit-clear -trap-audit-on` at a tool's entry scopes the map
++	// to that tool and nothing else.  Write last, so a trap that stops
++	// recording and writes in the same breath writes what it just stopped.
++	if (trap->audit_clear) {
++		LOG_MOD_DEBUG(2, "trap", "audit clear\n");
++		audit_clear();
++	}
++	if (trap->audit_off) {
++		LOG_MOD_DEBUG(2, "trap", "audit off\n");
++		audit_set_active(0);
++	}
++	if (trap->audit_on) {
++		LOG_MOD_DEBUG(2, "trap", "audit on\n");
++		audit_set_active(1);
++	}
++	if (trap->audit_write) {
++		LOG_MOD_DEBUG(2, "trap", "audit write: %s\n", trap->audit_write);
++		audit_write(trap->audit_write);
++	}
++
+ 	// Cycle counter actions.  Print before reset so -trap-cycle-print-reset
+ 	// reports the elapsed count and then zeroes it.  The reset/print is
+ 	// taken at the point the trapped write reaches the bus, so probe
+@@ -4414,6 +4441,23 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->ratelimit_on = 1;
+ 			private_cfg.debug.trap_def.ratelimit_on = 0;
+ 		}
++		if (private_cfg.debug.trap_def.audit_on) {
++			cur_trap_def->audit_on = 1;
++			private_cfg.debug.trap_def.audit_on = 0;
++		}
++		if (private_cfg.debug.trap_def.audit_off) {
++			cur_trap_def->audit_off = 1;
++			private_cfg.debug.trap_def.audit_off = 0;
++		}
++		if (private_cfg.debug.trap_def.audit_clear) {
++			cur_trap_def->audit_clear = 1;
++			private_cfg.debug.trap_def.audit_clear = 0;
++		}
++		if (private_cfg.debug.trap_def.audit_write) {
++			free(cur_trap_def->audit_write);
++			cur_trap_def->audit_write = private_cfg.debug.trap_def.audit_write;
++			private_cfg.debug.trap_def.audit_write = NULL;
++		}
+ 	}
+ 	if (cond) {
+ 		unsigned i = num_trap_defs++;
+@@ -4704,6 +4748,11 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
+ 	{ XC_SET_INT1("trap-ratelimit-off", &private_cfg.debug.trap_def.ratelimit_off) },
+ 	{ XC_SET_INT1("trap-ratelimit-on", &private_cfg.debug.trap_def.ratelimit_on) },
++	{ XC_CALL_STRING("audit", &audit_config) },
++	{ XC_SET_INT1("trap-audit-on", &private_cfg.debug.trap_def.audit_on) },
++	{ XC_SET_INT1("trap-audit-off", &private_cfg.debug.trap_def.audit_off) },
++	{ XC_SET_INT1("trap-audit-clear", &private_cfg.debug.trap_def.audit_clear) },
++	{ XC_SET_STRING("trap-audit-write", &private_cfg.debug.trap_def.audit_write) },
+ 	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
+ 	{ XC_SET_STRING("trap-byte", &private_cfg.debug.trap_def.byte_path) },
+ 	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
+@@ -4979,6 +5028,11 @@ static void helptext(void) {
+ "    -trap-ratelimit-off run unrestricted from this trap (wall clock only; cycle-exact)\n"
+ "    -trap-ratelimit-on  back to real time from this trap\n"
+ "    -trap-ram FILE      write flat physical RAM at trap (see -export-ram)\n"
++"  -audit FILE[,seed=F][,build=ID][,start=on|off][,reset]  physical access-audit map\n"
++"    -trap-audit-on      start recording into the audit map from this trap\n"
++"    -trap-audit-off     stop recording from this trap\n"
++"    -trap-audit-clear   zero the audit map at this trap\n"
++"    -trap-audit-write FILE  write the audit map at this trap\n"
+ "    -export-ram FILE    dump flat physical RAM of -load snapshot, then exit\n"
+ #ifdef SCREENSHOT
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"

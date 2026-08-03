@@ -1,0 +1,270 @@
+From a488adbaadaace3946750536ab894999633df98a Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:14 -0400
+Subject: [PATCH 23/44] trap: xpc= range condition and -trap-history flight
+
+---
+ src/xroar.c | 174 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 174 insertions(+)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index e45ef31..fbb3a42 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -79,6 +79,7 @@
+ #include "snapshot.h"
+ #include "sound.h"
+ #include "tape.h"
++#include "tcc1014/tcc1014.h"  // tcc1014_logical_to_physical, for xpc=
+ #include "ui.h"
+ #include "vdg_palette.h"
+ #include "vdisk.h"
+@@ -151,6 +152,10 @@ struct trap_def {
+ 	int screenshot_kind;         // 0=unset, 1=single, 2=bounded, 3=unbounded
+ 	unsigned long screenshot_last;   // captured upper bound when bounded
+ 	long match_value;   // value= qualifier for write traps, or -1 for none
++	long xpcr_lo;       // xpcrange= physical range low, or -1 for none
++	long xpcr_hi;       // xpcrange= physical range high
++	bool xpcr_inside;   // xpcrange= edge state: PC was inside on the last fetch
++	bool xpcr_hooked;   // xpcrange= ambient instruction hook installed
+ 	struct xroar_timeout *timeout_data;
+ 	// Context of the access that fired a WATCH trap, recorded by
+ 	// handle_trap_watch() before the shared handler runs.  wp_ctx says the
+@@ -186,6 +191,20 @@ static void handle_trap_watch(void *, bool RnW, uint32_t A, uint8_t D);
+ static void enable_all_traps(void);
+ static void disable_all_traps(void);
+ 
++// -trap-history N: flight recorder.  A ring of the last N executed physical
++// PCs, dumped to stderr whenever any trap actually fires (after its ghost/
++// value/range gates).  Opt-in: the ring pays one MMU translation per
++// instruction, so nothing is recorded unless the flag is given.
++static int trap_history_size = 0;
++static unsigned long *trap_history_ring = NULL;
++static unsigned trap_history_pos = 0;
++static unsigned long trap_history_seen = 0;
++static bool trap_history_installed = 0;
++static void trap_history_record(void *, uint32_t A);
++static void trap_history_dump(void);
++static void trap_xpcrange_check(void *, uint32_t A);
++static void trap_fast_parts_refresh(void);
++
+ #else
+ 
+ #define set_trap(s)
+@@ -3477,6 +3496,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 				} else {
+ 					machine_remove_breakpoint(xroar.machine, a, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
+ 				}
++			} else if (0 == c_strcasecmp(key, "xpcrange")) {
++				// xpcrange=LO-HI: fire the instant the PHYSICAL PC enters
++				// the range.  An execution tripwire: arm it over a region
++				// code never legitimately executes (the stack page, data
++				// buffers) and a wild jump is caught the cycle it lands,
++				// stack intact, instead of hundreds of wrecked bytes
++				// later.  Costs one MMU translation per instruction while
++				// armed (the any-address hook below), so it is per-trap
++				// opt-in, never ambient.  A single address is accepted as
++				// a one-address range.
++				if (a > 0x7ffff || b > 0x7ffff) {
++					fprintf(stderr, "xroar: -trap %s: physical address > 0x7ffff\n",
++					        trap->cond);
++					exit(EXIT_FAILURE);
++				}
++				if (enable) {
++					trap->xpcr_lo = (long)a;
++					trap->xpcr_hi = (long)b;
++					trap->xpcr_inside = 0;
++					machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_xpcrange_check, trap));
++					trap->xpcr_hooked = 1;
++				} else if (trap->xpcr_hooked) {
++					machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_xpcrange_check, trap));
++					trap->xpcr_hooked = 0;
++				}
+ 			} else if (0 == c_strcasecmp(key, "read")) {
+ 				if (enable) {
+ 					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
+@@ -3504,12 +3548,27 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ }
+ 
+ static void enable_all_traps(void) {
++	trap_fast_parts_refresh();
++	// -trap-history: one ambient any-address instruction hook, installed
++	// once per machine connect.  Ring memory is allocated on first install
++	// and kept; contents survive a reconnect, which is what a flight
++	// recorder should do.
++	if (trap_history_size > 0 && !trap_history_installed && xroar.machine) {
++		if (!trap_history_ring)
++			trap_history_ring = xmalloc((size_t)trap_history_size * sizeof(*trap_history_ring));
++		machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
++		trap_history_installed = 1;
++	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+ 		enable_trap(&trap_defs[i], 1);
+ 	}
+ }
+ 
+ static void disable_all_traps(void) {
++	if (trap_history_installed && xroar.machine) {
++		machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
++		trap_history_installed = 0;
++	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+ 		enable_trap(&trap_defs[i], 0);
+ 	}
+@@ -3557,6 +3616,101 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
+ 	return out;
+ }
+ 
++// Per-instruction hooks (the -trap-history ring, the xpcrange= edge
++// detector) cannot afford the part-tree walk trap_current_pc() and
++// trap_pc_physical() do on every call: that walk is exactly what made the
++// abandoned 8-alias xpc= design drop emulation below realtime.  Cache the
++// two parts, keyed on the machine pointer; enable_all_traps() refreshes the
++// cache on every machine (re)connect, and the getter re-keys defensively.
++static struct machine *trap_fast_machine = NULL;
++static struct debug_cpu *trap_fast_cpu = NULL;
++static struct TCC1014 *trap_fast_gime = NULL;
++
++static void trap_fast_parts_refresh(void) {
++	trap_fast_machine = xroar.machine;
++	trap_fast_cpu = NULL;
++	trap_fast_gime = NULL;
++	if (!xroar.machine)
++		return;
++	// The machine keeps a copy of its CPU's debug interface; use that
++	// rather than casting the CPU part, whose layout is per-core.
++	trap_fast_cpu = &xroar.machine->debug.cpu;
++	trap_fast_gime = (struct TCC1014 *)part_component_by_id_is_a(&xroar.machine->part, "GIME", "TCC1014");
++}
++
++// Physical address of the current PC via the cached parts.  On a machine
++// with no GIME the logical PC is returned as-is (flat address space), which
++// keeps the history ring useful there; -1 only when there is no CPU at all.
++static long trap_fast_phys(uint16_t pc) {
++	if (xroar.machine != trap_fast_machine)
++		trap_fast_parts_refresh();
++	if (!trap_fast_cpu)
++		return -1;
++	if (!trap_fast_gime)
++		return (long)pc;
++	return (long)tcc1014_logical_to_physical(trap_fast_gime, pc);
++}
++
++static long trap_fast_phys_pc(void) {
++	if (xroar.machine != trap_fast_machine)
++		trap_fast_parts_refresh();
++	if (!trap_fast_cpu)
++		return -1;
++	return trap_fast_phys((uint16_t)DELEGATE_CALL(trap_fast_cpu->get_pc));
++}
++
++// -trap-history: record one physical PC per instruction fetch.
++static void trap_history_record(void *sptr, uint32_t A) {
++	(void)sptr;
++	long phys = trap_fast_phys((uint16_t)A);
++	if (phys < 0)
++		return;
++	trap_history_ring[trap_history_pos] = (unsigned long)phys;
++	trap_history_pos = (trap_history_pos + 1) % (unsigned)trap_history_size;
++	++trap_history_seen;
++}
++
++// Dump the ring oldest-to-newest.  The final entry is the instruction the
++// trap fired on: pc=/xpc=/xpcrange= hooks run at the fetch, so their own
++// fetch is already recorded; write=/read= hooks fire mid-instruction, after
++// the fetch that performed the access was recorded.  Read backwards from
++// the end to walk the arrival path.
++static void trap_history_dump(void) {
++	if (!trap_history_installed || !trap_history_seen)
++		return;
++	unsigned n = (trap_history_seen < (unsigned long)trap_history_size)
++	             ? (unsigned)trap_history_seen : (unsigned)trap_history_size;
++	unsigned start = (trap_history_pos + (unsigned)trap_history_size - n)
++	                 % (unsigned)trap_history_size;
++	fprintf(stderr, "trap-history: last %u physical PCs, oldest first:\n", n);
++	for (unsigned i = 0; i < n; ++i) {
++		unsigned long v = trap_history_ring[(start + i) % (unsigned)trap_history_size];
++		if ((i % 8) == 0)
++			fprintf(stderr, "trap-history:");
++		fprintf(stderr, " 0x%05lX", v);
++		if ((i % 8) == 7 || i == n - 1)
++			fprintf(stderr, "\n");
++	}
++}
++
++// xpcrange= edge detector, called on every instruction fetch while armed.
++// Fires the moment the physical PC ENTERS [lo,hi]; staying inside does not
++// re-fire, leaving re-arms.  Level-triggering would fire on every
++// instruction of a legitimate stay and chew the -trap-range counter to
++// nothing, and the tripwire use case ("code never legitimately executes
++// here") only cares about arrival.
++static void trap_xpcrange_check(void *sptr, uint32_t A) {
++	struct trap_def *trap = sptr;
++	long phys = trap_fast_phys((uint16_t)A);
++	bool inside = (phys >= trap->xpcr_lo && phys <= trap->xpcr_hi);
++	if (inside && !trap->xpcr_inside) {
++		trap->xpcr_inside = 1;
++		handle_trap(trap);
++		return;
++	}
++	trap->xpcr_inside = inside;
++}
++
+ // Deferred trap-snap.  seconds=/cycle= traps fire from a scheduled event,
+ // which lands mid-instruction: the CPU may have consumed an opcode byte and
+ // have PC pointing at its operand -- a position the snapshot cannot fully
+@@ -3600,6 +3754,14 @@ static void handle_trap(void *sptr) {
+ 		return;
+ 	}
+ 
++	// Flight recorder: a real trap fire dumps the -trap-history ring,
++	// newest entry last.  Both range bounds are checked here: the engine's
++	// disable-at-tail design lets one trigger past range->last reach the
++	// action block (screenshot compensates internally, snap overwrites the
++	// same file), but an extra dump is visible noise, so gate it out.
++	if (!range || trap->counter <= range->last)
++		trap_history_dump();
++
+ 	// Break action
+ 	if (trap->snap) {
+ 		// -trap-timeout 0 exits synchronously at the end of this handler;
+@@ -3827,6 +3989,15 @@ static void set_trap(const char *cond) {
+ 		cur_trap_def->trace = -1;
+ 		cur_trap_def->no_trace = -1;
+ 		cur_trap_def->match_value = -1;
++		// -1 is "none" for the xpcrange= bounds; 0 is a valid physical
++		// address, so the struct's {0} zero-init cannot express it.  Set
++		// HERE at struct creation, not in enable_trap's condition block:
++		// cycle=/seconds= traps return out of enable_trap early, and a
++		// field left 0 would wrongly filter those traps against physical
++		// address zero (the shape of bug that once silently broke plain
++		// seconds= traps).
++		cur_trap_def->xpcr_lo = -1;
++		cur_trap_def->xpcr_hi = -1;
+ 	}
+ }
+ 
+@@ -4077,6 +4248,7 @@ static struct xconfig_option const xroar_options[] = {
+ #ifdef WANT_TRAPS
+ 	{ XC_CALL_STRING("trap", &set_trap) },
+ 	{ XC_CALL_STRING("trap-range", &set_trap_count) },
++	{ XC_SET_INT("trap-history", &trap_history_size) },
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
+ 	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
+ 	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
+@@ -4331,6 +4503,7 @@ static void helptext(void) {
+ "  -q, -quiet            equivalent to -verbose 0\n"
+ #ifdef WANT_TRAPS
+ "  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
++"  -trap-history N       ring of last N executed physical PCs; dump on any trap\n"
+ "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
+ "    -trap-snap FILE     write snapshot at trap\n"
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
+@@ -4394,6 +4567,7 @@ static void helptext(void) {
+ "  pc=ADDR               trigger at CPU Program Counter value\n"
+ "  read=A[-B]            trigger on read from address range\n"
+ "  write=A[-B]           trigger on write to address range\n"
++"  xpcrange=A-B          trigger when physical PC enters range\n"
+ "  access=A[-B]          trigger on either read or write\n"
+ "  cycle=N               trigger when the CPU cycle counter reaches N\n"
+ "  seconds=N             trigger N emulated seconds after boot\n"

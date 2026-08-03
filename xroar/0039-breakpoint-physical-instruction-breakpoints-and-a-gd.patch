@@ -1,0 +1,622 @@
+From 2c270672d68285b91c8219b1d35112cee2d8179f Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:47 -0400
+Subject: [PATCH 39/44] breakpoint: physical instruction breakpoints, and a gdb
+
+---
+ src/breakpoint.c    |   1 +
+ src/coco3.c         |  64 ++++++++++++++++++++----
+ src/dragon/dragon.c |  55 ++++++++++++++++++---
+ src/dragon/dragon.h |   1 +
+ src/gdb.c           | 115 +++++++++++++++++++++++++++++++++++++++++++-
+ src/machine.c       |  20 ++++++++
+ src/machine.h       |  14 ++++++
+ src/mc10.c          |  56 ++++++++++++++++++---
+ src/xroar.c         |  20 ++++----
+ 9 files changed, 310 insertions(+), 36 deletions(-)
+
+diff --git a/src/breakpoint.c b/src/breakpoint.c
+index 5596a25..23d17ca 100644
+--- a/src/breakpoint.c
++++ b/src/breakpoint.c
+@@ -33,6 +33,7 @@
+ #include "logging.h"
+ #include "machine.h"
+ #include "part.h"
++#include "tcc1014/tcc1014.h"
+ 
+ #ifndef BP_DEBUG
+ #define BP_DEBUG(...) LOG_DEBUG(__VA_ARGS__)
+diff --git a/src/coco3.c b/src/coco3.c
+index 2097189..a597573 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -67,6 +67,14 @@
+ #include "screenshot.h"
+ #include "xroar.h"
+ 
++struct coco3;
++static void coco3_add_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++			     DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void coco3_remove_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++				DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void coco3_instruction_hook(void *sptr, uint32_t A);
++static void coco3_instruction_hook_update(struct coco3 *mcc3);
++
+ #ifndef M_PI
+ # define M_PI 3.14159265358979323846
+ #endif
+@@ -179,6 +187,7 @@ struct coco3 {
+ 	struct bp_breakpoint_set breakpoint_set;
+ 	struct bp_watchpoint_set watchpoint_set;
+ 	struct bp_watchpoint_set pwatchpoint_set;  // physical-address watchpoints
++	struct bp_watchpoint_set pbreak_set;       // physical fetch-range breakpoints (list[0])
+ 
+ 	struct tape_interface *tape_interface;
+ 	DELEGATE_T1(void, float) tape_update_audio;
+@@ -363,16 +372,14 @@ static void coco3_add_instruction_hook(struct machine *m,
+ 				 DELEGATE_T1(void, uint32) handler) {
+ 	struct coco3 *mcc3 = (struct coco3 *)m;
+ 	bp_instr_hook_add(&mcc3->breakpoint_set, handler);
+-	mcc3->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mcc3->breakpoint_set);
++	coco3_instruction_hook_update(mcc3);
+ }
+ 
+ static void coco3_remove_instruction_hook(struct machine *m,
+ 				    DELEGATE_T1(void, uint32) handler) {
+ 	struct coco3 *mcc3 = (struct coco3 *)m;
+ 	bp_instr_hook_remove(&mcc3->breakpoint_set, handler);
+-	if (!bp_breakpoint_set_active(&mcc3->breakpoint_set)) {
+-		mcc3->CPU->instruction_hook.func = NULL;
+-	}
++	coco3_instruction_hook_update(mcc3);
+ }
+ 
+ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+@@ -396,12 +403,51 @@ static void coco3_remove_pwatchpoint(struct machine *m, int RnW,
+ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+ 				 uint32_t Astart, uint32_t Aend,
+ 				 DELEGATE_T3(void, bool, uint32, uint8) handler);
++// Physical fetch-range breakpoints.  Kept in list[0] of a watchpoint set --
++// the range-matching is identical, only the event differs (instruction fetch
++// rather than data access).  Dispatched from the instruction hook wrapper
++// below, which pays the one translation per fetch only while non-empty.
++static void coco3_add_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++			     DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct coco3 *mcc3 = (struct coco3 *)m;
++	bp_watchpoint_add(&mcc3->pbreak_set, 0, Astart, Aend, handler);
++	coco3_instruction_hook_update(mcc3);
++}
++
++static void coco3_remove_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++				DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct coco3 *mcc3 = (struct coco3 *)m;
++	bp_watchpoint_remove(&mcc3->pbreak_set, 0, Astart, Aend, handler);
++	coco3_instruction_hook_update(mcc3);
++}
++
++// Instruction hook wrapper: logical dispatch always; physical fetch-range
++// dispatch (one translation) only while pbreak ranges exist.
++static void coco3_instruction_hook(void *sptr, uint32_t A) {
++	struct coco3 *mcc3 = sptr;
++	bp_instruction_hook(&mcc3->breakpoint_set, A);
++	if (mcc3->pbreak_set.list[0]) {
++		uint32_t phys = tcc1014_logical_to_physical(mcc3->GIME, (uint16_t)A);
++		bp_check_watchpoints(&mcc3->pbreak_set, 0, phys, 0);
++	}
++}
++
++// One decision over everything that needs the CPU fetch hook.
++static void coco3_instruction_hook_update(struct coco3 *mcc3) {
++	if (bp_breakpoint_set_active(&mcc3->breakpoint_set) || mcc3->pbreak_set.list[0]) {
++		mcc3->CPU->instruction_hook = DELEGATE_AS1(void, uint32, coco3_instruction_hook, mcc3);
++	} else {
++		mcc3->CPU->instruction_hook.func = NULL;
++	}
++}
++
+ static void coco3_add_pwatchpoint(struct machine *m, bool RnW,
+ 				 uint32_t Astart, uint32_t Aend,
+ 				 DELEGATE_T3(void, bool, uint32, uint8) handler);
+ static void coco3_remove_pwatchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+ 				    DELEGATE_T3(void, bool, uint32, uint8) handler);
++
+ static void coco3_remove_watchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+ 				    DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -505,6 +551,8 @@ static struct part *coco3_allocate(void) {
+ 	m->debug.remove_instruction_hook = coco3_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = coco3_remove_breakpoint;
+ 	m->debug.add_watchpoint = coco3_add_watchpoint;
++	m->debug.add_pbreak = coco3_add_pbreak;
++	m->debug.remove_pbreak = coco3_remove_pbreak;
+ 	m->debug.add_pwatchpoint = coco3_add_pwatchpoint;
+ 	m->debug.remove_pwatchpoint = coco3_remove_pwatchpoint;
+ 	m->debug.remove_watchpoint = coco3_remove_watchpoint;
+@@ -1755,18 +1803,14 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+ 	if (!bp_breakpoint_add(&mcc3->breakpoint_set, A, handler)) {
+ 		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
+ 	}
+-	if (bp_breakpoint_set_active(&mcc3->breakpoint_set)) {
+-		mcc3->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mcc3->breakpoint_set);
+-	}
++	coco3_instruction_hook_update(mcc3);
+ }
+ 
+ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+ 				    DELEGATE_T2(void, bool, uint32) handler) {
+ 	struct coco3 *mcc3 = (struct coco3 *)m;
+ 	bp_breakpoint_remove(&mcc3->breakpoint_set, A, handler);
+-	if (!bp_breakpoint_set_active(&mcc3->breakpoint_set)) {
+-		mcc3->CPU->instruction_hook.func = NULL;
+-	}
++	coco3_instruction_hook_update(mcc3);
+ }
+ 
+ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 3b08c0b..1469020 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -64,6 +64,14 @@
+ #include "xconfig.h"
+ #include "xroar.h"
+ 
++struct dragon;
++static void dragon_add_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++			     DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void dragon_remove_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++				DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void dragon_instruction_hook(void *sptr, uint32_t A);
++static void dragon_instruction_hook_update(struct dragon *md);
++
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ #define DRAGON_SER_RAM      (2)
+@@ -236,16 +244,14 @@ static void dragon_add_instruction_hook(struct machine *m,
+ 				 DELEGATE_T1(void, uint32) handler) {
+ 	struct dragon *md = (struct dragon *)m;
+ 	bp_instr_hook_add(&md->breakpoint_set, handler);
+-	md->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &md->breakpoint_set);
++	dragon_instruction_hook_update(md);
+ }
+ 
+ static void dragon_remove_instruction_hook(struct machine *m,
+ 				    DELEGATE_T1(void, uint32) handler) {
+ 	struct dragon *md = (struct dragon *)m;
+ 	bp_instr_hook_remove(&md->breakpoint_set, handler);
+-	if (!bp_breakpoint_set_active(&md->breakpoint_set)) {
+-		md->CPU->instruction_hook.func = NULL;
+-	}
++	dragon_instruction_hook_update(md);
+ }
+ 
+ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
+@@ -261,6 +267,7 @@ static void dragon_add_pwatchpoint(struct machine *m, bool RnW,
+ static void dragon_remove_pwatchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+ 				    DELEGATE_T3(void, bool, uint32, uint8) handler);
++
+ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ 				     int32_t Astart, uint32_t Aend,
+ 				     DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -326,6 +333,8 @@ void dragon_allocate_common(struct dragon *md) {
+ 	m->debug.remove_instruction_hook = dragon_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = dragon_remove_breakpoint;
+ 	m->debug.add_watchpoint = dragon_add_watchpoint;
++	m->debug.add_pbreak = dragon_add_pbreak;
++	m->debug.remove_pbreak = dragon_remove_pbreak;
+ 	m->debug.add_pwatchpoint = dragon_add_pwatchpoint;
+ 	m->debug.remove_pwatchpoint = dragon_remove_pwatchpoint;
+ 	m->debug.remove_watchpoint = dragon_remove_watchpoint;
+@@ -1364,16 +1373,46 @@ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
+ 	if (!bp_breakpoint_add(&md->breakpoint_set, A, handler)) {
+ 		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
+ 	}
+-	if (bp_breakpoint_set_active(&md->breakpoint_set)) {
+-		md->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &md->breakpoint_set);
+-	}
++	dragon_instruction_hook_update(md);
+ }
+ 
+ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+ 				     DELEGATE_T2(void, bool, uint32) handler) {
+ 	struct dragon *md = (struct dragon *)m;
+ 	bp_breakpoint_remove(&md->breakpoint_set, A, handler);
+-	if (!bp_breakpoint_set_active(&md->breakpoint_set)) {
++	dragon_instruction_hook_update(md);
++}
++
++static void dragon_add_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++			     DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct dragon *md = (struct dragon *)m;
++	bp_watchpoint_add(&md->pbreak_set, 0, Astart, Aend, handler);
++	dragon_instruction_hook_update(md);
++}
++
++static void dragon_remove_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++				DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct dragon *md = (struct dragon *)m;
++	bp_watchpoint_remove(&md->pbreak_set, 0, Astart, Aend, handler);
++	dragon_instruction_hook_update(md);
++}
++
++// Instruction hook wrapper: logical dispatch always; physical fetch-range
++// dispatch (one translation) only while pbreak ranges exist.
++static void dragon_instruction_hook(void *sptr, uint32_t A) {
++	struct dragon *md = sptr;
++	bp_instruction_hook(&md->breakpoint_set, A);
++	if (md->pbreak_set.list[0]) {
++		uint32_t phys = A;
++		bp_check_watchpoints(&md->pbreak_set, 0, phys, 0);
++	}
++}
++
++// One decision over everything that needs the CPU fetch hook.
++static void dragon_instruction_hook_update(struct dragon *md) {
++	if (bp_breakpoint_set_active(&md->breakpoint_set) || md->pbreak_set.list[0]) {
++		md->CPU->instruction_hook = DELEGATE_AS1(void, uint32, dragon_instruction_hook, md);
++	} else {
+ 		md->CPU->instruction_hook.func = NULL;
+ 	}
+ }
+diff --git a/src/dragon/dragon.h b/src/dragon/dragon.h
+index 26b2bd8..604ed16 100644
+--- a/src/dragon/dragon.h
++++ b/src/dragon/dragon.h
+@@ -95,6 +95,7 @@ struct dragon {
+ 	struct bp_breakpoint_set breakpoint_set;
+ 	struct bp_watchpoint_set watchpoint_set;
+ 	struct bp_watchpoint_set pwatchpoint_set;  // physical == CPU address here
++	struct bp_watchpoint_set pbreak_set;       // physical fetch-range breakpoints (list[0])
+ 
+ 	struct tape_interface *tape_interface;
+ 	DELEGATE_T1(void, float) tape_update_audio;
+diff --git a/src/gdb.c b/src/gdb.c
+index 368af48..04a7671 100644
+--- a/src/gdb.c
++++ b/src/gdb.c
+@@ -74,6 +74,34 @@
+  *      Qxroar.key:SCAN,S          | press (S!=0)/release (S=0) raw matrix key
+  *                                     by DSCAN scancode (PIA path)
+  *      Qxroar.type:HEX            | queue hex-encoded text to auto_kbd typer
++ *      Qxroar.pbreak:PADDR[,LEN]  | set a breakpoint on a PHYSICAL address
++ *                                     (hex, 19-bit, LEN bytes, default 1).
++ *                                     Matched against the physical address the
++ *                                     MMU maps the PC to, so it fires in the
++ *                                     bank that owns the code and in no other:
++ *                                     no wrong-bank ghost hits to filter out,
++ *                                     and no bank it cannot reach.
++ *      Qxroar.pbreak-:PADDR[,LEN] | clear one
++ *      Qxroar.pwatch:T,PADDR[,LEN]  | set a PHYSICAL watchpoint. T is the Z
++ *                                     packet's type number: 2 write, 3 read,
++ *                                     4 access. Sees the byte through whatever
++ *                                     logical window it is banked into, which
++ *                                     a logical Z2 cannot.
++ *      Qxroar.pwatch-:T,PADDR[,LEN] | clear one
++ *
++ * Physical addresses are the flat RAM addresses -load-ram, qxroar.physmem and
++ * qxroar.xpc all use.  They are spelled through their own verbs rather than
++ * through Z0/Z2 deliberately: Z packets are a wire standard whose addresses
++ * are formatted by whatever client is on the socket, and a client that
++ * zero-padded a logical address to five digits would otherwise silently get a
++ * physical breakpoint.
++ *
++ * On a GIME machine the stop reply is a 'T' packet carrying the physical
++ * context of the stop as extra name:value pairs -- xpc, block, task and
++ * paddr, the same values the corresponding qxroar queries return -- so a
++ * client does not need a query round trip per stop to find out where it is.
++ * Unrecognised pairs are ignorable by protocol.  Machines with no GIME reply
++ * 'S' exactly as before.
+ 
+  * The four derived values above are as far as this should go. Anything that is
+  * simply a chip register -- SAM, PIA, the GIME's own $FF9x -- belongs in
+@@ -862,8 +890,26 @@ static int send_char(struct gdb_interface_private *gip, char c) {
+ 
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
++// The stop reply.  On a GIME machine it is a 'T' packet carrying the physical
++// context of the stop -- the same four values qxroar.xpc / .block / .task /
++// .paddr answer, computed here at the moment of the stop.  A logical PC alone
++// does not say where a stop happened on this machine: the same $6xxx can be
++// any of eleven banks.  Sending it with the stop saves the client a query
++// round trip per stop, and more importantly makes the answer atomic with the
++// stop rather than "whatever is mapped by the time you ask".  Machines with
++// no MMU have nothing to add and reply 'S' as before.
+ static void send_last_signal(struct gdb_interface_private *gip) {
+-	char tmpbuf[4];
++	char tmpbuf[64];
++	if (gip->gime) {
++		uint16_t pc = mc6809_get_pc(gip->cpu);
++		unsigned xpc = tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff;
++		snprintf(tmpbuf, sizeof(tmpbuf),
++			 "T%02xxpc:%05x;block:%02x;task:%02x;paddr:%05x;",
++			 gip->last_signal, xpc, (xpc >> 13) & 0xff,
++			 tcc1014_get_task(gip->gime), gip->gime->Z & 0x7ffff);
++		send_packet_string(gip, tmpbuf);
++		return;
++	}
+ 	snprintf(tmpbuf, sizeof(tmpbuf), "S%02x", gip->last_signal);
+ 	send_packet(gip, tmpbuf, 3);
+ }
+@@ -1167,6 +1213,73 @@ static void general_set(struct gdb_interface_private *gip, char *args) {
+ 			send_packet_string(gip, "E00");
+ 			return;
+ 		}
++		if (0 == strcmp(set, "pbreak") || 0 == strcmp(set, "pbreak-")) {
++			// Qxroar.pbreak:PADDR[,LEN] / Qxroar.pbreak-:PADDR[,LEN] --
++			// set or clear an instruction breakpoint on a flat PHYSICAL
++			// address (hex, no prefix; LEN bytes, default 1). The
++			// breakpoint matches the physical address the MMU maps the PC
++			// to at each fetch, so it fires only in the bank that owns
++			// the code, and it reaches every bank -- neither of which a
++			// logical Z0 can do on a machine that pages eleven blocks
++			// through one window. Replaces the client-side idiom of
++			// stopping on a logical address, querying the block, and
++			// continuing past every wrong-bank hit.
++			char *addrs = strsep(&args, ",");
++			if (!addrs || !*addrs) { send_packet_string(gip, "E00"); return; }
++			unsigned long A = strtoul(addrs, NULL, 16);
++			unsigned long len = (args && *args) ? strtoul(args, NULL, 16) : 1;
++			if (!len || A > 0x7ffff || (A + len - 1) > 0x7ffff) {
++				send_packet_string(gip, "E00");
++				return;
++			}
++			if (set[6] == '-')
++				machine_remove_hbreak_phys(gip->machine, (uint32_t)A, (uint32_t)(A + len - 1));
++			else
++				machine_add_hbreak_phys(gip->machine, (uint32_t)A, (uint32_t)(A + len - 1));
++			send_packet_string(gip, "OK");
++			return;
++		}
++		if (0 == strcmp(set, "pwatch") || 0 == strcmp(set, "pwatch-")) {
++			// Qxroar.pwatch:T,PADDR[,LEN] / Qxroar.pwatch-:T,PADDR[,LEN]
++			// -- set or clear a PHYSICAL watchpoint, matched against the
++			// address the machine's own decode produced for the RAM cycle.
++			// T is the Z packet's type number (2 write, 3 read, 4 access)
++			// so one numbering serves both. A logical Z2 sees a write only
++			// through the window it was set in; this sees it wherever the
++			// byte is banked, without the eight-slot-alias workaround that
++			// needed one stop per wrong alias.
++			char *types = strsep(&args, ",");
++			if (!types || !args) { send_packet_string(gip, "E00"); return; }
++			// Z-packet numbering: 2 write, 3 read, 4 access.
++			unsigned type = (unsigned)strtoul(types, NULL, 16);
++			if (type < 2 || type > 4) {
++				send_packet_string(gip, "E00");
++				return;
++			}
++			char *addrs = strsep(&args, ",");
++			if (!addrs || !*addrs) { send_packet_string(gip, "E00"); return; }
++			unsigned long A = strtoul(addrs, NULL, 16);
++			unsigned long len = (args && *args) ? strtoul(args, NULL, 16) : 1;
++			// 19 bits stock, 21 with a DAT board -- the same bound the
++			// -trap read=/write=/access= physical path takes.
++			if (!len || A > 0x1fffff || (A + len - 1) > 0x1fffff) {
++				send_packet_string(gip, "E00");
++				return;
++			}
++			if (set[6] == '-') {
++				if (type == 2 || type == 4)
++					machine_remove_hwatch_phys(gip->machine, 0, (uint32_t)A, (uint32_t)(A + len - 1));
++				if (type == 3 || type == 4)
++					machine_remove_hwatch_phys(gip->machine, 1, (uint32_t)A, (uint32_t)(A + len - 1));
++			} else {
++				if (type == 2 || type == 4)
++					machine_add_hwatch_phys(gip->machine, 0, (uint32_t)A, (uint32_t)(A + len - 1));
++				if (type == 3 || type == 4)
++					machine_add_hwatch_phys(gip->machine, 1, (uint32_t)A, (uint32_t)(A + len - 1));
++			}
++			send_packet_string(gip, "OK");
++			return;
++		}
+ 		if (0 == strcmp(set, "axis")) {
+ 			// Qxroar.axis:A,V -- set synthetic-joystick axis A (0=X, 1=Y)
+ 			// to raw value V (hex, 0..ffff, centre 8000). Drives
+diff --git a/src/machine.c b/src/machine.c
+index 99eb9c0..7e20aa1 100644
+--- a/src/machine.c
++++ b/src/machine.c
+@@ -512,4 +512,24 @@ void machine_add_hwatch(struct machine *m, bool RnW, uint32_t Astart, uint32_t A
+ void machine_remove_hwatch(struct machine *m, int RnW, int32_t Astart, uint32_t Aend) {
+ 	machine_remove_watchpoint(m, RnW, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
+ }
++
++void machine_add_hbreak_phys(struct machine *m, uint32_t Astart, uint32_t Aend) {
++	if (m->debug.add_pbreak)
++		m->debug.add_pbreak(m, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
++}
++
++void machine_remove_hbreak_phys(struct machine *m, uint32_t Astart, uint32_t Aend) {
++	if (m->debug.remove_pbreak)
++		m->debug.remove_pbreak(m, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
++}
++
++void machine_add_hwatch_phys(struct machine *m, bool RnW, uint32_t Astart, uint32_t Aend) {
++	if (m->debug.add_pwatchpoint)
++		m->debug.add_pwatchpoint(m, RnW, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
++}
++
++void machine_remove_hwatch_phys(struct machine *m, int RnW, uint32_t Astart, uint32_t Aend) {
++	if (m->debug.remove_pwatchpoint)
++		m->debug.remove_pwatchpoint(m, RnW, Astart, Aend, DELEGATE_AS3(void, bool, uint32, uint8, machine_trap_whandler, m));
++}
+ #endif
+diff --git a/src/machine.h b/src/machine.h
+index 9bab82c..5cac70b 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -250,6 +250,12 @@ struct machine {
+ 					  int32_t Astart, uint32_t Aend,
+ 					  DELEGATE_T3(void, bool, uint32, uint8) handler);
+ 
++		// Physical instruction-fetch breakpoint ranges (pbreak).
++		void (*add_pbreak)(struct machine *, uint32_t Astart, uint32_t Aend,
++				   DELEGATE_T3(void, bool, uint32, uint8) handler);
++		void (*remove_pbreak)(struct machine *, uint32_t Astart, uint32_t Aend,
++				      DELEGATE_T3(void, bool, uint32, uint8) handler);
++
+ 		// Physical watchpoints: matched against the flat physical
+ 		// address the machine's own decode produced for the cycle (GIME
+ 		// Z on the CoCo 3), so they see a byte wherever it is banked.
+@@ -321,6 +327,14 @@ void machine_remove_hbreak(struct machine *m, int32_t A);
+ #ifdef WANT_GDB_TARGET
+ void machine_add_hwatch(struct machine *m, bool RnW, uint32_t Astart, uint32_t Aend);
+ void machine_remove_hwatch(struct machine *m, int RnW, int32_t Astart, uint32_t Aend);
++
++// Physical-address flavours, for the gdb Qxroar.pbreak/pwatch verbs: ranges
++// matched against the machine's own decode (GIME Z on the CoCo 3), so a
++// breakpoint or watch fires wherever the code or byte is banked.
++void machine_add_hbreak_phys(struct machine *m, uint32_t Astart, uint32_t Aend);
++void machine_remove_hbreak_phys(struct machine *m, uint32_t Astart, uint32_t Aend);
++void machine_add_hwatch_phys(struct machine *m, bool RnW, uint32_t Astart, uint32_t Aend);
++void machine_remove_hwatch_phys(struct machine *m, int RnW, uint32_t Astart, uint32_t Aend);
+ #define machine_remove_hwatch_all(m) machine_remove_hwatch((m), -1, -1, 0)
+ #endif
+ 
+diff --git a/src/mc10.c b/src/mc10.c
+index b9d3ae9..2485bf5 100644
+--- a/src/mc10.c
++++ b/src/mc10.c
+@@ -58,6 +58,14 @@
+ #include "vo.h"
+ #include "xroar.h"
+ 
++struct mc10;
++static void mc10_add_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++			     DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void mc10_remove_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++				DELEGATE_T3(void, bool, uint32, uint8) handler);
++static void mc10_instruction_hook(void *sptr, uint32_t A);
++static void mc10_instruction_hook_update(struct mc10 *mp);
++
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ struct mc10 {
+@@ -93,6 +101,7 @@ struct mc10 {
+ 	struct bp_breakpoint_set breakpoint_set;
+ 	struct bp_watchpoint_set watchpoint_set;
+ 	struct bp_watchpoint_set pwatchpoint_set;  // physical == CPU address here
++	struct bp_watchpoint_set pbreak_set;       // physical fetch-range breakpoints (list[0])
+ 
+ 	struct tape_interface *tape_interface;
+ 	DELEGATE_T1(void, float) tape_update_audio;
+@@ -208,16 +217,14 @@ static void mc10_add_instruction_hook(struct machine *m,
+ 				 DELEGATE_T1(void, uint32) handler) {
+ 	struct mc10 *mp = (struct mc10 *)m;
+ 	bp_instr_hook_add(&mp->breakpoint_set, handler);
+-	mp->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mp->breakpoint_set);
++	mc10_instruction_hook_update(mp);
+ }
+ 
+ static void mc10_remove_instruction_hook(struct machine *m,
+ 				    DELEGATE_T1(void, uint32) handler) {
+ 	struct mc10 *mp = (struct mc10 *)m;
+ 	bp_instr_hook_remove(&mp->breakpoint_set, handler);
+-	if (!bp_breakpoint_set_active(&mp->breakpoint_set)) {
+-		mp->CPU->instruction_hook.func = NULL;
+-	}
++	mc10_instruction_hook_update(mp);
+ }
+ 
+ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
+@@ -233,6 +240,7 @@ static void mc10_add_pwatchpoint(struct machine *m, bool RnW,
+ static void mc10_remove_pwatchpoint(struct machine *m, int RnW,
+ 				    int32_t Astart, uint32_t Aend,
+ 				    DELEGATE_T3(void, bool, uint32, uint8) handler);
++
+ static void mc10_remove_watchpoint(struct machine *m, int RnW,
+ 				   int32_t Astart, uint32_t Aend,
+ 				   DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -307,6 +315,8 @@ static struct part *mc10_allocate(void) {
+ 	m->debug.remove_instruction_hook = mc10_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = mc10_remove_breakpoint;
+ 	m->debug.add_watchpoint = mc10_add_watchpoint;
++	m->debug.add_pbreak = mc10_add_pbreak;
++	m->debug.remove_pbreak = mc10_remove_pbreak;
+ 	m->debug.add_pwatchpoint = mc10_add_pwatchpoint;
+ 	m->debug.remove_pwatchpoint = mc10_remove_pwatchpoint;
+ 	m->debug.remove_watchpoint = mc10_remove_watchpoint;
+@@ -915,16 +925,46 @@ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
+ 	if (!bp_breakpoint_add(&mp->breakpoint_set, A, handler)) {
+ 		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
+ 	}
+-	if (bp_breakpoint_set_active(&mp->breakpoint_set)) {
+-		mp->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mp->breakpoint_set);
+-	}
++	mc10_instruction_hook_update(mp);
+ }
+ 
+ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+ 				    DELEGATE_T2(void, bool, uint32) handler) {
+ 	struct mc10 *mp = (struct mc10 *)m;
+ 	bp_breakpoint_remove(&mp->breakpoint_set, A, handler);
+-	if (!bp_breakpoint_set_active(&mp->breakpoint_set)) {
++	mc10_instruction_hook_update(mp);
++}
++
++static void mc10_add_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++			     DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct mc10 *mp = (struct mc10 *)m;
++	bp_watchpoint_add(&mp->pbreak_set, 0, Astart, Aend, handler);
++	mc10_instruction_hook_update(mp);
++}
++
++static void mc10_remove_pbreak(struct machine *m, uint32_t Astart, uint32_t Aend,
++				DELEGATE_T3(void, bool, uint32, uint8) handler) {
++	struct mc10 *mp = (struct mc10 *)m;
++	bp_watchpoint_remove(&mp->pbreak_set, 0, Astart, Aend, handler);
++	mc10_instruction_hook_update(mp);
++}
++
++// Instruction hook wrapper: logical dispatch always; physical fetch-range
++// dispatch (one translation) only while pbreak ranges exist.
++static void mc10_instruction_hook(void *sptr, uint32_t A) {
++	struct mc10 *mp = sptr;
++	bp_instruction_hook(&mp->breakpoint_set, A);
++	if (mp->pbreak_set.list[0]) {
++		uint32_t phys = A;
++		bp_check_watchpoints(&mp->pbreak_set, 0, phys, 0);
++	}
++}
++
++// One decision over everything that needs the CPU fetch hook.
++static void mc10_instruction_hook_update(struct mc10 *mp) {
++	if (bp_breakpoint_set_active(&mp->breakpoint_set) || mp->pbreak_set.list[0]) {
++		mp->CPU->instruction_hook = DELEGATE_AS1(void, uint32, mc10_instruction_hook, mp);
++	} else {
+ 		mp->CPU->instruction_hook.func = NULL;
+ 	}
+ }
+diff --git a/src/xroar.c b/src/xroar.c
+index f41ccbf..dbe0d77 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -4493,15 +4493,17 @@ static void set_trap(const char *cond) {
+ 		cur_trap_def->trace = -1;
+ 		cur_trap_def->no_trace = -1;
+ 		cur_trap_def->match_value = -1;
+-		// -1 is "no physical filter" for the xpcrange= bounds, which xpc=
+-		// now shares.  0 is a valid physical address, so this cannot ride
+-		// the struct's {0} zero-init, and it must be set HERE at struct
+-		// creation rather than in enable_trap(): cycle=/seconds= traps
+-		// return out of enable_trap before reaching the condition block,
+-		// so their bounds would stay 0 and the gate would demand a PC that
+-		// maps to physical zero -- a trap whose action silently never
+-		// fires.  That was a real bug in the xpc= that this replaced,
+-		// found by bisecting a plain `seconds=5` run with no xpc= in it.
++		// -1 is "no physical filter" for the xpcrange= bounds.  0 is a
++		// valid physical address, so this cannot ride the struct's {0}
++		// zero-init, and it must be set HERE at struct creation rather
++		// than in enable_trap(): cycle=/seconds= traps return out of
++		// enable_trap before reaching the condition block, so their bounds
++		// would stay 0 and a gate would demand a PC that maps to physical
++		// zero -- a trap whose action silently never fires.  That was a
++		// real bug in an early xpc=, found by bisecting a plain
++		// `seconds=5` run with no xpc= in it.  xpc= no longer uses these
++		// bounds (it is a breakpoint on the physical instruction list),
++		// but xpcrange= does, and the hazard is the same shape.
+ 		cur_trap_def->xpcr_lo = -1;
+ 		cur_trap_def->xpcr_hi = -1;
+ 	}

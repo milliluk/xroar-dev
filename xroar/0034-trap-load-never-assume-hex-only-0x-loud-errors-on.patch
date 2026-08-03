@@ -1,0 +1,173 @@
+From 2db9e72e6ed1d1ac1f6338ac2bc0dd74d2dc1e97 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:37 -0400
+Subject: [PATCH 34/44] trap/load: never assume hex; only 0x, loud errors on
+
+---
+ doc/xroar.texi |   7 +++-
+ src/xroar.c    | 101 ++++++++++++++++++++++++++++++++-----------------
+ 2 files changed, 72 insertions(+), 36 deletions(-)
+
+diff --git a/doc/xroar.texi b/doc/xroar.texi
+index 1e6442d..6ec3a1b 100644
+--- a/doc/xroar.texi
++++ b/doc/xroar.texi
+@@ -2264,7 +2264,12 @@ SAM, PIA or GIME state.
+ @tab Equivalent to @option{-verbose 0}.
+ 
+ @item @option{-trap @var{condition}}
+-@tab Configure a trap to fire on @var{condition}.
++@tab Configure a trap to fire on @var{condition}.  Addresses in a condition
++(@samp{pc=}, @samp{xpc=}, @samp{write=}, @samp{read=}, @samp{access=}) are
++decimal by default; prefix with @samp{0x} for hex.  For a @samp{0x}-prefixed
++value, digit count decides address space: 1--4 digits is a 16-bit logical
++address, 5--6 digits is physical.  A plain decimal number is classified by
++magnitude instead (@math{<=65535} logical, else physical).
+ @item @ @ @ @option{-trap-range @var{m}[-@var{n}]}
+ @tab Perform trap's actions only on @var{m}th-@var{n}th trigger.
+ @item @ @ @ @option{-trap-snap @var{file}}
+diff --git a/src/xroar.c b/src/xroar.c
+index 068908a..557a25b 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -3033,11 +3033,30 @@ static void add_load(const char *arg) {
+ 	}
+ }
+ 
+-// Parse a single unsigned number: "0x" for hex (via base 0) or decimal.
++// Parse a single unsigned number: "0x" prefix for hex, otherwise decimal.
++// Bare digits are NEVER treated as hex, even if they look hex-ish (e.g.
++// "ff66" without a prefix is not a number at all here, not decimal 0xff66
++// and not silently 0 -- it's an error). Base is always explicit (10 or 16):
++// strtoul's base-0 auto-detect would also treat a leading "0" as octal,
++// which is exactly the kind of silent wrong-base surprise this avoids.
+ static unsigned long parse_num_ul(const char *s) {
+-	if (!s || !*s)
+-		return 0;
+-	return strtoul(s, NULL, 0);
++	if (!s || !*s) {
++		fprintf(stderr, "xroar: expected a number, got nothing\n");
++		exit(EXIT_FAILURE);
++	}
++	int base = 10;
++	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
++		s += 2;
++		base = 16;
++	}
++	char *end;
++	unsigned long v = strtoul(s, &end, base);
++	if (end == s || *end != 0) {
++		fprintf(stderr, "xroar: '%s' is not a valid number "
++		        "(0x prefix for hex, otherwise decimal)\n", s);
++		exit(EXIT_FAILURE);
++	}
++	return v;
+ }
+ 
+ // Shared loader for -load-ram and -trap-load.
+@@ -3432,34 +3451,42 @@ static void handle_seconds_trigger(void *sptr) {
+ 	event_queue(&trg->event);
+ }
+ 
+-// Address-space classification by digit count, applied uniformly to every
+-// address a trap condition takes: 1-4 hex digits is a 16-bit LOGICAL address,
+-// 5-6 digits is PHYSICAL (leading zeros meaningful: 0x08000 is physical, low
+-// 512K; 0x8000 is logical).  Decimal gets the same rule by magnitude as a
+-// fallback, but hex is the documented form.  Returns 0 logical, 1 physical,
+-// -1 unclassifiable.  A range must not mix spaces; the caller errors on that.
++// Address-space classification, applied uniformly to every address a trap
++// condition takes. Bare digits are ALWAYS decimal, never hex -- "ff66" is
++// not a number here, it's an error; hex needs an explicit 0x prefix. For a
++// 0x-prefixed value, digit count decides: 1-4 hex digits is a 16-bit LOGICAL
++// address, 5-6 digits is PHYSICAL (leading zeros meaningful: 0x08000 is
++// physical, low 512K; 0x8000 is logical). A bare decimal number is
++// classified by magnitude instead (<=65535 logical, else physical), since
++// digit count means nothing in base 10. Returns 0 logical, 1 physical, -1
++// only for an absent token (e.g. the missing side of a M- range); anything
++// present but unparseable exits loudly instead of returning -1. A range must
++// not mix spaces; the caller errors on that.
+ static int trap_addr_space(const char *tok) {
+ 	if (!tok || !*tok)
+ 		return -1;
+-	if (tok[0] == '$') {
+-		tok++;
+-	} else if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
++	if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+ 		tok += 2;
+-	} else {
+-		// Decimal (or garbage; parse_range_ul will decide): classify by
+-		// magnitude so plain numbers keep working.
+-		char *end;
+-		unsigned long v = strtoul(tok, &end, 10);
+-		if (end == tok)
+-			return -1;
+-		return (v > 0xffff) ? 1 : 0;
+-	}
+-	int n = 0;
+-	while (isxdigit((unsigned char)tok[n]))
+-		n++;
+-	if (n < 1 || n > 6)
+-		return -1;
+-	return (n >= 5) ? 1 : 0;
++		int n = 0;
++		while (isxdigit((unsigned char)tok[n]))
++			n++;
++		if (n < 1 || n > 6 || tok[n] != 0) {
++			fprintf(stderr, "xroar: -trap: '%s' is not a valid 0x address "
++			        "(1-4 hex digits = logical, 5-6 = physical)\n", tok - 2);
++			exit(EXIT_FAILURE);
++		}
++		return (n >= 5) ? 1 : 0;
++	}
++	// No 0x prefix: always decimal, never hex. Classify by magnitude so
++	// plain numbers keep working as addresses.
++	char *end;
++	unsigned long v = strtoul(tok, &end, 10);
++	if (end == tok || *end != 0) {
++		fprintf(stderr, "xroar: -trap: '%s' is not a valid decimal number "
++		        "(prefix with 0x for hex)\n", tok);
++		exit(EXIT_FAILURE);
++	}
++	return (v > 0xffff) ? 1 : 0;
+ }
+ 
+ // Classify a condition's value: a single address or LO-HI range.  Both sides
+@@ -3476,8 +3503,9 @@ static int trap_addr_space_range(const char *cond, const char *val) {
+ 	int b = trap_addr_space(dash + 1);
+ 	free(lo);
+ 	if (a >= 0 && b >= 0 && a != b) {
+-		fprintf(stderr, "xroar: -trap %s: range mixes logical (1-4 hex digits) "
+-		        "and physical (5-6 digits) addresses\n", cond);
++		fprintf(stderr, "xroar: -trap %s: range mixes logical (0x + 1-4 digits, "
++		        "or decimal <=65535) and physical (0x + 5-6 digits, or "
++		        "decimal >65535) addresses\n", cond);
+ 		exit(EXIT_FAILURE);
+ 	}
+ 	return (a >= 0) ? a : b;
+@@ -3592,9 +3620,10 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 		unsigned long a = -1UL, b = -1UL;
+ 		parse_range_ul(val, &a, &b);
+ 
+-		// One address grammar for every condition: 1-4 hex digits is
+-		// logical, 5-6 is physical.  pc= with a physical address is
+-		// exactly the xpc= machinery, so reroute rather than duplicate.
++		// One address grammar for every condition: decimal by default,
++		// 0x prefix for hex; 0x + 1-4 digits is logical, 0x + 5-6 is
++		// physical.  pc= with a physical address is exactly the xpc=
++		// machinery, so reroute rather than duplicate.
+ 		int addr_phys = trap_addr_space_range(trap->cond, val);
+ 		if (addr_phys == 1 && 0 == c_strcasecmp(key, "pc")) {
+ 			key = "xpc";
+@@ -4935,8 +4964,10 @@ static void helptext(void) {
+ "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
+ "  -q, -quiet            equivalent to -verbose 0\n"
+ #ifdef WANT_TRAPS
+-"  -trap CONDITION       configure trap (write=A may add ,value=V; 1-4 hex\n"
+-"                          digits = logical address, 5-6 = physical)\n"
++"  -trap CONDITION       configure trap (write=A may add ,value=V; decimal by\n"
++"                          default, 0x prefix for hex; 0x + 1-4 digits =\n"
++"                          logical address, 0x + 5-6 digits = physical;\n"
++"                          plain decimal is classified by magnitude)\n"
+ "  -trap-byte FILE       append the byte satisfying a read=/write= trap to FILE\n"
+ "  -trap-history N       ring of last N executed physical PCs; dump on any trap\n"
+ "  -profile-range NAME=LO-HI  count fetches and cycles in a physical range\n"

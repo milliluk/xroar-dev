@@ -1,0 +1,164 @@
+From a3ae12f11b064e5491014448a7166abc225419ac Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:14 -0400
+Subject: [PATCH 03/44] windows: allow a true headless build without SDL
+
+MinGW previously selected the native windows32 UI solely from the host OS. Even --without-sdl3 still compiled that UI, so Windows automation had to ship SDL3 and a GUI-subsystem executable despite selecting the null UI at runtime.
+
+Add --disable-windows32-ui and separate the OS-level WINDOWS32 definition from WINDOWS32_UI. The disabled build omits dialogs, resources, host keyboard hooks and GUI startup/shutdown, skips SDL discovery, and links as a console program with only the Windows libraries used by the portable core.
+---
+ configure.ac    | 13 ++++++++++++-
+ src/Makefile.am |  4 ++++
+ src/hkbd.c      |  4 ++--
+ src/ui.c        |  4 ++--
+ src/xroar.c     | 12 ++++++------
+ 5 files changed, 26 insertions(+), 11 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index a591be7..b174bdb 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -117,6 +117,9 @@ AC_ARG_WITH([opengl],
+ AC_ARG_ENABLE([ui_sdl],
+ 	AS_HELP_STRING([--enable-ui-sdl], [force inclusion of basic SDL UI]) )
+ 
++AC_ARG_ENABLE([windows32_ui],
++	AS_HELP_STRING([--disable-windows32-ui], [don't build the native Windows UI]) )
++
+ AC_ARG_WITH([cocoa],
+ 	AS_HELP_STRING([--without-cocoa], [don't test for Mac OS X Cocoa]) )
+ test "x$with_sdl2" = "xno" && with_cocoa=no
+@@ -305,9 +308,17 @@ AM_COND_IF([MINGW], [
+ 		test "x$enable_ui_sdl" != "xyes" && enable_ui_sdl=no
+ 		AC_DEFINE([WINDOWS32], 1, [Windows])
+ 		MINGW_CFLAGS="-D__USE_MINGW_ANSI_STDIO=1"
+-		MINGW_LIBS="-lmingw32 -lwinmm -mwindows -lws2_32 -lcomctl32 -lole32 -luuid"
++		MINGW_LIBS="-lwinmm -lws2_32 -lole32 -luuid"
++		AS_IF([test "x$enable_windows32_ui" != "xno"], [
++			AC_DEFINE([WINDOWS32_UI], 1, [Native Windows user interface])
++			MINGW_LIBS="-lmingw32 -mwindows $MINGW_LIBS -lcomctl32"
++		], [
++			with_sdl3=no
++			with_sdl2=no
++		])
+ 		test -z "$with_opengl" && with_opengl=no
+ 		])
++AM_CONDITIONAL([WINDOWS32_UI], [test -n "$have_mingw" && test "x$enable_windows32_ui" != "xno"])
+ AC_SUBST(MINGW_CFLAGS)
+ AC_SUBST(MINGW_LIBS)
+ 
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 094044e..6209409 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -519,6 +519,10 @@ endif
+ if MINGW
+ xroar_CFLAGS += $(MINGW_CFLAGS)
+ xroar_LDADD += $(MINGW_LIBS)
++endif
++
++# Native Windows user interface
++if WINDOWS32_UI
+ xroar_SOURCES += \
+ 	windows32/about.c \
+ 	windows32/common_windows32.c windows32/common_windows32.h \
+diff --git a/src/hkbd.c b/src/hkbd.c
+index 910abf1..2de4b23 100644
+--- a/src/hkbd.c
++++ b/src/hkbd.c
+@@ -50,7 +50,7 @@
+ #include "x11/hkbd_x11.h"
+ #endif
+ 
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ #include "windows32/hkbd_windows.h"
+ #endif
+ 
+@@ -1155,7 +1155,7 @@ void hk_update_keymap(void) {
+ 	bool have_keymap = 0;
+ #if defined(HAVE_X11)
+ 	have_keymap = have_keymap || hk_x11_update_keymap();
+-#elif defined(WINDOWS32)
++#elif defined(WINDOWS32_UI)
+ 	have_keymap = have_keymap || hk_windows_update_keymap();
+ #elif defined(HAVE_COCOA)
+ 	have_keymap = have_keymap || hk_darwin_update_keymap();
+diff --git a/src/ui.c b/src/ui.c
+index b41261d..f9ccd2a 100644
+--- a/src/ui.c
++++ b/src/ui.c
+@@ -45,7 +45,7 @@ struct module * const default_filereq_module_list[] = {
+ #ifdef HAVE_COCOA
+ 	&filereq_cocoa_module,
+ #endif
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 	&filereq_windows32_module,
+ #endif
+ #ifdef HAVE_GTK3
+@@ -82,7 +82,7 @@ static struct ui_module * const default_ui_module_list[] = {
+ 	&ui_gtk2_module,
+ #endif
+ #endif
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 	&ui_windows32_module,
+ #endif
+ #ifdef HAVE_WASM
+diff --git a/src/xroar.c b/src/xroar.c
+index be51f94..4921be9 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -85,7 +85,7 @@
+ #include "xconfig.h"
+ #include "xroar.h"
+ 
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ #include "windows32/common_windows32.h"
+ #endif
+ 
+@@ -882,7 +882,7 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 	char *conffile = NULL;
+ 	bool no_conffile = 0;
+ 	bool no_builtin = 0;
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 	int alloc_console = -1;
+ #endif
+ 
+@@ -913,13 +913,13 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 			no_builtin = 1;
+ 			argn++;
+ 		} else if (argn < argc && 0 == strcmp(argv[argn], "-C")) {
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 			// Windows allocate console option
+ 			alloc_console = 1;
+ #endif
+ 			argn++;
+ 		} else if (argn < argc && 0 == strcmp(argv[argn], "-no-C")) {
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 			// Windows allocate console option
+ 			alloc_console = 0;
+ #endif
+@@ -929,7 +929,7 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 		}
+ 	}
+ 
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 	windows32_init(alloc_console);
+ #endif
+ 
+@@ -1506,7 +1506,7 @@ void xroar_shutdown(void) {
+ 	if (xroar.ui_interface) {
+ 		DELEGATE_SAFE_CALL(xroar.ui_interface->free);
+ 	}
+-#ifdef WINDOWS32
++#ifdef WINDOWS32_UI
+ 	windows32_shutdown();
+ #endif
+ }

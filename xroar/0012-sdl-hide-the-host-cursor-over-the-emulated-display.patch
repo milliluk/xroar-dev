@@ -1,0 +1,65 @@
+From e145e598a2093e4801e997771f8736bb0e40f60e Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:49 -0400
+Subject: [PATCH 12/44] sdl: hide the host cursor over the emulated display
+
+---
+ src/sdl2/common.c | 11 ++++++++++-
+ src/vo.h          |  1 +
+ src/xroar.c       |  2 ++
+ 3 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/sdl2/common.c b/src/sdl2/common.c
+index dd62b0c..4f30b63 100644
+--- a/src/sdl2/common.c
++++ b/src/sdl2/common.c
+@@ -134,7 +134,16 @@ void run_sdl_event_loop(struct ui_sdl2_interface *uisdl2) {
+ 			break;
+ 
+ 		case SDL_MOUSEMOTION:
+-			if (uisdl2->mouse_hidden) {
++			// -hide-cursor: keep the host pointer hidden while it is over
++			// the emulator video area.  SDL_ShowCursor only governs the SDL
++			// client area, so the native (non-client) menu bar and window
++			// chrome still show the system cursor.
++			if (uisdl2->cfg->vo_cfg.hide_cursor) {
++				if (!uisdl2->mouse_hidden) {
++					SDL_ShowCursor(SDL_DISABLE);
++					uisdl2->mouse_hidden = 1;
++				}
++			} else if (uisdl2->mouse_hidden) {
+ 				SDL_ShowCursor(SDL_ENABLE);
+ 				uisdl2->mouse_hidden = 0;
+ 			}
+diff --git a/src/vo.h b/src/vo.h
+index 4b702ed..6733695 100644
+--- a/src/vo.h
++++ b/src/vo.h
+@@ -90,6 +90,7 @@ extern struct xconfig_enum vo_gl_filter_list[];
+ struct vo_cfg {
+ 	char *geometry;
+ 	int pixel_fmt;
++	_Bool hide_cursor;  // hide host pointer over the emulator video area
+ };
+ 
+ // Window Area is the obvious top level.  Defined in host screen pixels, and
+diff --git a/src/xroar.c b/src/xroar.c
+index fc0565c..365f22a 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -3278,6 +3278,7 @@ static struct xconfig_option const xroar_options[] = {
+ 
+ 	/* Video: */
+ 	{ XC_SET_BOOL("fs", &private_cfg.vo.fullscreen) },
++	{ XC_SET_BOOL("hide-cursor", &xroar_ui_cfg.vo_cfg.hide_cursor) },
+ 	{ XC_SET_INT("fskip", &private_cfg.vo.frameskip) },
+ 	{ XC_SET_ENUM("ccr", &private_cfg.vo.ccr, vo_cmp_ccr_list) },
+ 	{ XC_SET_ENUM("gl-filter", &private_cfg.vo.gl_filter, vo_gl_filter_list) },
+@@ -3538,6 +3539,7 @@ static void helptext(void) {
+ 
+ " Video:\n"
+ "  -fs                   start emulator full-screen if possible\n"
++"  -hide-cursor          hide host pointer over the emulator area (visible over menus)\n"
+ "  -fskip FRAMES         frameskip (default: 0)\n"
+ "  -ccr RENDERER         cross-colour renderer (-ccr help for list)\n"
+ "  -gl-filter FILTER     OpenGL texture filter (-gl-filter help for list)\n"

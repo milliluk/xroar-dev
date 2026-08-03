@@ -1,0 +1,67 @@
+From 5c6b61cde46e3447e5fbeb78baa521478bf8ab04 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:37 -0400
+Subject: [PATCH 06/44] hd6309: fix cycle counts in 6309 native mode
+
+---
+ src/mc6809/hd6309.c | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
+index cbfa1e2..9bbb24e 100644
+--- a/src/mc6809/hd6309.c
++++ b/src/mc6809/hd6309.c
+@@ -641,7 +641,7 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 				continue;
+ 
+ 			// 0x12 NOP inherent
+-			case 0x12: peek_byte(cpu, REG_PC); break;
++			case 0x12: if (!NATIVE_MODE) peek_byte(cpu, REG_PC); break;
+ 
+ 			// 0x13 SYNC inherent
+ 			// TODO: "There appears to be a bug with SYNC in native
+@@ -694,7 +694,7 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 				// TODO: behaviour for illegal input differs on
+ 				// the 6309 [hoglet67]
+ 				REG_A = op_daa(cpu, REG_A);
+-				peek_byte(cpu, REG_PC);
++				if (!NATIVE_MODE) peek_byte(cpu, REG_PC);
+ 				break;
+ 
+ 			// 0x1a ORCC immediate
+@@ -702,7 +702,7 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 				unsigned data;
+ 				data = byte_immediate(cpu);
+ 				REG_CC |= data;
+-				peek_byte(cpu, REG_PC);
++				if (!NATIVE_MODE) peek_byte(cpu, REG_PC);
+ 			} break;
+ 
+ 			// 0x1c ANDCC immediate
+@@ -710,7 +710,7 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 				unsigned data;
+ 				data = byte_immediate(cpu);
+ 				REG_CC &= data;
+-				peek_byte(cpu, REG_PC);
++				if (!NATIVE_MODE) peek_byte(cpu, REG_PC);
+ 			} break;
+ 
+ 			// 0x1d SEX inherent
+@@ -955,7 +955,7 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 
+ 			// 0x39 RTS inherent
+ 			case 0x39:
+-				peek_byte(cpu, REG_PC);
++				if (!NATIVE_MODE) peek_byte(cpu, REG_PC);
+ 				REG_PC = pull_s_word(cpu);
+ 				NVMA_CYCLE;
+ 				break;
+@@ -963,7 +963,7 @@ static void hd6309_run(struct MC6809 *cpu) {
+ 			// 0x3a ABX inherent
+ 			case 0x3a:
+ 				REG_X += REG_B;
+-				peek_byte(cpu, REG_PC);
++				if (!NATIVE_MODE) peek_byte(cpu, REG_PC);
+ 				if (!NATIVE_MODE)
+ 					NVMA_CYCLE;
+ 				break;

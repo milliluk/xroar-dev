@@ -1,0 +1,231 @@
+name: build
+
+# Every build path this repo documents, on every push. The build scripts are
+# the CI: each one ends with build/acceptance.sh, so a green job means the five
+# capabilities are actually linked in, not merely that the compiler was happy.
+# See BUILD.md for the same recipes run by hand.
+
+# Docs do not change what gets built, and a README fix should not spend eight
+# jobs proving it. Nothing in paths-ignore is read by any build script.
+on:
+  push:
+    branches: [master, main]
+    # NOT .gitattributes: it is what stops core.autocrlf mangling the patch
+    # series on the Windows runner, so a change there can break a build.
+    paths-ignore: ['**.md', 'COPYING', 'LICENSE.MIT', '.gitignore']
+  pull_request:
+    # NOT .gitattributes: it is what stops core.autocrlf mangling the patch
+    # series on the Windows runner, so a change there can break a build.
+    paths-ignore: ['**.md', 'COPYING', 'LICENSE.MIT', '.gitignore']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Debian and Ubuntu package no SDL for the mingw host, so the cross-build
+  # takes SDL3 from libsdl.org. Keep this in step with the version quoted in
+  # build/build-windows.sh's MISSING message and in BUILD.md.
+  SDL3_VERSION: 3.4.12
+
+jobs:
+  # ---------------------------------------------------------------- linux ---
+  # Two configurations, two jobs, deliberately: both extract over xroar-1.12.1/
+  # and both write bin/xroar-dev, so they cannot share a checkout.
+  linux:
+    name: linux (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [headless, gui]
+    steps:
+      - uses: actions/checkout@v7
+
+      # libpng-dev is not probed by build-linux.sh but is load-bearing: without
+      # it configure drops screenshots quietly and acceptance.sh fails AFTER a
+      # completely successful compile. binutils is for `strings`, which is the
+      # whole of acceptance.sh.
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config \
+            texinfo libpng-dev zlib1g-dev binutils patch
+
+      - name: install SDL2
+        if: matrix.mode == 'gui'
+        run: sudo apt-get install -y --no-install-recommends libsdl2-dev
+
+      - name: build
+        run: bash build/build-linux.sh ${{ matrix.mode }}
+
+      # Needs the patched tree left behind by the build, so it runs here rather
+      # than in a job of its own.
+      - name: option audit
+        if: matrix.mode == 'headless'
+        run: bash build/audit-options.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xroar-dev-linux-${{ matrix.mode }}
+          path: bin/xroar-dev
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- macos ---
+  macos:
+    name: macos (${{ matrix.mode }})
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [headless, gui]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install build dependencies
+        run: |
+          for f in autoconf automake libtool pkgconf sdl2 libpng texinfo; do
+            brew list --formula "$f" >/dev/null 2>&1 || brew install "$f"
+          done
+
+      # Homebrew's texinfo is keg-only (provided_by_macos) so it is NOT linked
+      # into $(brew --prefix)/bin, and the runner image has no makeinfo of its
+      # own -- build-macos.sh would exit 2 with `MISSING: makeinfo`. The script
+      # only prepends to PATH, so this entry survives.
+      - name: put keg-only texinfo on PATH
+        run: echo "$(brew --prefix texinfo)/bin" >> "$GITHUB_PATH"
+
+      - name: build
+        run: bash build/build-macos.sh ${{ matrix.mode }}
+
+      - name: option audit
+        if: matrix.mode == 'headless'
+        run: bash build/audit-options.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xroar-dev-macos-${{ matrix.mode }}
+          path: bin/xroar-dev
+          if-no-files-found: error
+
+  # ------------------------------------------------------- windows (cross) ---
+  # THE GATE. This is the only build compiled with -Werror, and per
+  # build-windows.sh it is where a missing declaration shows up as a truncated
+  # pointer rather than as silence. The runner is pinned rather than -latest so
+  # that a new mingw gcc lands as a deliberate bump, not as a red master.
+  windows-cross:
+    name: windows (mingw cross, -Werror)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 autoconf automake libtool pkg-config \
+            texinfo binutils patch make
+
+      - name: cache SDL3 mingw sysroot
+        id: sdl3-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/mingw-sdl
+          key: sdl3-mingw-${{ env.SDL3_VERSION }}
+
+      # The one step in this whole repo that needs the network.
+      - name: fetch SDL3 development libraries
+        if: steps.sdl3-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          v="$SDL3_VERSION"
+          curl -fsSLO "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL3-devel-$v-mingw.tar.gz"
+          tar xzf "SDL3-devel-$v-mingw.tar.gz"
+          mkdir -p ~/mingw-sdl
+          cp -r "SDL3-$v/x86_64-w64-mingw32/"* ~/mingw-sdl/
+
+      - name: build
+        run: MINGWROOT="$HOME/mingw-sdl" bash build/build-windows.sh
+
+      # build-windows.sh copies the DLL through `[ -f ... ] && cp ...`, which is
+      # exempt from set -e: a missing SDL3.dll ships a .exe that cannot start,
+      # silently. Assert it here instead.
+      - name: SDL3.dll must be beside the exe
+        run: test -f bin/SDL3.dll
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xroar-dev-windows-cross
+          path: bin/
+          if-no-files-found: error
+
+  # ------------------------------------------------------ windows (native) ---
+  windows-native:
+    name: windows (msys2 native)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v7
+
+      # msystem: MINGW64 is what sets $MSYSTEM, which build-msys2.sh gates on --
+      # the MSYS toolchain would produce a binary needing msys-2.0.dll.
+      # sdl3 lower-case: pacman has no mingw-w64-x86_64-SDL3.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel autoconf automake libtool texinfo patch
+          pacboy: >-
+            toolchain:p sdl3:p libpng:p pkgconf:p libtre:p python:p
+
+      - name: build
+        run: bash build/build-msys2.sh
+
+      - name: option audit
+        run: bash build/audit-options.sh
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xroar-dev-windows-native
+          path: bin/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- lwasm ---
+  # No acceptance check exists for lwasm, so this is a compile gate plus a
+  # liveness check on the binary. Windows is left out: the script hardcodes the
+  # extensionless `lwasm` output name.
+  lwasm:
+    name: lwasm (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential patch
+
+      - name: build
+        run: bash build/build-lwasm.sh
+
+      - name: it runs
+        run: ./bin/lwasm --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lwasm-${{ matrix.os }}
+          path: bin/lwasm
+          if-no-files-found: error

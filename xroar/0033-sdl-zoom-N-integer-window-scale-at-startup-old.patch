@@ -1,0 +1,68 @@
+From 3969b17de1a1ef01d7fbcb0e52cac556530f6255 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:34 -0400
+Subject: [PATCH 33/44] sdl: -zoom N, integer window scale at startup (old
+
+---
+ src/sdl2/vo_sdl2.c | 9 +++++++++
+ src/xroar.c        | 7 +++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/src/sdl2/vo_sdl2.c b/src/sdl2/vo_sdl2.c
+index c44ff43..628471b 100644
+--- a/src/sdl2/vo_sdl2.c
++++ b/src/sdl2/vo_sdl2.c
+@@ -528,5 +528,14 @@ static void draw(void *sptr) {
+ 
+ static void resize(void *sptr, unsigned int w, unsigned int h) {
+ 	struct ui_sdl2_interface *uisdl2 = sptr;
++	struct vo_interface *vo = uisdl2->ui_interface.vo_interface;
++	struct vo_sdl_interface *vosdl = (struct vo_sdl_interface *)vo;
++	// Track the new size NOW rather than waiting for the SDL resize event.
++	// set_viewport()'s keep-the-multiple arithmetic reads window_area, and a
++	// machine setting its first viewport right after a startup -zoom resize
++	// read the pre-resize size, concluded the window was 1x the old viewport,
++	// and resized it straight back -- which made -zoom a no-op.
++	vosdl->window_area.w = w;
++	vosdl->window_area.h = h;
+ 	SDL_SetWindowSize(uisdl2->vo_window, w, h);
+ }
+diff --git a/src/xroar.c b/src/xroar.c
+index 0a45531..068908a 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -342,6 +342,7 @@ struct private_cfg {
+ 	// Video
+ 	struct {
+ 		bool fullscreen;
++		int zoom;  // -zoom N: initial window zoom level (0 = built-in default of 4)
+ 		int frameskip;
+ 		int ccr;
+ 		int gl_filter;
+@@ -1484,6 +1485,10 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 	ui_update_state(-1, ui_tag_vsync, private_cfg.vo.vsync, NULL);
+ 	ui_update_state(-1, ui_tag_picture, private_cfg.vo.picture, NULL);
+ 	ui_update_state(-1, ui_tag_fullscreen, private_cfg.vo.fullscreen, NULL);
++	// -zoom N sets the initial window scale (quarter-viewport tiles, same unit
++	// the Zoom In/Out/Reset UI uses; reset is 4). 0 leaves the built-in default.
++	if (private_cfg.vo.zoom > 0)
++		ui_update_state(-1, ui_tag_zoom, private_cfg.vo.zoom, NULL);
+ 	ui_update_state(-1, ui_tag_ntsc_scaling, private_cfg.vo.ntsc_scaling, NULL);
+ 	ui_update_state(-1, ui_tag_brightness, private_cfg.vo.brightness, NULL);
+ 	ui_update_state(-1, ui_tag_contrast, private_cfg.vo.contrast, NULL);
+@@ -4574,6 +4579,7 @@ static struct xconfig_option const xroar_options[] = {
+ 
+ 	/* Video: */
+ 	{ XC_SET_BOOL("fs", &private_cfg.vo.fullscreen) },
++	{ XC_SET_INT("zoom", &private_cfg.vo.zoom) },
+ 	{ XC_SET_BOOL("hide-cursor", &xroar_ui_cfg.vo_cfg.hide_cursor) },
+ 	{ XC_SET_INT("fskip", &private_cfg.vo.frameskip) },
+ 	{ XC_SET_ENUM("ccr", &private_cfg.vo.ccr, vo_cmp_ccr_list) },
+@@ -4874,6 +4880,7 @@ static void helptext(void) {
+ "  -fskip FRAMES         frameskip (default: 0)\n"
+ "  -ccr RENDERER         cross-colour renderer (-ccr help for list)\n"
+ "  -gl-filter FILTER     OpenGL texture filter (-gl-filter help for list)\n"
++"  -zoom N               initial window zoom level (default 4; unit = quarter viewport)\n"
+ "  -vo-vsync             start with vsync enabled\n"
+ "  -vo-pixel-fmt FMT     pixel format (-vo-pixel-fmt help for list)\n"
+ "  -geometry WxH+X+Y     initial emulator geometry\n"

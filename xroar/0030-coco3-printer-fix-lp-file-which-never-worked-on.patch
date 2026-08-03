@@ -1,0 +1,44 @@
+From 2154af072f1ef3c4df81f49f386d5db6aad1717f Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:27 -0400
+Subject: [PATCH 30/44] coco3, printer: fix -lp-file, which never worked on
+
+---
+ src/coco3.c   | 9 +++++++--
+ src/printer.c | 3 +++
+ 2 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/coco3.c b/src/coco3.c
+index 55d5952..c4d69ca 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -1984,8 +1984,13 @@ static void coco3_print_byte(void *sptr, bool RnW, uint32_t A) {
+ 	if (!mcc3->printer_interface) {
+ 		return;
+ 	}
+-	// Not ROM?
+-	if (tcc1014_decode(mcc3->GIME, mcc3->CPU->reg_pc) != 0) {
++	// CoCo 3 BASIC is copied to RAM at boot and runs there (ROM mode
++	// disabled), so a memory-map test can never identify it.  Instead,
++	// verify the code at PC is the expected routine: ORCC #$50 at $A2C1.
++	// Guards against unrelated user code running at this address.
++	struct machine *m = &mcc3->public;
++	if (m->read_byte(m, mcc3->CPU->reg_pc, 0) != 0x1a ||
++	    m->read_byte(m, mcc3->CPU->reg_pc + 1, 0) != 0x50) {
+ 		return;
+ 	}
+ 	int byte = MC6809_REG_A(mcc3->CPU);
+diff --git a/src/printer.c b/src/printer.c
+index f0f0fbd..6a0b938 100644
+--- a/src/printer.c
++++ b/src/printer.c
+@@ -201,6 +201,9 @@ void printer_strobe(struct printer_interface *pi, bool strobe, int data) {
+ 	// Print byte
+ 	if (pip->stream) {
+ 		fputc(data, pip->stream);
++		// Flush so file output survives abnormal exit and pipe
++		// consumers see data as it's printed.
++		fflush(pip->stream);
+ 		// Schedule UI notify
+ 		pip->chars_printed++;
+ 		if (!event_queued(&pip->update_chars_printed_event)) {

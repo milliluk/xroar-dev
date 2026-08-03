@@ -1,0 +1,195 @@
+From 483799855c72959a8eafd7fa27669e6b5996472a Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:07 -0400
+Subject: [PATCH 20/44] strict-load-checks: fail loudly on
+
+---
+ src/coco3.c |  9 +++++++++
+ src/xroar.c | 57 ++++++++++++++++++++++++++++++++++++-----------------
+ 2 files changed, 48 insertions(+), 18 deletions(-)
+
+diff --git a/src/coco3.c b/src/coco3.c
+index 88b88b7..bc58f06 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -588,6 +588,15 @@ static bool coco3_finish(struct part *p) {
+ 	rombank_report(mcc3->ROM0, "coco3", "Super Extended Colour BASIC");
+ 	mcc3->crc_secb = 0xb4c88d6c;  // Super Extended Colour BASIC (NTSC)
+ 	mcc3->has_secb = rombank_verify_crc(mcc3->ROM0, "Super Extended Colour BASIC", -1, "@coco3", xroar.cfg.force_crc_match, &mcc3->crc_secb);
++	if (!mcc3->has_secb) {
++		if (mcc3->ROM0->d[0]) {
++			fprintf(stderr, "xroar: Super Extended Colour BASIC ROM CRC invalid, exiting "
++					"(pass -force-crc-match to boot anyway)\n");
++		} else {
++			fprintf(stderr, "xroar: Super Extended Colour BASIC ROM not found (check -rompath), exiting\n");
++		}
++		exit(1);
++	}
+ 
+ 	// RAM configuration
+ 	ram_report(mcc3->RAM, "coco3", "motherboard RAM");
+diff --git a/src/xroar.c b/src/xroar.c
+index b2bf9f5..d918c6e 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -404,7 +404,7 @@ static void load_ram_apply(void);
+ enum load_format { LOAD_FMT_AUTO, LOAD_FMT_RAW, LOAD_FMT_DECB, LOAD_FMT_HEX, LOAD_FMT_SREC };
+ static unsigned long parse_num_ul(const char *s);
+ static int load_detect_format(const char *file);
+-static void load_blob(const char *spec);
++static _Bool load_blob(const char *spec);
+ static void add_run(const char *arg);
+ static void set_gain(double gain);
+ static void set_audio_record(const char *arg);
+@@ -1459,7 +1459,10 @@ void xroar_init_finish(void) {
+ 	if (private_cfg.file.snapshot) {
+ 		// If we're loading a snapshot, loading other media doesn't
+ 		// make sense (as it'll be overridden by the snapshot).
+-		read_snapshot(private_cfg.file.snapshot);
++		if (read_snapshot(private_cfg.file.snapshot) < 0) {
++			fprintf(stderr, "xroar: -load %s: failed, exiting\n", private_cfg.file.snapshot);
++			exit(1);
++		}
+ 	} else {
+ 		// Otherwise, attach any other media images.
+ 
+@@ -1468,6 +1471,11 @@ void xroar_init_finish(void) {
+ 			if (private_cfg.file.fd[i]) {
+ 				bool autorun = (autorun_media_slot == (media_slot_fd0 + i));
+ 				xroar_load_disk(private_cfg.file.fd[i], i, autorun);
++				if (!vdrive_disk_in_drive(xroar.vdrive_interface, i)) {
++					fprintf(stderr, "xroar: -load-fd%u %s: failed, exiting\n",
++						i, private_cfg.file.fd[i]);
++					exit(1);
++				}
+ 			}
+ 		}
+ 
+@@ -1554,7 +1562,10 @@ void xroar_init_finish(void) {
+ 
+ 	// Scripted pointer/keyboard timeline (joystick_script.c). Machine and any
+ 	// -load snapshot are live by now, so events schedule from the current tick.
+-	script_js_load(input_script_path);
++	if (input_script_path && script_js_load(input_script_path) < 0) {
++		fprintf(stderr, "xroar: -input-script %s: failed, exiting\n", input_script_path);
++		exit(1);
++	}
+ }
+ 
+ static void xroar_ui_set_config_autosave(void *sptr, int tag, void *smsg) {
+@@ -2976,16 +2987,16 @@ static int load_detect_format(const char *file) {
+ 	return LOAD_FMT_RAW;
+ }
+ 
+-static void load_blob(const char *spec) {
++static _Bool load_blob(const char *spec) {
+ 	if (!spec || !*spec || !xroar.machine)
+-		return;
++		return 0;
+ 	char *s = xstrdup(spec);
+ 	char *opts = s;
+ 	char *file = strsep(&opts, ",");
+ 	if (!file || !*file) {
+ 		LOG_MOD_WARN("load", "%s: no filename\n", spec);
+ 		free(s);
+-		return;
++		return 0;
+ 	}
+ 	int fmt = LOAD_FMT_AUTO;
+ 	int have_addr = 0;
+@@ -3027,7 +3038,7 @@ static void load_blob(const char *spec) {
+ 	}
+ 	if (bad) {
+ 		free(s);
+-		return;
++		return 0;
+ 	}
+ 
+ 	if (fmt == LOAD_FMT_AUTO)
+@@ -3037,20 +3048,20 @@ static void load_blob(const char *spec) {
+ 		if (!have_addr) {
+ 			LOG_MOD_WARN("load", "%s: raw load requires addr=\n", file);
+ 			free(s);
+-			return;
++			return 0;
+ 		}
+ 		struct ram *ram = (struct ram *)part_component_by_id_is_a(
+ 			(struct part *)xroar.machine, "RAM", "ram");
+ 		if (!ram) {
+ 			LOG_MOD_WARN("load", "machine has no RAM to load into\n");
+ 			free(s);
+-			return;
++			return 0;
+ 		}
+ 		FILE *f = fopen(file, "rb");
+ 		if (!f) {
+ 			LOG_MOD_WARN("load", "%s: cannot open\n", file);
+ 			free(s);
+-			return;
++			return 0;
+ 		}
+ 		fseek(f, 0, SEEK_END);
+ 		long sz = ftell(f);
+@@ -3059,7 +3070,7 @@ static void load_blob(const char *spec) {
+ 			fclose(f);
+ 			LOG_MOD_WARN("load", "%s: empty or unreadable\n", file);
+ 			free(s);
+-			return;
++			return 0;
+ 		}
+ 		size_t want = (size_t)sz;
+ 		if (maxlen && want > maxlen)
+@@ -3074,7 +3085,7 @@ static void load_blob(const char *spec) {
+ 			LOG_MOD_WARN("load", "%s: only %zu of %zu bytes loaded (ran off end of RAM)\n",
+ 				     file, n, got);
+ 		free(s);
+-		return;
++		return 1;
+ 	}
+ 
+ 	// Formatted loads carry their own addresses.
+@@ -3089,11 +3100,14 @@ static void load_blob(const char *spec) {
+ 	case LOAD_FMT_SREC: rc = motorola_s19_read(file, 0); fn = "srec"; break;
+ 	default: rc = -1; fn = "?"; break;
+ 	}
+-	if (rc >= 0)
++	if (rc >= 0) {
+ 		LOG_MOD_PRINT("load", "%s -> CPU memory (%s)\n", file, fn);
+-	else
+-		LOG_MOD_WARN("load", "%s: %s load failed\n", file, fn);
++		free(s);
++		return 1;
++	}
++	LOG_MOD_WARN("load", "%s: %s load failed\n", file, fn);
+ 	free(s);
++	return 0;
+ }
+ 
+ // -load-ram FILE[,opts] - queue a file to load into RAM after the machine (and
+@@ -3103,8 +3117,12 @@ static void add_load_ram(const char *arg) {
+ }
+ 
+ static void load_ram_apply(void) {
+-	for (struct slist *l = private_cfg.file.load_ram; l; l = l->next)
+-		load_blob((const char *)l->data);
++	for (struct slist *l = private_cfg.file.load_ram; l; l = l->next) {
++		if (!load_blob((const char *)l->data)) {
++			fprintf(stderr, "xroar: -load-ram %s: failed, exiting\n", (const char *)l->data);
++			exit(1);
++		}
++	}
+ }
+ 
+ // Add a file to load and mark its slot to autorun.
+@@ -3533,7 +3551,10 @@ static void handle_trap(void *sptr) {
+ 		xroar_master_cycles = 0;
+ 	}
+ 	if (trap->load_spec) {
+-		load_blob(trap->load_spec);
++		if (!load_blob(trap->load_spec)) {
++			fprintf(stderr, "xroar: -trap-load %s: failed, exiting\n", trap->load_spec);
++			exit(1);
++		}
+ 	}
+ 	// Timeout goes last.  xroar_set_timeout("0") is synchronous: it calls
+ 	// xroar_quit(), which is exit().  Any action ordered after it on the

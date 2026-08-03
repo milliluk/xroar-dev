@@ -1,0 +1,125 @@
+From 4f0e0a2ca5b10fe050768b4d4d200cb32524d4c4 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:42:12 -0400
+Subject: [PATCH 43/44] trap: history/profile on one stream, and surviving a 
+ machine
+
+---
+ src/xroar.c | 37 ++++++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index 55beaac..ac57dd3 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -216,6 +216,7 @@ static unsigned long *trap_history_ring = NULL;
+ static unsigned trap_history_pos = 0;
+ static unsigned long trap_history_seen = 0;
+ static bool trap_history_installed = 0;
++static struct machine *trap_history_machine = NULL;  // which machine the hook lives in
+ static void trap_history_record(void *, uint32_t A);
+ static void trap_history_dump(void);
+ static void trap_xpcrange_check(void *, uint32_t A);
+@@ -245,6 +246,7 @@ static char *profile_out_path = NULL;         // -profile-out FILE (default stde
+ static uint32_t *profile_hist_hits = NULL;    // [PROFILE_PADDR_SPAN] hits
+ static unsigned long long *profile_hist_cyc = NULL; // [PROFILE_PADDR_SPAN] cycles
+ static bool profile_installed = 0;
++static struct machine *profile_machine = NULL;       // which machine the hook lives in
+ static int profile_prev_range = -1;           // range inside on the last fetch
+ static long profile_prev_pc = -1;             // physical PC of the last fetch
+ static uint32_t profile_prev_tick = 0;        // event_current_tick at last fetch
+@@ -3867,22 +3869,32 @@ static void enable_all_traps(void) {
+ 	// once per machine connect.  Ring memory is allocated on first install
+ 	// and kept; contents survive a reconnect, which is what a flight
+ 	// recorder should do.
+-	if (trap_history_size > 0 && !trap_history_installed && xroar.machine) {
++	// Keyed on the machine pointer, not just the installed flag: a snapshot
++	// load rebuilds the machine, and the old flag left the recorder hooked
++	// into the DEAD machine's breakpoint set -- installed stayed 1, the new
++	// CPU's instruction hook never carried it, and every warm-resume
++	// -trap-history dump came out empty.  Same hazard and same cure as
++	// trap_fast_parts_refresh() above.
++	if (trap_history_size > 0 && xroar.machine &&
++	    (!trap_history_installed || trap_history_machine != xroar.machine)) {
+ 		if (!trap_history_ring)
+ 			trap_history_ring = xmalloc((size_t)trap_history_size * sizeof(*trap_history_ring));
+ 		machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
+ 		trap_history_installed = 1;
++		trap_history_machine = xroar.machine;
+ 	}
+ 	// -profile-range / -profile-hist: one more ambient any-address hook,
+ 	// installed once per machine connect.  Histogram tables are allocated
+ 	// here on first install and kept across a reconnect, like the ring.
+-	if (profile_active() && !profile_installed && xroar.machine) {
++	if (profile_active() && xroar.machine &&
++	    (!profile_installed || profile_machine != xroar.machine)) {
+ 		if (profile_hist_top > 0 && !profile_hist_hits) {
+ 			profile_hist_hits = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_hits));
+ 			profile_hist_cyc  = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_cyc));
+ 		}
+ 		machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, profile_record, NULL));
+ 		profile_installed = 1;
++		profile_machine = xroar.machine;
+ 	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+ 		enable_trap(&trap_defs[i], 1);
+@@ -4006,6 +4018,10 @@ static void trap_history_record(void *sptr, uint32_t A) {
+ // fetch is already recorded; write=/read= hooks fire mid-instruction, after
+ // the fetch that performed the access was recorded.  Read backwards from
+ // the end to walk the arrival path.
++// Diagnostic DATA goes to stdout, the stream instruction traces already
++// use: -trap-trace-n prints there and this dump used to print to stderr,
++// so a reader following one stream saw traps that "never fired".  One
++// stream now; stderr keeps warnings and errors only.
+ static void trap_history_dump(void) {
+ 	if (!trap_history_installed || !trap_history_seen)
+ 		return;
+@@ -4013,7 +4029,7 @@ static void trap_history_dump(void) {
+ 	             ? (unsigned)trap_history_seen : (unsigned)trap_history_size;
+ 	unsigned start = (trap_history_pos + (unsigned)trap_history_size - n)
+ 	                 % (unsigned)trap_history_size;
+-	fprintf(stderr, "trap-history: last %u physical PCs, oldest first:\n", n);
++	fprintf(stdout, "trap-history: last %u physical PCs, oldest first:\n", n);
+ 	if (symfile_loaded()) {
+ 		// With names, the ring is a call trace and belongs one per line;
+ 		// the packed hex columns below are what it has to be without
+@@ -4037,7 +4053,7 @@ static void trap_history_dump(void) {
+ 				snprintf(key, sizeof(key), "%.*s",
+ 				         (int)strcspn(where, "+ "), where);
+ 			_Bool same = where && prev[0] && 0 == strcmp(prev, key);
+-			fprintf(stderr, "trap-history: 0x%05lX  %s%s%s\n", v,
++			fprintf(stdout, "trap-history: 0x%05lX  %s%s%s\n", v,
+ 			        same ? "\"" : (where ? where : "-"),
+ 			        (src && !same) ? "  " : "", (src && !same) ? src : "");
+ 			memcpy(prev, key, sizeof(prev));
+@@ -4047,10 +4063,10 @@ static void trap_history_dump(void) {
+ 	for (unsigned i = 0; i < n; ++i) {
+ 		unsigned long v = trap_history_ring[(start + i) % (unsigned)trap_history_size];
+ 		if ((i % 8) == 0)
+-			fprintf(stderr, "trap-history:");
+-		fprintf(stderr, " 0x%05lX", v);
++			fprintf(stdout, "trap-history:");
++		fprintf(stdout, " 0x%05lX", v);
+ 		if ((i % 8) == 7 || i == n - 1)
+-			fprintf(stderr, "\n");
++			fprintf(stdout, "\n");
+ 	}
+ }
+ 
+@@ -4146,11 +4162,14 @@ static int profile_range_cmp(const void *a, const void *b) {
+ static void profile_dump(void) {
+ 	if (!profile_active())
+ 		return;
+-	FILE *f = stderr;
++	// stdout, same stream as instruction traces and trap-history: profile
++	// rows are diagnostic data, and splitting them onto stderr cost real
++	// debugging time.  -profile-out FILE still redirects.
++	FILE *f = stdout;
+ 	if (profile_out_path) {
+ 		FILE *o = fopen(profile_out_path, "w");
+ 		if (o) f = o;
+-		else LOG_MOD_WARN("profile", "-profile-out %s: %s; using stderr\n",
++		else LOG_MOD_WARN("profile", "-profile-out %s: %s; using stdout\n",
+ 		                  profile_out_path, strerror(errno));
+ 	}
+ 	fprintf(f, "profile: %llu instructions, %llu cycles total\n",

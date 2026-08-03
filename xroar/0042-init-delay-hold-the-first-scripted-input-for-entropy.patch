@@ -1,0 +1,2117 @@
+From 704f94ff0f653861bea0325676d151d992b6872e Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:42:09 -0400
+Subject: [PATCH 42/44] -init-delay: hold the first scripted input, for entropy
+
+---
+ src/audiorec.c        | 215 +++++++++++++++
+ src/audiorec.h        |  67 +++++
+ src/audit.c           | 270 +++++++++++++++++++
+ src/audit.h           | 106 ++++++++
+ src/auto_kbd.c        |  19 ++
+ src/joystick_script.c | 426 +++++++++++++++++++++++++++++
+ src/joystick_script.h |  31 +++
+ src/symfile.c         | 611 ++++++++++++++++++++++++++++++++++++++++++
+ src/symfile.h         | 108 ++++++++
+ src/xroar.c           |  67 +++++
+ src/xroar.h           |  40 +++
+ 11 files changed, 1960 insertions(+)
+ create mode 100644 src/audiorec.c
+ create mode 100644 src/audiorec.h
+ create mode 100644 src/audit.c
+ create mode 100644 src/audit.h
+ create mode 100644 src/joystick_script.c
+ create mode 100644 src/joystick_script.h
+ create mode 100644 src/symfile.c
+ create mode 100644 src/symfile.h
+
+diff --git a/src/audiorec.c b/src/audiorec.c
+new file mode 100644
+index 0000000..95261aa
+--- /dev/null
++++ b/src/audiorec.c
+@@ -0,0 +1,215 @@
++/** \file
++ *
++ *  \brief Debug audio capture for the headless rig.
++ *
++ *  \copyright Public domain, part of the xroar-dev headless test harness.
++ *
++ *  See audiorec.h for what mix / dac / 1bit mean. WAV output goes through the
++ *  bundled sndfile_compat writer (no libsndfile needed); raw output is written
++ *  directly with no header. All capture is mono at the sound output rate.
++ */
++
++#include "top-config.h"
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "audiorec.h"
++#include "logging.h"
++#include "sndfile_compat.h"
++
++// Staging buffer: floats accumulated per frame, flushed when full.
++#define AR_BUF_FRAMES (4096)
++
++int audiorec_active = 0;
++
++static struct {
++	int armed;
++	char *whole_run_path;              // -audio-record FILE, or NULL
++	enum audiorec_source source;
++	enum audiorec_fmt fmt;
++
++	// Open-file state.
++	int open;                          // file is open (may be paused)
++	SNDFILE *sf;                       // WAV path
++	FILE *raw;                         // raw path
++	int is_raw;
++	float buf[AR_BUF_FRAMES];
++	int nbuf;                          // frames staged
++} ar = {
++	.source = AUDIOREC_SRC_MIX,
++	.fmt = AUDIOREC_FMT_S16,
++};
++
++// --- option setters ----------------------------------------------------------
++
++void audiorec_arm(void) {
++	ar.armed = 1;
++}
++
++int audiorec_armed(void) {
++	return ar.armed;
++}
++
++int audiorec_set_whole_run_file(const char *path) {
++	free(ar.whole_run_path);
++	ar.whole_run_path = path ? strdup(path) : NULL;
++	ar.armed = 1;
++	return 0;
++}
++
++int audiorec_set_source(const char *name) {
++	if (!name) return -1;
++	if (!strcmp(name, "mix"))       ar.source = AUDIOREC_SRC_MIX;
++	else if (!strcmp(name, "dac"))  ar.source = AUDIOREC_SRC_DAC;
++	else if (!strcmp(name, "1bit")) ar.source = AUDIOREC_SRC_1BIT;
++	else {
++		LOG_MOD_ERROR("audiorec", "unknown source '%s' (want mix|dac|1bit)\n", name);
++		return -1;
++	}
++	ar.armed = 1;
++	return 0;
++}
++
++int audiorec_set_format(const char *name) {
++	if (!name) return -1;
++	if (!strcmp(name, "s16"))        ar.fmt = AUDIOREC_FMT_S16;
++	else if (!strcmp(name, "float")) ar.fmt = AUDIOREC_FMT_FLOAT;
++	else {
++		LOG_MOD_ERROR("audiorec", "unknown format '%s' (want s16|float)\n", name);
++		return -1;
++	}
++	ar.armed = 1;
++	return 0;
++}
++
++// --- helpers -----------------------------------------------------------------
++
++// Decide wav vs raw from the file extension. .raw/.pcm/.bin -> raw, anything
++// else -> wav. This is the only selector: name the file for what you want.
++static int resolve_is_raw(const char *path) {
++	const char *dot = strrchr(path, '.');
++	if (dot) {
++		if (!strcmp(dot, ".raw") || !strcmp(dot, ".pcm") || !strcmp(dot, ".bin"))
++			return 1;
++	}
++	return 0;
++}
++
++static void flush_buf(void) {
++	if (ar.nbuf <= 0) return;
++	if (ar.is_raw) {
++		if (ar.fmt == AUDIOREC_FMT_FLOAT) {
++			fwrite(ar.buf, sizeof(float), ar.nbuf, ar.raw);
++		} else {
++			int16_t out[AR_BUF_FRAMES];
++			for (int i = 0; i < ar.nbuf; i++) {
++				float v = ar.buf[i];
++				if (v > 1.0f) v = 1.0f;
++				if (v < -1.0f) v = -1.0f;
++				out[i] = (int16_t)(v * 32767.0f);
++			}
++			fwrite(out, sizeof(int16_t), ar.nbuf, ar.raw);
++		}
++	} else {
++		sf_writef_float(ar.sf, ar.buf, ar.nbuf);
++	}
++	ar.nbuf = 0;
++}
++
++// --- open / close ------------------------------------------------------------
++
++int audiorec_start(const char *path, int rate) {
++	if (!path) return -1;
++	if (ar.open) audiorec_stop();   // close any previous clip
++
++	ar.is_raw = resolve_is_raw(path);
++	ar.nbuf = 0;
++
++	if (ar.is_raw) {
++		ar.raw = fopen(path, "wb");
++		if (!ar.raw) {
++			LOG_MOD_ERROR("audiorec", "cannot open '%s' for raw write\n", path);
++			return -1;
++		}
++	} else {
++		SF_INFO info;
++		memset(&info, 0, sizeof(info));
++		info.samplerate = rate;
++		info.channels = 1;
++		info.format = SF_FORMAT_WAV |
++		    (ar.fmt == AUDIOREC_FMT_FLOAT ? SF_FORMAT_FLOAT : SF_FORMAT_PCM_16);
++		ar.sf = sf_open(path, SFM_WRITE, &info);
++		if (!ar.sf) {
++			LOG_MOD_ERROR("audiorec", "cannot open '%s' for wav write\n", path);
++			return -1;
++		}
++	}
++
++	ar.open = 1;
++	audiorec_active = 1;
++	LOG_MOD_DEBUG(1, "audiorec", "recording %s %s -> %s @ %dHz\n",
++	    ar.source == AUDIOREC_SRC_DAC ? "dac" :
++	    ar.source == AUDIOREC_SRC_1BIT ? "1bit" : "mix",
++	    ar.is_raw ? (ar.fmt == AUDIOREC_FMT_FLOAT ? "raw/float" : "raw/s16")
++	              : (ar.fmt == AUDIOREC_FMT_FLOAT ? "wav/float" : "wav/s16"),
++	    path, rate);
++	return 0;
++}
++
++int audiorec_start_whole_run(int rate) {
++	if (!ar.whole_run_path) return 0;
++	return audiorec_start(ar.whole_run_path, rate);
++}
++
++void audiorec_stop(void) {
++	if (!ar.open) return;
++	audiorec_active = 0;   // stop the tap before we tear the file down
++	flush_buf();
++	if (ar.is_raw) {
++		if (ar.raw) { fclose(ar.raw); ar.raw = NULL; }
++	} else {
++		if (ar.sf) { sf_close(ar.sf); ar.sf = NULL; }
++	}
++	ar.open = 0;
++	LOG_MOD_DEBUG(1, "audiorec", "recording stopped\n");
++}
++
++// Pause or resume without closing the file. This is how you splice several
++// disjoint windows into one clip: start once, toggle off at the end of a
++// window, toggle on at the start of the next. The paused samples are dropped,
++// not silenced, so the output concatenates the recorded windows with no gap.
++// A no-op if nothing is open, since there is no file to write to.
++void audiorec_toggle(void) {
++	if (!ar.open) {
++		LOG_MOD_DEBUG(1, "audiorec", "toggle ignored: nothing recording\n");
++		return;
++	}
++	audiorec_active = !audiorec_active;
++	LOG_MOD_DEBUG(1, "audiorec", "recording %s\n",
++	    audiorec_active ? "resumed" : "paused");
++}
++
++// --- per-frame tap -----------------------------------------------------------
++
++void audiorec_frame(float mix, float dac, int sbs_en, int sbs_lvl) {
++	if (!audiorec_active) return;
++	float v;
++	switch (ar.source) {
++	case AUDIOREC_SRC_DAC:
++		v = dac;
++		break;
++	case AUDIOREC_SRC_1BIT:
++		v = sbs_en ? (sbs_lvl ? 0.5f : -0.5f) : 0.0f;
++		break;
++	case AUDIOREC_SRC_MIX:
++	default:
++		v = mix;
++		break;
++	}
++	ar.buf[ar.nbuf++] = v;
++	if (ar.nbuf >= AR_BUF_FRAMES)
++		flush_buf();
++}
+diff --git a/src/audiorec.h b/src/audiorec.h
+new file mode 100644
+index 0000000..cb52a0e
+--- /dev/null
++++ b/src/audiorec.h
+@@ -0,0 +1,67 @@
++/** \file
++ *
++ *  \brief Debug audio capture for the headless rig.
++ *
++ *  \copyright Public domain, part of the xroar-dev headless test harness.
++ *
++ *  Records one of three signals to a WAV or raw file, mono, at the sound
++ *  interface's output rate:
++ *
++ *    mix   the final speaker output (post gain and external mix)
++ *    dac   the 6-bit DAC voltage the CPU is driving, normalised 0..1
++ *    1bit  the single-bit sound output as a centred square wave
++ *
++ *  dac and 1bit capture the LOGICAL signal each source drives, not its scaled
++ *  analog share of the summing bus. The single-bit source is a bias on the
++ *  bus in this mixer, not an independent waveform, so there is nothing to tee
++ *  for its analog contribution. What you get instead is the debuggable signal:
++ *  what the sound code put on the DAC, and when it toggled the 1-bit output.
++ */
++
++#ifndef XROAR_AUDIOREC_H_
++#define XROAR_AUDIOREC_H_
++
++enum audiorec_source {
++	AUDIOREC_SRC_MIX = 0,   // final speaker output (default)
++	AUDIOREC_SRC_DAC,       // 6-bit DAC level, 0..1
++	AUDIOREC_SRC_1BIT,      // single-bit sound as a square wave
++};
++
++enum audiorec_fmt {
++	AUDIOREC_FMT_S16 = 0,   // 16-bit signed (default)
++	AUDIOREC_FMT_FLOAT,     // 32-bit float
++};
++
++// Command-line option setters. Each returns 0 on success, -1 on a bad value.
++// Any of these arms capture, so ao_null knows to request a real sample format.
++int audiorec_set_whole_run_file(const char *path);   // -audio-record FILE
++int audiorec_set_source(const char *name);           // -audio-record-source
++int audiorec_set_format(const char *name);           // -audio-record-format
++void audiorec_arm(void);                             // arm without a whole-run file
++
++// True if any capture option was given. Read by ao_null before it picks a
++// format: an armed recorder needs the mix path to actually render samples.
++int audiorec_armed(void);
++
++// Fast gate for the per-frame tap in sound.c: nonzero while a file is open.
++extern int audiorec_active;
++
++// Whole-run: open the -audio-record file if one was set. rate is the sound
++// interface output rate. No-op (returns 0) if no whole-run file was given.
++int audiorec_start_whole_run(int rate);
++
++// Trap-driven start/stop. start opens path; stop flushes and closes.
++int audiorec_start(const char *path, int rate);
++void audiorec_stop(void);
++
++// Pause/resume the open file without closing it. Lets several disjoint
++// windows land in one clip (start once, then toggle off/on around gaps).
++void audiorec_toggle(void);
++
++// Per output frame, called from sound.c's mix loop. Selects the configured
++// source and buffers one sample. Cheap: does nothing unless audiorec_active.
++// mix is the channel-0 speaker sample; dac is the current DAC level (0..1);
++// sbs_en / sbs_lvl are the single-bit enable and level.
++void audiorec_frame(float mix, float dac, int sbs_en, int sbs_lvl);
++
++#endif
+diff --git a/src/audit.c b/src/audit.c
+new file mode 100644
+index 0000000..d486373
+--- /dev/null
++++ b/src/audit.c
+@@ -0,0 +1,270 @@
++/** \file
++ *
++ *  \brief Physical-address access audit map.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ */
++
++#include "top-config.h"
++
++// For strsep()
++#define _DEFAULT_SOURCE
++#define _BSD_SOURCE
++#define _DARWIN_C_SOURCE
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "pl-string.h"
++#include "xalloc.h"
++
++#include "audit.h"
++#include "logging.h"
++
++uint8_t *audit_map = NULL;
++extern inline void audit_mark(unsigned phys, uint8_t bits);
++
++// The allocation, which outlives any pause.  audit_map is this pointer while
++// recording and NULL while not, so the per-cycle hook is one test.
++static uint8_t *audit_base = NULL;
++static char *audit_path = NULL;
++static char audit_build[40] = { 0 };
++static uint32_t audit_runs = 0;
++static _Bool audit_on = 0;
++
++static const char audit_magic[8] = { 'X','R','A','U','D','I','T','\0' };
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++static void audit_fatal(const char *what, const char *path) {
++	fprintf(stderr, "xroar: -audit %s: %s: %s\n", what, path, strerror(errno));
++	exit(EXIT_FAILURE);
++}
++
++// Read a map file and OR it into the live map.  Used by seed=.  A file whose
++// legend version differs is refused rather than merged: the bits would mean
++// different things in the two halves of the result, and nothing downstream
++// could tell which byte came from where.
++static void audit_seed(const char *path) {
++	FILE *f = fopen(path, "rb");
++	if (!f) {
++		audit_fatal("seed", path);
++	}
++	uint8_t hdr[AUDIT_HEADER_BYTES];
++	if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
++		fprintf(stderr, "xroar: -audit seed: %s: short header\n", path);
++		exit(EXIT_FAILURE);
++	}
++	if (memcmp(hdr, audit_magic, sizeof(audit_magic)) != 0) {
++		fprintf(stderr, "xroar: -audit seed: %s: not an audit map\n", path);
++		exit(EXIT_FAILURE);
++	}
++	uint32_t fmt    = hdr[8]  | (hdr[9] << 8)  | (hdr[10] << 16) | ((uint32_t)hdr[11] << 24);
++	uint32_t legend = hdr[12] | (hdr[13] << 8) | (hdr[14] << 16) | ((uint32_t)hdr[15] << 24);
++	uint32_t span   = hdr[16] | (hdr[17] << 8) | (hdr[18] << 16) | ((uint32_t)hdr[19] << 24);
++	uint32_t runs   = hdr[20] | (hdr[21] << 8) | (hdr[22] << 16) | ((uint32_t)hdr[23] << 24);
++	if (fmt != AUDIT_FORMAT_VERSION || legend != AUDIT_LEGEND_VERSION) {
++		fprintf(stderr, "xroar: -audit seed: %s: format %u legend %u, "
++		        "this build writes format %u legend %u\n",
++		        path, fmt, legend, AUDIT_FORMAT_VERSION, AUDIT_LEGEND_VERSION);
++		exit(EXIT_FAILURE);
++	}
++	if (span != AUDIT_SPAN) {
++		fprintf(stderr, "xroar: -audit seed: %s: span 0x%x, this build uses 0x%x\n",
++		        path, span, AUDIT_SPAN);
++		exit(EXIT_FAILURE);
++	}
++	// The build id is carried forward but not enforced here: only the tool
++	// reading the finished map knows which build it means to report against.
++	// Warn on a mismatch so a cross-build union is at least visible.
++	hdr[63] = 0;
++	if (audit_build[0] && ((char *)hdr)[24] && 0 != strcmp((char *)hdr + 24, audit_build)) {
++		LOG_MOD_WARN("audit", "seed %s was built as '%s', this run is '%s'; "
++		             "unioning maps across builds\n", path, (char *)hdr + 24, audit_build);
++	} else if (!audit_build[0]) {
++		memcpy(audit_build, (char *)hdr + 24, sizeof(audit_build) - 1);
++	}
++	audit_runs = runs;
++
++	// OR in a chunk at a time; the map is larger than any sane stack frame.
++	uint8_t buf[65536];
++	unsigned off = 0;
++	size_t n;
++	while (off < AUDIT_SPAN && (n = fread(buf, 1, sizeof(buf), f)) > 0) {
++		if (n > AUDIT_SPAN - off)
++			n = AUDIT_SPAN - off;
++		for (size_t i = 0; i < n; i++)
++			audit_base[off + i] |= buf[i];
++		off += n;
++	}
++	fclose(f);
++	if (off != AUDIT_SPAN) {
++		fprintf(stderr, "xroar: -audit seed: %s: short map (%u of %u bytes)\n",
++		        path, off, (unsigned)AUDIT_SPAN);
++		exit(EXIT_FAILURE);
++	}
++	LOG_MOD_DEBUG(1, "audit", "seeded from %s (%u prior run%s)\n",
++	              path, runs, runs == 1 ? "" : "s");
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++void audit_config(const char *spec) {
++	if (audit_base) {
++		fprintf(stderr, "xroar: -audit given more than once\n");
++		exit(EXIT_FAILURE);
++	}
++	char *copy = xstrdup(spec);
++	char *rest = copy;
++	char *file = strsep(&rest, ",");
++	if (!file || !*file) {
++		fprintf(stderr, "xroar: -audit: no filename\n");
++		exit(EXIT_FAILURE);
++	}
++
++	const char *seed = NULL;
++	const char *build = NULL;
++	_Bool start = 1;
++	_Bool reset = 0;
++	while (rest && *rest) {
++		char *opt = strsep(&rest, ",");
++		if (!opt || !*opt)
++			continue;
++		char *val = strchr(opt, '=');
++		if (val)
++			*(val++) = 0;
++		if (0 == strcmp(opt, "seed") && val) {
++			seed = val;
++		} else if (0 == strcmp(opt, "build") && val) {
++			// Which build this map describes.  Recorded in the header so a
++			// reader can refuse to report a map against source it does not
++			// match, and so seeding across builds warns instead of quietly
++			// unioning addresses that mean different things.  The harness
++			// feeds it the assembler .sym file's !build line.
++			build = val;
++		} else if (0 == strcmp(opt, "start") && val) {
++			if (0 == strcmp(val, "on")) {
++				start = 1;
++			} else if (0 == strcmp(val, "off")) {
++				start = 0;
++			} else {
++				fprintf(stderr, "xroar: -audit start=%s: want on or off\n", val);
++				exit(EXIT_FAILURE);
++			}
++		} else if (0 == strcmp(opt, "reset")) {
++			reset = 1;
++		} else {
++			fprintf(stderr, "xroar: -audit: unknown option '%s'\n", opt);
++			exit(EXIT_FAILURE);
++		}
++	}
++
++	audit_base = xzalloc(AUDIT_SPAN);
++	audit_path = xstrdup(file);
++	// Set before seeding: audit_seed() compares against it, and adopts the
++	// seed's id only when this run has none to state.
++	if (build)
++		audit_set_build_id(build);
++
++	// seed= names the map to start from.  Naming the output file there too
++	// is the accumulate-in-place idiom, and is why seeding reads before the
++	// output is ever opened.  reset= wins over seed=, which is only useful
++	// for "same command line, fresh map this time".
++	if (seed && !reset)
++		audit_seed(seed);
++
++	audit_on = start;
++	audit_map = audit_on ? audit_base : NULL;
++	LOG_MOD_DEBUG(1, "audit", "map armed, recording %s, output %s\n",
++	              audit_on ? "on" : "off", audit_path);
++	free(copy);
++}
++
++_Bool audit_configured(void) {
++	return audit_base != NULL;
++}
++
++void audit_set_active(_Bool active) {
++	if (!audit_base) {
++		LOG_MOD_WARN("audit", "-trap-audit with no -audit; ignored\n");
++		return;
++	}
++	if (audit_on == active)
++		return;
++	audit_on = active;
++	audit_map = audit_on ? audit_base : NULL;
++	LOG_MOD_DEBUG(1, "audit", "recording %s\n", audit_on ? "on" : "off");
++}
++
++void audit_clear(void) {
++	if (!audit_base)
++		return;
++	memset(audit_base, 0, AUDIT_SPAN);
++	audit_runs = 0;
++	LOG_MOD_DEBUG(1, "audit", "map cleared\n");
++}
++
++void audit_set_build_id(const char *id) {
++	if (!id)
++		return;
++	strncpy(audit_build, id, sizeof(audit_build) - 1);
++	audit_build[sizeof(audit_build) - 1] = 0;
++}
++
++void audit_write(const char *path) {
++	if (!audit_base) {
++		LOG_MOD_WARN("audit", "-trap-audit-write with no -audit; ignored\n");
++		return;
++	}
++	if (!path)
++		path = audit_path;
++	if (!path)
++		return;
++	FILE *f = fopen(path, "wb");
++	if (!f) {
++		LOG_MOD_WARN("audit", "%s: %s\n", path, strerror(errno));
++		return;
++	}
++	uint8_t hdr[AUDIT_HEADER_BYTES];
++	memset(hdr, 0, sizeof(hdr));
++	memcpy(hdr, audit_magic, sizeof(audit_magic));
++	uint32_t v[4] = { AUDIT_FORMAT_VERSION, AUDIT_LEGEND_VERSION,
++	                  AUDIT_SPAN, audit_runs + 1 };
++	for (int i = 0; i < 4; i++) {
++		hdr[8 + i*4 + 0] = v[i] & 0xff;
++		hdr[8 + i*4 + 1] = (v[i] >> 8) & 0xff;
++		hdr[8 + i*4 + 2] = (v[i] >> 16) & 0xff;
++		hdr[8 + i*4 + 3] = (v[i] >> 24) & 0xff;
++	}
++	memcpy(hdr + 24, audit_build, sizeof(audit_build) - 1);
++	if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
++	    fwrite(audit_base, 1, AUDIT_SPAN, f) != AUDIT_SPAN) {
++		LOG_MOD_WARN("audit", "%s: short write: %s\n", path, strerror(errno));
++	}
++	fclose(f);
++	LOG_MOD_DEBUG(1, "audit", "wrote %s\n", path);
++}
++
++void audit_shutdown(void) {
++	if (!audit_base)
++		return;
++	audit_write(NULL);
++	audit_map = NULL;
++	free(audit_base);
++	audit_base = NULL;
++	free(audit_path);
++	audit_path = NULL;
++}
+diff --git a/src/audit.h b/src/audit.h
+new file mode 100644
+index 0000000..707bfdd
+--- /dev/null
++++ b/src/audit.h
+@@ -0,0 +1,106 @@
++/** \file
++ *
++ *  \brief Physical-address access audit map.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ *
++ *  One byte per flat physical RAM address, one bit per access class, unioned
++ *  over a run and optionally over many runs.  Answers "did this ever execute",
++ *  "how deep did the stack get", and "what did the interrupt handlers touch"
++ *  as a lookup over the finished map rather than as a stakeout with a
++ *  breakpoint.
++ *
++ *  The map is keyed on the SAME flat physical address that -trap xpc=,
++ *  -load-ram addr= and Qxroar.physmem use, so a symbol's physical address
++ *  indexes it directly.
++ *
++ *  What this deliberately does NOT do is count.  Per-address hit and cycle
++ *  counts already exist as -profile-hist (a per-physical-PC hits+cycles
++ *  table); duplicating them here would cost four to eight bytes per address
++ *  to answer a question another flag already answers better.  This map is
++ *  flags: it tells you WHETHER, and the profiler tells you HOW OFTEN.
++ */
++
++#ifndef XROAR_AUDIT_H_
++#define XROAR_AUDIT_H_
++
++#include <stdint.h>
++
++// Flat physical span covered.  512K is the stock GIME maximum; the DAT board's
++// extra bank bits extend the address by two more bits, and the trap code
++// already documents 0x1fffff as the ceiling.  Covering the whole thing costs
++// 2M of host memory once and removes any dependency on machine RAM sizing.
++#define AUDIT_SPAN (0x200000)
++
++// Bit legend.  Bumped as a unit via the header's legend version if it ever
++// changes meaning, so an old map can never be silently read with a new legend.
++#define AUDIT_READ    (0x01)  // read by the CPU as data
++#define AUDIT_WRITE   (0x02)  // written by the CPU
++#define AUDIT_EXEC    (0x04)  // consumed from the instruction stream
++#define AUDIT_OPCODE  (0x08)  // ... and it is the first byte of an instruction
++#define AUDIT_STACK_S (0x10)  // address derived from S (push, pull, or S-relative)
++#define AUDIT_STACK_U (0x20)  // address derived from U
++#define AUDIT_IRQ     (0x40)  // accessed while an interrupt handler was active
++#define AUDIT_PUSHPULL (0x80) // stack push/pull traffic, not indexed addressing
++
++// The two stack flags compose rather than partition, so nothing is lost:
++//   PUSHPULL & STACK_S   the S stack proper -- its extent is the high-water mark
++//   PUSHPULL & STACK_U   the U stack, where a program keeps one
++//   STACK_U without PUSHPULL   U used as a general pointer, e.g. `lda ,u+`
++// Measured on one cold boot, the last of those outnumbers the U stack by more
++// than two hundred to one, which is why they are not one flag.
++//
++// There is no vector flag.  The 6809's hardware vectors live in ROM on this
++// machine, so a vector fetch never reaches a RAM cycle and never reaches this
++// map; the class exists in the core (MC6809_MC_VECTOR) so a vector read is not
++// miscounted as an instruction fetch, and stops there.
++
++#define AUDIT_LEGEND_VERSION (1)
++#define AUDIT_FORMAT_VERSION (1)
++#define AUDIT_HEADER_BYTES   (64)
++
++// The live map, or NULL when recording is off.  Exposed so the per-cycle mark
++// is an inlined test-and-or in the machine's memory path rather than a call.
++extern uint8_t *audit_map;
++
++inline void audit_mark(unsigned phys, uint8_t bits) {
++	if (audit_map && phys < AUDIT_SPAN)
++		audit_map[phys] |= bits;
++}
++
++// -audit FILE[,seed=FILE][,start=on|off][,reset].  Allocates the map and, for
++// seed=, unions an existing file in first.  Errors are fatal: an audit run
++// that silently recorded nothing is worse than one that did not start.
++void audit_config(const char *spec);
++
++// True if -audit was given at all (whether or not recording is currently on).
++_Bool audit_configured(void);
++
++// Turn recording on or off without discarding what is already recorded.
++void audit_set_active(_Bool active);
++
++// Zero the map, keeping it configured and its active state unchanged.
++void audit_clear(void);
++
++// Write the map.  path == NULL writes to the configured -audit file.
++void audit_write(const char *path);
++
++// Write the configured file (if any) and release the map.  Called from
++// xroar_shutdown, so a run that is killed cleanly still leaves a map.
++void audit_shutdown(void);
++
++// Build id recorded in the header, for the staleness check on the reader side.
++void audit_set_build_id(const char *id);
++
++#endif
+diff --git a/src/auto_kbd.c b/src/auto_kbd.c
+index 4650b13..36d1913 100644
+--- a/src/auto_kbd.c
++++ b/src/auto_kbd.c
+@@ -22,6 +22,8 @@
+ #include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
++#include <unistd.h>
+ 
+ #include "delegate.h"
+ #include "sds.h"
+@@ -217,6 +219,11 @@ static void do_rts(void *sptr, bool RnW, uint32_t A) {
+ 	ak->machine->op_rts(ak->machine);
+ }
+ 
++// -type-delay: pick the delay, once, the first time there is something to type.
++// Random mode is uniform in [0,S] seconds over rand(), which is ample for
++// putting variation into one instant; the chosen value is always logged, so a
++// run that turns something up can be repeated with -type-delay-seed.
++
+ static void do_auto_event(void *sptr, bool RnW, uint32_t A) {
+ 	struct auto_kbd *ak = sptr;
+ 	(void)RnW;
+@@ -229,6 +236,18 @@ static void do_auto_event(void *sptr, bool RnW, uint32_t A) {
+ 	debug_set_register(ak->machine->debug.target, ak->regno_a, 0);
+ 	DELEGATE_CALL(ak->machine->debug.cpu.set_flag, debug_cpu_flag_zero, 1);
+ 
++	// Hold the first character. Returning here leaves the "no key pressed"
++	// state above in place and rts's back into the ROM's poll loop, which is
++	// exactly what a real keyboard looks like when nobody has typed yet --
++	// no event is cancelled and nothing else is rescheduled.
++	// One shared deadline (xroar.c): an -input-script run and an auto-typed
++	// one must not each start their own clock, or the delay means something
++	// different depending on how the machine is being driven.
++	if (event_tick_delta(event_current_tick, xroar_init_delay_deadline()) < 0) {
++		ak->machine->op_rts(ak->machine);
++		return;
++	}
++
+ 	struct auto_event *ae = ak->auto_event_list->data;
+ 	bool next_event = 0;
+ 
+diff --git a/src/joystick_script.c b/src/joystick_script.c
+new file mode 100644
+index 0000000..7cd3a5c
+--- /dev/null
++++ b/src/joystick_script.c
+@@ -0,0 +1,426 @@
++/** \file
++ *
++ *  \brief Scripted synthetic pointer as a joystick module.
++ *
++ *  \copyright Public domain. Part of the xroar-dev fork.
++ *
++ *  Why this exists, and why it's a joystick module and not a WaitForNewXY
++ *  shim: JOYSTK reads position through joystick_read_axis(), and the fire
++ *  button reaches $FF00 through joystick_read_buttons(). That is the single
++ *  seam every input path funnels through. Drive it and the whole program is
++ *  controllable, including WTBUT and the menus (which read $FF00 directly and
++ *  never call WaitForNewXY) and the M33ED double-click detector (which keys off
++ *  real button edges spaced in emulated time). Nothing is injected into the
++ *  6809 image.
++ *
++ *  Wire-up:
++ *    1. src/joystick.c: declare `extern struct joystick_module script_js_mod;`
++ *       and add `&script_js_mod,` to joystick_module_list[] (unconditional;
++ *       this module has no UI/VO dependency).
++ *    2. src/xroar.c: after joystick_init(), create a builtin config named
++ *       "script" (see the snippet in the cover notes), add a `-input-script
++ *       FILE` option, and call script_js_load(path) once the machine is live.
++ *    3. Run: -joy-right script -hires-joystick right -input-script moves.txt
++ *
++ *  Axis values are raw 0..65535 (centre 32767), exactly what joystick_read_axis
++ *  returns to the hi-res monostable. Canvas-pixel -> raw-unit calibration is
++ *  done in the Python layer, once, by probing; this module stays dumb and
++ *  correct about units.
++ *
++ *  Script grammar (one command per line, '#' starts a comment):
++ *    move  X Y       set axis 0 = X, axis 1 = Y   (raw 0..65535)
++ *    axis  A V       set axis A (0|1|x|y) = V
++ *    down  [N]       press button N   (default 0; the right fire button)
++ *    up    [N]       release button N
++ *    wait  MS        advance the timeline MS emulated milliseconds
++ *    frames N        advance N emulated frames (~1/60 s each)
++ *    type  TEXT      type TEXT via the ROM key-poll (auto_kbd); spaces kept,
++ *                    backslash escapes honoured (e.g. \r for ENTER)
++ *    key   NAME S    press (S=down) or release (S=up) ANY key at the raw
++ *                    keyboard matrix. NAME is a letter or digit (a, 7), or a
++ *                    name: shift ctrl alt f1 f2 up down left right space
++ *                    enter clear break backspace at colon semicolon comma
++ *                    minus period slash. This is the path auto_kbd/`type`
++ *                    skip, so it is the only way to feed GetModifierKeys or
++ *                    anything else that reads the matrix directly. The key
++ *                    stays held until the matching `key NAME up`.
++ *                    `key down down` presses the DOWN ARROW: name and state
++ *                    are separate positional tokens.
++ *
++ *  A click is `down` / `wait` / `up`. A double-click is two of those inside the
++ *  M33E8 window. A drag is `down` / a run of `move`s / `up`. Leading `wait`s
++ *  before the first action delay the whole timeline.
++ */
++
++#include "top-config.h"
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "delegate.h"
++
++#include "auto_kbd.h"
++#include "events.h"
++#include "joystick.h"
++#include "keyboard.h"
++#include "module.h"
++#include "xalloc.h"
++#include "xroar.h"
++
++#include "joystick_script.h"
++
++// One emulated NTSC frame, near enough for `frames`. Use `wait MS` when you
++// need the double-click window measured precisely.
++#define SCRIPT_FRAME_TICKS ((event_ticks)(EVENT_TICK_RATE / 60))
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Synthetic pointer state. Read by the control delegates below; written by the
++// timeline (or by the direct pokes). Centre both axes so a script that only
++// clicks doesn't slam the cursor to a corner first.
++
++static struct {
++	int axis[JOYSTICK_NUM_AXES];      // 0..65535
++	_Bool button[JOYSTICK_NUM_BUTTONS];
++} script_state = {
++	.axis = { 32767, 32767 },
++};
++
++static int clamp16(int v) {
++	if (v < 0) return 0;
++	if (v > 65535) return 65535;
++	return v;
++}
++
++void script_js_set_axis(unsigned axis, int value) {
++	if (axis < JOYSTICK_NUM_AXES)
++		script_state.axis[axis] = clamp16(value);
++}
++
++void script_js_set_button(unsigned button, _Bool down) {
++	if (button < JOYSTICK_NUM_BUTTONS)
++		script_state.button[button] = down;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// joystick_control objects. One per configured axis/button; each just reports
++// the relevant slot of script_state.
++
++struct script_axis {
++	struct joystick_control joystick_control;
++	unsigned axis;
++};
++
++struct script_button {
++	struct joystick_control joystick_control;
++	unsigned button;
++};
++
++static int script_read_axis(void *sptr) {
++	struct script_axis *a = sptr;
++	return script_state.axis[a->axis];
++}
++
++static int script_read_button(void *sptr) {
++	struct script_button *b = sptr;
++	return script_state.button[b->button] ? 1 : 0;
++}
++
++// spec is the CONTROL-SPEC after the "script:" prefix. For an axis it may be
++// "x"/"y" or "0"/"1"; empty falls back to the slot index. For a button it's the
++// 1-based button number like the mouse submodule, empty falls back to slot.
++static struct joystick_control *script_configure_axis(char *spec, unsigned jaxis) {
++	unsigned idx = jaxis;
++	if (spec && *spec) {
++		if (*spec == 'x' || *spec == 'X') idx = 0;
++		else if (*spec == 'y' || *spec == 'Y') idx = 1;
++		else idx = (unsigned)strtol(spec, NULL, 0);
++	}
++	if (idx >= JOYSTICK_NUM_AXES)
++		return NULL;
++
++	struct script_axis *a = xmalloc(sizeof(*a));
++	*a = (struct script_axis){0};
++	a->axis = idx;
++	a->joystick_control.read = DELEGATE_AS0(int, script_read_axis, a);
++	a->joystick_control.free = DELEGATE_AS0(void, free, a);
++	return &a->joystick_control;
++}
++
++static struct joystick_control *script_configure_button(char *spec, unsigned jbutton) {
++	unsigned idx = jbutton;
++	if (spec && *spec)
++		idx = (unsigned)(strtol(spec, NULL, 0));
++	if (idx >= JOYSTICK_NUM_BUTTONS)
++		return NULL;
++
++	struct script_button *b = xmalloc(sizeof(*b));
++	*b = (struct script_button){0};
++	b->button = idx;
++	b->joystick_control.read = DELEGATE_AS0(int, script_read_button, b);
++	b->joystick_control.free = DELEGATE_AS0(void, free, b);
++	return &b->joystick_control;
++}
++
++static struct joystick_submodule script_js_submod = {
++	.name = "script",
++	.init = NULL,
++	.configure_axis = script_configure_axis,
++	.configure_button = script_configure_button,
++};
++
++static struct joystick_submodule *script_js_submodlist[] = {
++	&script_js_submod,
++	NULL
++};
++
++struct joystick_module script_js_mod = {
++	.common = { .name = "script", .description = "Scripted synthetic pointer" },
++	.submodule_list = script_js_submodlist,
++};
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Timeline. The whole script is parsed into a flat step array at load time.
++// One event on MACHINE_EVENT_LIST walks it: apply step i, then queue itself for
++// step i+1's pre-delay. `wait`/`frames` lines carry no action; they accumulate
++// into the next action's pre-delay. Scheduling is always relative (event_ticks
++// is uint32_t and wraps near 300 s), so an arbitrarily long script is fine as
++// long as no single gap exceeds ~150 s.
++
++/* key NAME -> DSCAN scancode. The matrix path was always general (KBD_MATRIX_*
++ * resolves col/row from the live keymap); only this lookup was narrow, so the
++ * script could press shift/ctrl/alt and nothing else. That was survivable only
++ * while a separate command buffer drove the ordinary keys; when that went away
++ * the gap became the whole problem, and it went unnoticed for a long time.
++ * Letters and digits come out of the enum arithmetically: DSCAN_A..DSCAN_Z and
++ * DSCAN_0..DSCAN_9 are contiguous in dkbd.h. Everything else is named here.
++ * Note "key down down" is legal and means the DOWN ARROW pressed: the name and
++ * the state are separate positional tokens. */
++static const struct { const char *name; int scan; } script_key_names[] = {
++	{ "shift", DSCAN_SHIFT }, { "ctrl", DSCAN_CTRL }, { "alt", DSCAN_ALT },
++	{ "f1", DSCAN_F1 }, { "f2", DSCAN_F2 },
++	{ "up", DSCAN_UP }, { "down", DSCAN_DOWN },
++	{ "left", DSCAN_LEFT }, { "right", DSCAN_RIGHT },
++	{ "space", DSCAN_SPACE }, { "enter", DSCAN_ENTER },
++	{ "clear", DSCAN_CLEAR }, { "break", DSCAN_BREAK },
++	{ "backspace", DSCAN_BACKSPACE },
++	{ "at", DSCAN_AT }, { "colon", DSCAN_COLON },
++	{ "semicolon", DSCAN_SEMICOLON }, { "comma", DSCAN_COMMA },
++	{ "minus", DSCAN_MINUS }, { "period", DSCAN_FULL_STOP },
++	{ "slash", DSCAN_SLASH },
++	{ NULL, 0 }
++};
++
++static int script_key_scan(const char *name) {
++	for (int i = 0; script_key_names[i].name; i++)
++		if (strcmp(name, script_key_names[i].name) == 0)
++			return script_key_names[i].scan;
++	if (name[0] && !name[1]) {
++		char c = name[0];
++		if (c >= 'a' && c <= 'z') return DSCAN_A + (c - 'a');
++		if (c >= 'A' && c <= 'Z') return DSCAN_A + (c - 'A');
++		if (c >= '0' && c <= '9') return DSCAN_0 + (c - '0');
++	}
++	// Raw numeric scancode escape hatch: "key 0x2b down" is DSCAN_UP. Lets a
++	// test reach anything in dkbd.h without waiting on this table.
++	if (name[0] == '0' && (name[1] == 'x' || name[1] == 'X')) {
++		char *end;
++		long v = strtol(name, &end, 0);
++		if (*end == 0 && v >= 0 && v <= DSCAN_INVALID)
++			return (int)v;
++	}
++	return -1;
++}
++
++enum { ACT_MOVE, ACT_AXIS, ACT_BUTTON, ACT_TYPE, ACT_KEY };
++
++struct script_step {
++	event_ticks delay;   // ticks to wait before applying, relative to prev step
++	int type;
++	int a, b;            // MOVE: a=x,b=y | AXIS: a=idx,b=val | BUTTON: a=idx,b=down
++	char *str;           // TYPE: text for ak_parse_type_string (backslash escapes ok)
++};
++
++static struct script_step *steps = NULL;
++static size_t n_steps = 0;
++static size_t step_i = 0;
++static struct event script_event;
++static _Bool event_inited = 0;
++
++static void apply_step(const struct script_step *s) {
++	switch (s->type) {
++	case ACT_MOVE:
++		script_js_set_axis(0, s->a);
++		script_js_set_axis(1, s->b);
++		break;
++	case ACT_AXIS:
++		script_js_set_axis((unsigned)s->a, s->b);
++		break;
++	case ACT_BUTTON:
++		script_js_set_button((unsigned)s->a, s->b ? 1 : 0);
++		break;
++	case ACT_TYPE:
++		// Reuse XRoar's auto-typer. It breakpoints the ROM key-poll at
++		// $a1cb, which a guest's POLCAT routes through via jsr [$A000],
++		// so the typesetter sees these keystrokes. Sequenced here on the
++		// timeline so it fires only after the clicks that open the type
++		// tool, not whenever some other POLCAT consumer happens to poll.
++		if (s->str && xroar.auto_kbd)
++			ak_parse_type_string(xroar.auto_kbd, s->str);
++		break;
++	case ACT_KEY:
++		// Raw keyboard-matrix press/release, the path auto_kbd skips.
++		// s->a is a DSCAN scancode; KBD_MATRIX_* resolves its col/row
++		// from the live keymap, so nothing here is a hardcoded matrix
++		// position. Held until the matching release, so GetModifierKeys
++		// (which reads $FF00/$FF02 directly) sees a real modifier.
++		if (xroar.keyboard_interface) {
++			if (s->b)
++				KBD_MATRIX_PRESS(xroar.keyboard_interface, s->a);
++			else
++				KBD_MATRIX_RELEASE(xroar.keyboard_interface, s->a);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static void script_event_fire(void *sptr) {
++	(void)sptr;
++	if (step_i >= n_steps)
++		return;
++	apply_step(&steps[step_i]);
++	step_i++;
++	if (step_i < n_steps)
++		event_queue_dt(&script_event, steps[step_i].delay);
++}
++
++// Grow the step array and return the new slot, tagged with pending_delay which
++// the caller resets afterwards.
++static struct script_step *push_step(event_ticks *pending_delay) {
++	steps = xrealloc(steps, (n_steps + 1) * sizeof(*steps));
++	struct script_step *s = &steps[n_steps++];
++	*s = (struct script_step){0};
++	s->delay = *pending_delay;
++	*pending_delay = 0;
++	return s;
++}
++
++int script_js_load(const char *path) {
++	if (!path)
++		return 0;
++
++	FILE *f = fopen(path, "r");
++	if (!f) {
++		fprintf(stderr, "[script-js] cannot open input script '%s'\n", path);
++		return -1;
++	}
++
++	event_ticks pending_delay = 0;
++	char line[256];
++	int lineno = 0;
++
++	while (fgets(line, sizeof(line), f)) {
++		lineno++;
++		char *hash = strchr(line, '#');
++		if (hash)
++			*hash = '\0';
++
++		char *tok = strtok(line, " \t\r\n");
++		if (!tok)
++			continue;
++
++		if (strcmp(tok, "wait") == 0) {
++			char *a = strtok(NULL, " \t\r\n");
++			if (a)
++				pending_delay += (event_ticks)EVENT_MS((uintmax_t)strtoul(a, NULL, 0));
++		} else if (strcmp(tok, "frames") == 0) {
++			char *a = strtok(NULL, " \t\r\n");
++			if (a)
++				pending_delay += (event_ticks)(strtoul(a, NULL, 0) * SCRIPT_FRAME_TICKS);
++		} else if (strcmp(tok, "move") == 0) {
++			char *a = strtok(NULL, " \t\r\n");
++			char *b = strtok(NULL, " \t\r\n");
++			if (a && b) {
++				struct script_step *s = push_step(&pending_delay);
++				s->type = ACT_MOVE;
++				s->a = clamp16((int)strtol(a, NULL, 0));
++				s->b = clamp16((int)strtol(b, NULL, 0));
++			}
++		} else if (strcmp(tok, "axis") == 0) {
++			char *a = strtok(NULL, " \t\r\n");
++			char *b = strtok(NULL, " \t\r\n");
++			if (a && b) {
++				unsigned idx = (a[0] == 'x' || a[0] == 'X') ? 0
++				             : (a[0] == 'y' || a[0] == 'Y') ? 1
++				             : (unsigned)strtoul(a, NULL, 0);
++				struct script_step *s = push_step(&pending_delay);
++				s->type = ACT_AXIS;
++				s->a = (int)idx;
++				s->b = clamp16((int)strtol(b, NULL, 0));
++			}
++		} else if (strcmp(tok, "down") == 0 || strcmp(tok, "up") == 0) {
++			char *a = strtok(NULL, " \t\r\n");
++			struct script_step *s = push_step(&pending_delay);
++			s->type = ACT_BUTTON;
++			s->a = a ? (int)strtol(a, NULL, 0) : 0;
++			s->b = (tok[0] == 'd');
++		} else if (strcmp(tok, "key") == 0) {
++			// key NAME down|up -- raw matrix press/release. NAME maps
++			// to a DSCAN scancode; the keymap turns that into a matrix
++			// position, so no col/row is hardcoded here. Any key, not
++			// just modifiers: see script_key_names above.
++			char *name = strtok(NULL, " \t\r\n");
++			char *st = strtok(NULL, " \t\r\n");
++			if (name && st) {
++				int scan = script_key_scan(name);
++				if (scan < 0) {
++					fprintf(stderr, "[script-js] %s:%d: unknown key '%s'\n",
++					        path, lineno, name);
++				} else {
++					struct script_step *s = push_step(&pending_delay);
++					s->type = ACT_KEY;
++					s->a = scan;
++					s->b = (strcmp(st, "down") == 0);
++				}
++			}
++		} else if (strcmp(tok, "type") == 0) {
++			// Argument is the rest of the line, spaces preserved.
++			char *rest = strtok(NULL, "\r\n");
++			if (rest) {
++				while (*rest == ' ' || *rest == '\t')
++					rest++;
++				if (*rest) {
++					struct script_step *s = push_step(&pending_delay);
++					s->type = ACT_TYPE;
++					s->str = xstrdup(rest);
++				}
++			}
++		} else {
++			fprintf(stderr, "[script-js] %s:%d: unknown command '%s'\n",
++			        path, lineno, tok);
++		}
++	}
++	fclose(f);
++
++	if (n_steps == 0)
++		return 0;
++
++	if (!event_inited) {
++		event_init(&script_event, MACHINE_EVENT_LIST,
++		           DELEGATE_AS0(void, script_event_fire, NULL));
++		event_inited = 1;
++	}
++	step_i = 0;
++	// -init-delay applies to the script too, and it is the same deadline the
++	// auto-typer waits on (xroar.c). Before this, a scripted run got no
++	// delay at all: the option only reached auto_kbd, so the one input path
++	// that automation actually uses was the one path it did not affect.
++	event_ticks now = event_current_tick;
++	event_ticks deadline = xroar_init_delay_deadline();
++	int extra = event_tick_delta(deadline, now);
++	event_queue_dt(&script_event, steps[0].delay + (extra > 0 ? extra : 0));
++	return 0;
++}
+diff --git a/src/joystick_script.h b/src/joystick_script.h
+new file mode 100644
+index 0000000..dc9b251
+--- /dev/null
++++ b/src/joystick_script.h
+@@ -0,0 +1,31 @@
++/** \file
++ *
++ *  \brief Scripted synthetic pointer as a joystick module.
++ *
++ *  Headless input injection for unattended guest work. Feeds the right-port
++ *  axes and the fire button from a timeline scheduled in emulated time, so
++ *  every input path above the hardware (JOYSTK, the direct $FF00 reads in
++ *  WTBUT / menus, and the M33ED double-click detector) runs unmodified.
++ *
++ *  \copyright Public domain. Part of the xroar-dev fork.
++ */
++
++#ifndef XROAR_JOYSTICK_SCRIPT_H_
++#define XROAR_JOYSTICK_SCRIPT_H_
++
++#include "joystick.h"
++
++// Registered in joystick_module_list[] (src/joystick.c).
++extern struct joystick_module script_js_mod;
++
++// Parse an input script and queue its first event on MACHINE_EVENT_LIST.
++// Call once, after the machine is built and events are live. Safe to call with
++// path == NULL (no-op). Returns 0 on success, -1 on failure to open.
++int script_js_load(const char *path);
++
++// Direct pokes, if you'd rather drive it from C / gdb than from a file.
++// value is 0..65535 (centre 32767); axis 0 = X, 1 = Y.
++void script_js_set_axis(unsigned axis, int value);
++void script_js_set_button(unsigned button, _Bool down);
++
++#endif
+diff --git a/src/symfile.c b/src/symfile.c
+new file mode 100644
+index 0000000..5bd9935
+--- /dev/null
++++ b/src/symfile.c
+@@ -0,0 +1,611 @@
++/** \file
++ *
++ *  \brief Program symbols, in physical space.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ */
++
++#include "top-config.h"
++
++// For strsep()
++#define _DEFAULT_SOURCE
++#define _BSD_SOURCE
++#define _DARWIN_C_SOURCE
++
++#include <errno.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "pl-string.h"
++#include "xalloc.h"
++
++#include "logging.h"
++#include "symfile.h"
++
++// Record classes, in the order a bare name prefers them.  A program symbol
++// beats a direct-page variable beats an equate: the first two are places and
++// the third is a number that may or may not be one.
++enum {
++	SYMTAB_KIND_S = 0,   // program symbol: name, image, logical, physical
++	SYMTAB_KIND_D = 1,   // direct-page variable: name, offset, logical, physical
++	SYMTAB_KIND_E = 2,   // equate: name, value
++};
++
++struct symfile_sym {
++	char *name;
++	char *image;         // S only; NULL otherwise
++	uint32_t phys;       // S/D: flat physical.  E: the equate's value
++	uint16_t logical;
++	uint8_t offset;      // D only
++	uint8_t kind;
++};
++
++// One physical address can carry several line records: a macro call site and
++// the macro's own body both claim the byte the expansion emitted, and a line
++// that emits nothing is credited to the next address that does.  The last
++// record for an address wins, which is the innermost attribution and is what
++// the host-side reader of the same file resolves to; `seq` is what keeps
++// "last" meaningful through a sort that is not stable.
++struct symfile_line {
++	uint32_t phys;
++	uint32_t seq;
++	char *where;         // "file:line"
++};
++
++static struct symfile_sym *syms = NULL;
++static size_t n_syms = 0, syms_alloc = 0;
++
++static struct symfile_line *lines = NULL;
++static size_t n_lines = 0, lines_alloc = 0;
++
++// Reverse lookup: S records only, sorted by physical address.  Direct-page
++// variables are deliberately absent: MC3 pins that page to the top of
++// physical RAM, so a DP variable sits nowhere near the code that uses it and
++// would only ever be a misleading "nearest symbol" for some unrelated byte.
++static struct symfile_sym **by_phys = NULL;
++static size_t n_by_phys = 0;
++
++static bool loaded = 0;
++static bool sorted = 0;
++static char *build_id = NULL;
++
++#define SYMTAB_DEFAULT_DISTANCE (0x400)
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++static void symfile_fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
++
++static void symfile_fatal(const char *fmt, ...) {
++	va_list ap;
++	fputs("xroar: -symbols: ", stderr);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++	exit(EXIT_FAILURE);
++}
++
++static struct symfile_sym *sym_new(void) {
++	if (n_syms == syms_alloc) {
++		syms_alloc = syms_alloc ? syms_alloc * 2 : 4096;
++		syms = xrealloc(syms, syms_alloc * sizeof(*syms));
++	}
++	struct symfile_sym *s = &syms[n_syms++];
++	memset(s, 0, sizeof(*s));
++	sorted = 0;
++	return s;
++}
++
++static struct symfile_line *line_new(void) {
++	if (n_lines == lines_alloc) {
++		lines_alloc = lines_alloc ? lines_alloc * 2 : 16384;
++		lines = xrealloc(lines, lines_alloc * sizeof(*lines));
++	}
++	struct symfile_line *l = &lines[n_lines];
++	memset(l, 0, sizeof(*l));
++	l->seq = (uint32_t)n_lines++;
++	sorted = 0;
++	return l;
++}
++
++// Split a record into whitespace-separated fields in place.  Returns the
++// count; fields beyond MAX are left in the last one, which is what the L
++// class wants ("file:line" is one field but a filename may not be).
++static int split_fields(char *row, char **field, int max) {
++	int n = 0;
++	while (n < max) {
++		while (*row == ' ' || *row == '\t')
++			row++;
++		if (!*row)
++			break;
++		field[n++] = row;
++		if (n == max)
++			break;
++		while (*row && *row != ' ' && *row != '\t')
++			row++;
++		if (*row)
++			*(row++) = 0;
++	}
++	return n;
++}
++
++static uint32_t parse_hex(const char *s, const char *what, const char *path,
++                          unsigned lineno) {
++	char *end;
++	unsigned long v = strtoul(s, &end, 16);
++	if (end == s || *end != 0)
++		symfile_fatal("%s:%u: %s '%s' is not hex", path, lineno, what, s);
++	return (uint32_t)v;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Sorting and lookup
++
++static int cmp_by_name(const void *a, const void *b) {
++	const struct symfile_sym *x = a, *y = b;
++	int c = strcmp(x->name, y->name);
++	if (c)
++		return c;
++	if (x->kind != y->kind)
++		return (int)x->kind - (int)y->kind;
++	return strcmp(x->image ? x->image : "", y->image ? y->image : "");
++}
++
++static int cmp_by_phys(const void *a, const void *b) {
++	const struct symfile_sym *x = *(struct symfile_sym * const *)a;
++	const struct symfile_sym *y = *(struct symfile_sym * const *)b;
++	if (x->phys != y->phys)
++		return (x->phys < y->phys) ? -1 : 1;
++	return strcmp(x->name, y->name);
++}
++
++static int cmp_line(const void *a, const void *b) {
++	const struct symfile_line *x = a, *y = b;
++	if (x->phys != y->phys)
++		return (x->phys < y->phys) ? -1 : 1;
++	return (x->seq < y->seq) ? -1 : (x->seq > y->seq);
++}
++
++// Deferred until the first lookup, so that repeated -symbols options cost one
++// sort rather than one each.
++static void symfile_sort(void) {
++	if (sorted)
++		return;
++	qsort(syms, n_syms, sizeof(*syms), cmp_by_name);
++	if (n_lines)
++		qsort(lines, n_lines, sizeof(*lines), cmp_line);
++	free(by_phys);
++	by_phys = NULL;
++	n_by_phys = 0;
++	for (size_t i = 0; i < n_syms; i++)
++		if (syms[i].kind == SYMTAB_KIND_S)
++			n_by_phys++;
++	if (n_by_phys) {
++		by_phys = xmalloc(n_by_phys * sizeof(*by_phys));
++		size_t j = 0;
++		for (size_t i = 0; i < n_syms; i++)
++			if (syms[i].kind == SYMTAB_KIND_S)
++				by_phys[j++] = &syms[i];
++		qsort(by_phys, n_by_phys, sizeof(*by_phys), cmp_by_phys);
++	}
++	sorted = 1;
++}
++
++// First entry with this name, or SIZE_MAX.  The array is sorted by name, so
++// every definition of a name is one contiguous run starting here.
++static size_t find_name(const char *name) {
++	size_t lo = 0, hi = n_syms;
++	while (lo < hi) {
++		size_t mid = lo + (hi - lo) / 2;
++		if (strcmp(syms[mid].name, name) < 0)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	if (lo < n_syms && 0 == strcmp(syms[lo].name, name))
++		return lo;
++	return (size_t)-1;
++}
++
++// Does IMAGE name this record's image?  The symbol file spells images as the
++// object it linked from ("OVERLAY5.link.ram"); the short form before the first
++// dot is what a human types and is accepted too.
++static bool image_matches(const struct symfile_sym *s, const char *image) {
++	if (!s->image)
++		return 0;
++	if (0 == strcmp(s->image, image))
++		return 1;
++	size_t n = strcspn(s->image, ".");
++	return (strlen(image) == n && 0 == strncmp(s->image, image, n));
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Loading
++
++void symfile_load(const char *spec) {
++	char *copy = xstrdup(spec);
++	char *rest = copy;
++	char *path = strsep(&rest, ",");
++	if (!path || !*path)
++		symfile_fatal("no filename");
++
++	const char *want_build = NULL;
++	while (rest && *rest) {
++		char *opt = strsep(&rest, ",");
++		if (!opt || !*opt)
++			continue;
++		char *val = strchr(opt, '=');
++		if (val)
++			*(val++) = 0;
++		if (0 == strcmp(opt, "build") && val) {
++			want_build = val;
++		} else {
++			symfile_fatal("%s: unknown option '%s'", path, opt);
++		}
++	}
++
++	FILE *f = fopen(path, "r");
++	if (!f)
++		symfile_fatal("%s: %s", path, strerror(errno));
++
++	char row[1024];
++	unsigned lineno = 0;
++	size_t got_s = 0, got_d = 0, got_e = 0, got_l = 0;
++	char *file_build = NULL;
++
++	while (fgets(row, sizeof(row), f)) {
++		lineno++;
++		size_t len = strlen(row);
++		while (len && (row[len-1] == '\n' || row[len-1] == '\r'))
++			row[--len] = 0;
++		if (!len)
++			continue;
++
++		char *field[6];
++		int n = split_fields(row, field, 6);
++		if (n < 1)
++			continue;
++		const char *cls = field[0];
++
++		if (0 == strcmp(cls, "!gensym")) {
++			// One generator version is supported at a time.  A file
++			// from a newer generator may spell a class differently,
++			// and reading it optimistically is how a symbol file
++			// starts producing plausible wrong addresses.
++			if (n < 2 || 0 != strcmp(field[1], "1"))
++				symfile_fatal("%s: generator version '%s', this build reads 1",
++				             path, (n >= 2) ? field[1] : "");
++		} else if (0 == strcmp(cls, "!build")) {
++			if (n >= 2)
++				file_build = xstrdup(field[1]);
++		} else if (0 == strcmp(cls, "!image")) {
++			// Per-image org/base/size/digest.  The digest guards the
++			// host-side reader, which can see obj/; from here the
++			// build id is the only check available.
++			continue;
++		} else if (0 == strcmp(cls, "S")) {
++			if (n < 5)
++				symfile_fatal("%s:%u: short S record", path, lineno);
++			struct symfile_sym *s = sym_new();
++			s->kind = SYMTAB_KIND_S;
++			s->name = xstrdup(field[1]);
++			s->image = xstrdup(field[2]);
++			s->logical = (uint16_t)parse_hex(field[3], "logical", path, lineno);
++			s->phys = parse_hex(field[4], "physical", path, lineno);
++			got_s++;
++		} else if (0 == strcmp(cls, "D")) {
++			if (n < 5)
++				symfile_fatal("%s:%u: short D record", path, lineno);
++			struct symfile_sym *s = sym_new();
++			s->kind = SYMTAB_KIND_D;
++			s->name = xstrdup(field[1]);
++			s->offset = (uint8_t)parse_hex(field[2], "offset", path, lineno);
++			s->logical = (uint16_t)parse_hex(field[3], "logical", path, lineno);
++			s->phys = parse_hex(field[4], "physical", path, lineno);
++			got_d++;
++		} else if (0 == strcmp(cls, "E")) {
++			if (n < 3)
++				symfile_fatal("%s:%u: short E record", path, lineno);
++			struct symfile_sym *s = sym_new();
++			s->kind = SYMTAB_KIND_E;
++			s->name = xstrdup(field[1]);
++			s->phys = parse_hex(field[2], "value", path, lineno);
++			s->logical = (uint16_t)s->phys;
++			got_e++;
++		} else if (0 == strcmp(cls, "L")) {
++			if (n < 3)
++				symfile_fatal("%s:%u: short L record", path, lineno);
++			struct symfile_line *l = line_new();
++			l->phys = parse_hex(field[1], "physical", path, lineno);
++			l->where = xstrdup(field[2]);
++			got_l++;
++		} else {
++			symfile_fatal("%s:%u: unknown record class '%s'", path, lineno, cls);
++		}
++	}
++	fclose(f);
++
++	// A build id stated on the command line is a claim about which code
++	// this file describes, and a wrong one is the stale-snapshot failure
++	// wearing a new hat: every address plausible, all of them from the
++	// wrong build.  Fatal, not a warning.
++	if (want_build && file_build && 0 != strcmp(want_build, file_build))
++		symfile_fatal("%s describes build '%s', but build='%s' was asked for",
++		             path, file_build, want_build);
++	if (file_build) {
++		if (build_id && 0 != strcmp(build_id, file_build))
++			LOG_MOD_WARN("symbols", "%s is build '%s'; already loaded '%s'\n",
++			             path, file_build, build_id);
++		if (!build_id)
++			build_id = file_build;
++		else
++			free(file_build);
++	}
++
++	loaded = 1;
++	LOG_MOD_DEBUG(1, "symbols", "%s: %zu symbols, %zu dp, %zu equates, %zu lines"
++	              " (build %s)\n", path, got_s, got_d, got_e, got_l,
++	              build_id ? build_id : "unstated");
++}
++
++bool symfile_loaded(void) {
++	return loaded;
++}
++
++const char *symfile_build_id(void) {
++	return build_id;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Forward resolution
++
++// Resolve a bare or IMAGE-qualified name.  Exits on absence or ambiguity.
++static const struct symfile_sym *symfile_find(const char *name) {
++	if (!loaded)
++		symfile_fatal("'@%s' needs a symbol file: pass -symbols FILE, and pass "
++		             "it BEFORE the option that uses '@'", name);
++	symfile_sort();
++
++	const char *colon = strchr(name, ':');
++	if (colon) {
++		char *image = xstrndup(name, (size_t)(colon - name));
++		const char *bare = colon + 1;
++		size_t i = find_name(bare);
++		const struct symfile_sym *hit = NULL;
++		for (; i != (size_t)-1 && i < n_syms && 0 == strcmp(syms[i].name, bare); i++) {
++			if (image_matches(&syms[i], image)) {
++				hit = &syms[i];
++				break;
++			}
++		}
++		if (!hit)
++			symfile_fatal("'%s' is not defined in image '%s'", bare, image);
++		free(image);
++		return hit;
++	}
++
++	size_t first = find_name(name);
++	if (first == (size_t)-1)
++		symfile_fatal("no symbol '%s' (rebuilt since the symbol file was "
++		             "written?  misspelt?)", name);
++	// Every definition of the name is one run; the run is sorted by kind,
++	// so the preference order S > D > E is just "take the first kind
++	// present" and ambiguity is only ever judged within that kind.
++	size_t last = first;
++	while (last + 1 < n_syms && 0 == strcmp(syms[last + 1].name, name))
++		last++;
++	uint8_t kind = syms[first].kind;
++	size_t n = 0;
++	for (size_t i = first; i <= last; i++)
++		if (syms[i].kind == kind)
++			n++;
++	if (n > 1) {
++		// The thunk-shadowing case.  Naming both candidates is the whole
++		// point: they are different places, and picking one is how a
++		// breakpoint lands one indirection short of the code meant.
++		fprintf(stderr, "xroar: -symbols: '%s' is defined in %zu images:", name, n);
++		for (size_t i = first; i <= last; i++)
++			if (syms[i].kind == kind)
++				fprintf(stderr, " %s(0x%05X)", syms[i].image ? syms[i].image : "?",
++				        syms[i].phys);
++		fprintf(stderr, "\nxroar: -symbols: qualify it as @IMAGE:%s -- these are "
++		        "usually the resident's dispatch thunk and an overlay's "
++		        "implementation, which are different places.\n", name);
++		exit(EXIT_FAILURE);
++	}
++	return &syms[first];
++}
++
++// Split "Name+OFFSET" (with or without a leading '@') and resolve the name.
++// Only '+' is accepted for the offset: '-' is the range separator in the
++// address grammar and cannot mean two things.  An offset is here so a
++// breakpoint can land inside a routine without hand arithmetic on hex, which
++// is the manual step this whole option exists to delete.
++static const struct symfile_sym *symfile_resolve(const char *spec, unsigned long *off_out) {
++	if (*spec == '@')
++		spec++;
++	const char *plus = strchr(spec, '+');
++	char *name = plus ? xstrndup(spec, (size_t)(plus - spec)) : xstrdup(spec);
++	if (!*name)
++		symfile_fatal("'@' with no name after it");
++
++	unsigned long offset = 0;
++	if (plus) {
++		const char *o = plus + 1;
++		int base = 10;
++		if (o[0] == '0' && (o[1] == 'x' || o[1] == 'X')) {
++			o += 2;
++			base = 16;
++		}
++		char *end;
++		offset = strtoul(o, &end, base);
++		if (end == o || *end != 0)
++			symfile_fatal("'%s': offset '%s' is not a number (0x prefix for hex)",
++			             spec, plus + 1);
++	}
++
++	const struct symfile_sym *s = symfile_find(name);
++	free(name);
++	if (off_out)
++		*off_out = offset;
++	return s;
++}
++
++bool symfile_resolve_token(const char *tok, struct symfile_addr *out) {
++	if (!tok || tok[0] != '@')
++		return 0;
++	unsigned long offset = 0;
++	const struct symfile_sym *s = symfile_resolve(tok, &offset);
++	out->value = s->phys + (uint32_t)offset;
++	// An equate is a number, not necessarily an address, so it gets the
++	// same magnitude classification a literal would; a symbol or a DP
++	// variable is a place, and the file records those as physical.
++	out->physical = (s->kind == SYMTAB_KIND_E) ? (out->value > 0xffff) : 1;
++	return 1;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Reverse
++
++const char *symfile_whereis(uint32_t phys, uint32_t max_distance) {
++	// A rotation, so one printf can name two addresses.  Four is enough for
++	// every call site here and keeps the whole thing allocation-free.
++	static char buf[4][128];
++	static int next = 0;
++
++	if (!loaded)
++		return NULL;
++	symfile_sort();
++	if (!n_by_phys)
++		return NULL;
++	if (!max_distance)
++		max_distance = SYMTAB_DEFAULT_DISTANCE;
++
++	// Last entry at or below phys.
++	size_t lo = 0, hi = n_by_phys;
++	while (lo < hi) {
++		size_t mid = lo + (hi - lo) / 2;
++		if (by_phys[mid]->phys <= phys)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	if (lo == 0)
++		return NULL;
++	const struct symfile_sym *s = by_phys[lo - 1];
++	uint32_t off = phys - s->phys;
++	if (off > max_distance)
++		return NULL;
++
++	char *out = buf[next];
++	next = (next + 1) % 4;
++	if (off)
++		snprintf(out, sizeof(buf[0]), "%s+%u (%s)", s->name, off, s->image);
++	else
++		snprintf(out, sizeof(buf[0]), "%s (%s)", s->name, s->image);
++	return out;
++}
++
++const char *symfile_line(uint32_t phys) {
++	if (!loaded || !n_lines)
++		return NULL;
++	symfile_sort();
++	// Upper bound, then step back one: the last record for the address is
++	// the one that wins (see struct symfile_line).
++	size_t lo = 0, hi = n_lines;
++	while (lo < hi) {
++		size_t mid = lo + (hi - lo) / 2;
++		if (lines[mid].phys <= phys)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	if (lo > 0 && lines[lo - 1].phys == phys)
++		return lines[lo - 1].where;
++	return NULL;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++void symfile_query(const char *list) {
++	char *copy = xstrdup(list);
++	char *rest = copy;
++	while (rest && *rest) {
++		char *tok = strsep(&rest, ",");
++		if (!tok || !*tok)
++			continue;
++
++		// A number queries backwards, a name forwards.  Same 0x-or-
++		// decimal rule the rest of the address grammar uses; anything
++		// that is not a clean number is taken as a name.
++		const char *num = tok;
++		int base = 10;
++		if (num[0] == '0' && (num[1] == 'x' || num[1] == 'X')) {
++			num += 2;
++			base = 16;
++		}
++		char *end;
++		unsigned long v = strtoul(num, &end, base);
++		if (tok[0] != '@' && end != num && *end == 0) {
++			const char *where = symfile_whereis((uint32_t)v, 0);
++			const char *src = symfile_line((uint32_t)v);
++			printf("rev %05lX %s %s\n", v, where ? where : "-", src ? src : "-");
++			continue;
++		}
++
++		unsigned long off = 0;
++		const struct symfile_sym *s = symfile_resolve(tok, &off);
++		uint32_t value = s->phys + (uint32_t)off;
++		switch (s->kind) {
++		case SYMTAB_KIND_S:
++			printf("sym %s phys %05X logical %04X %s\n",
++			       s->name, value, (unsigned)(s->logical + off) & 0xffff, s->image);
++			break;
++		case SYMTAB_KIND_D:
++			printf("dp %s phys %05X logical %04X offset %02X\n",
++			       s->name, value, (unsigned)(s->logical + off) & 0xffff, s->offset);
++			break;
++		default:
++			printf("equ %s value %04X %s\n", s->name, value,
++			       (value > 0xffff) ? "physical" : "logical");
++			break;
++		}
++	}
++	free(copy);
++	exit(EXIT_SUCCESS);
++}
++
++void symfile_shutdown(void) {
++	for (size_t i = 0; i < n_syms; i++) {
++		free(syms[i].name);
++		free(syms[i].image);
++	}
++	free(syms);
++	syms = NULL;
++	n_syms = syms_alloc = 0;
++	for (size_t i = 0; i < n_lines; i++)
++		free(lines[i].where);
++	free(lines);
++	lines = NULL;
++	n_lines = lines_alloc = 0;
++	free(by_phys);
++	by_phys = NULL;
++	n_by_phys = 0;
++	free(build_id);
++	build_id = NULL;
++	loaded = 0;
++	sorted = 0;
++}
+diff --git a/src/symfile.h b/src/symfile.h
+new file mode 100644
+index 0000000..086915f
+--- /dev/null
++++ b/src/symfile.h
+@@ -0,0 +1,108 @@
++/** \file
++ *
++ *  \brief Program symbols, in physical space.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ *
++ *  `-symbols FILE` loads a symbol file emitted by the guest program's build,
++ *  after which `@Name` is accepted anywhere an address is, and everything
++ *  XRoar prints an address in can print a name beside it.
++ *
++ *  This exists because on a banked machine an address is not a place.  The
++ *  same logical $6xxx can be any of eleven overlays, so every recipe that
++ *  wanted to break on a routine had to run a host-side tool, substitute a
++ *  physical number into the command line, and then hand-correlate whatever
++ *  came back against a map.  A substitution that silently produced nothing
++ *  armed a trap on address zero, and a hex column in a flight-recorder dump
++ *  said nothing at all without that manual step.
++ *
++ *  Three rules, each one a wrong answer that has actually been given:
++ *
++ *  - **A bare name that two images define is an error**, not a first-wins
++ *    guess.  In the target program sixty-odd names are defined twice, almost
++ *    always as the resident's dispatch thunk and the overlay's real
++ *    implementation of the same routine.  Picking one silently puts a
++ *    breakpoint one indirection short of the code that was meant, in whatever
++ *    bank happened to be mapped.  Qualify as `@IMAGE:Name` and it is
++ *    unambiguous.
++ *  - **`@Name` with no symbol file loaded is a hard error** naming the
++ *    missing `-symbols`, never a silent resolve to zero.  That is the failure
++ *    the shell substitution used to produce, and inheriting it would be a
++ *    poor trade.
++ *  - **`-symbols` must precede any option that uses `@`.**  Options are
++ *    parsed in order and traps are constructed as they are seen, so a later
++ *    `-symbols` is a table that did not exist when the address was needed.
++ *
++ *  Program symbols and direct-page variables resolve PHYSICAL; equates
++ *  resolve to their value, classified by the same magnitude rule the trap
++ *  address grammar uses, because an equate is as likely to be an I/O port as
++ *  anything else.
++ */
++
++#ifndef XROAR_SYMFILE_H_
++#define XROAR_SYMFILE_H_
++
++#include <stdint.h>
++
++// A resolved @-token.  `physical` is the address-space classification the
++// trap grammar wants: 1 for a program symbol or direct-page variable (both
++// of which the symbol file records as flat physical addresses), and for an
++// equate the same magnitude rule a literal gets (<=0xffff is logical).
++struct symfile_addr {
++	uint32_t value;
++	bool physical;
++};
++
++// -symbols FILE[,build=ID].  Repeatable: symbol records and line records
++// live in separate files (a .sym and a .lines beside your build) and both
++// load through this option, dispatched on record class rather than on
++// filename.  build= states which build the caller believes the file
++// describes; a mismatch against the file's own !build id is fatal, for the
++// same reason a stale warm snapshot is.  Any error here exits: a debugging
++// session running against symbols for different code is worse than one
++// running against none.
++void symfile_load(const char *spec);
++
++// True once any symbol file has been loaded.
++bool symfile_loaded(void);
++
++// The !build id of the loaded file, or NULL.
++const char *symfile_build_id(void);
++
++// Resolve TOK if it is an @-token, i.e. "@Name", "@IMAGE:Name" or either of
++// those plus "+OFFSET" (decimal, or 0x for hex).  Returns 0 without touching
++// *OUT if TOK does not begin with '@'; exits loudly on an unknown name, an
++// ambiguous bare name, or no table loaded.
++bool symfile_resolve_token(const char *tok, struct symfile_addr *out);
++
++// Nearest symbol at or below PHYS, formatted "Name+off (IMAGE)", or NULL if
++// nothing is within MAX_DISTANCE below it (0 asks for the default).  The
++// string is one of a small rotation of static buffers, so a printf can name
++// two addresses in one call, but it is not stable across many calls.
++const char *symfile_whereis(uint32_t phys, uint32_t max_distance);
++
++// "file:line" for PHYS, or NULL.  Exact match: this is the source line whose
++// code starts at that byte, not the line whose code contains it.
++const char *symfile_line(uint32_t phys);
++
++// -symbols-query NAME[,NAME]...  Resolve each and print, then exit.  Answers
++// in both directions: an @-token or bare name resolves forward, a number
++// resolves back through symfile_whereis().  Needs no machine, which is what
++// makes it the check that this loader and the host-side reader of the same
++// file agree.
++void symfile_query(const char *list);
++
++void symfile_shutdown(void);
++
++#endif
+diff --git a/src/xroar.c b/src/xroar.c
+index 93a8a67..55beaac 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -37,6 +37,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ #ifdef WANT_GDB_TARGET
+@@ -534,6 +535,63 @@ static void remove_autosave_flag_file(void);
+ 
+ static struct cart_config *selected_cart_config;
+ 
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// -init-delay. See xroar.h for what it is for.
++
++// Master ticks are 32 bits, so anything past this would wrap the deadline and
++// delay by a fraction of what was asked -- silently, which is the worst way to
++// be wrong. Nothing sane asks for a minute before the first input.
++#define INIT_DELAY_MAX_S (60.0)
++
++uint32_t xroar_init_delay_deadline(void) {
++	static _Bool resolved = 0;
++	static event_ticks deadline;
++	if (resolved)
++		return deadline;
++	resolved = 1;
++
++	// Config is EMULATED SECONDS; the scheduler counts master ticks.
++	double seconds = xroar.cfg.kbd.init_delay;
++	if (seconds <= 0.0) {
++		deadline = event_current_tick;
++		return deadline;
++	}
++	if (seconds > INIT_DELAY_MAX_S) {
++		LOG_MOD_WARN("init-delay", "%.4f s clamped to %.1f s\n",
++			     seconds, INIT_DELAY_MAX_S);
++		seconds = INIT_DELAY_MAX_S;
++	}
++	unsigned max = (unsigned)(seconds * (double)EVENT_TICK_RATE);
++	unsigned delay = max;
++	if (xroar.cfg.kbd.init_delay_random) {
++		unsigned seed = xroar.cfg.kbd.init_delay_seed;
++		if (seed == 0) {
++			// Nanoseconds, not seconds. Two runs launched back to back
++			// in a loop -- which is exactly how this gets used -- share
++			// a wall-clock second and often have near pids, and seeding
++			// from those gave visibly clustered first draws. The
++			// nanosecond field decorrelates them.
++			struct timespec ts;
++			clock_gettime(CLOCK_REALTIME, &ts);
++			seed = (unsigned)ts.tv_nsec * 2654435761u;
++			seed ^= (unsigned)ts.tv_sec;
++			seed ^= (unsigned)getpid() << 16;
++		}
++		srand(seed);
++		delay = (unsigned)(rand() % ((int)max + 1));
++		// PRINT, not DEBUG: this line is the run's record of which delay
++		// it actually got. A run whose whole purpose is to vary is not
++		// reproducible without it, and a harness that captures the log
++		// should not have to be told to raise the log level first.
++		LOG_MOD_PRINT("init-delay", "%.4f s (random in [0,%.4f], seed %u)\n",
++			      (double)delay / (double)EVENT_TICK_RATE, seconds, seed);
++	} else {
++		LOG_MOD_PRINT("init-delay", "%.4f s (fixed)\n", seconds);
++	}
++	deadline = event_current_tick + delay;
++	return deadline;
++}
++
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ /* Default configuration */
+@@ -4820,6 +4878,9 @@ static struct xconfig_option const xroar_options[] = {
+ 	/* Emulator actions: */
+ 	{ XC_SET_BOOL("ratelimit", &private_cfg.debug.ratelimit) },
+ 	{ XC_SET_STRING_LIST("type", &private_cfg.kbd.type_list) },
++	{ XC_SET_DOUBLE("init-delay", &xroar.cfg.kbd.init_delay) },
++	{ XC_SET_BOOL("init-delay-random", &xroar.cfg.kbd.init_delay_random) },
++	{ XC_SET_INT("init-delay-seed", (int *)&xroar.cfg.kbd.init_delay_seed) },
+ 
+ 	/* Debugging: */
+ 	{ XC_SET_INT("debug-fdc", &logging.debug_fdc) },
+@@ -5002,6 +5063,9 @@ static void helptext(void) {
+ "  -kbd-translate          enable keyboard translation\n"
+ "  -type STRING            intercept ROM calls to type STRING into BASIC\n"
+ "  -load-text FILE         type FILE into BASIC\n"
++"  -init-delay S           hold the first scripted input S seconds (e.g. 0.1)\n"
++"  -init-delay-random      make that delay uniform in [0,S], for entropy\n"
++"  -init-delay-seed N      seed the random delay (0 = clock and pid)\n"
+ "\n"
+ 
+ " Joysticks:\n"
+@@ -5268,6 +5332,9 @@ static void config_print_all(FILE *f, bool all) {
+ 	xroar_cfg_print_string(f, all, "load-tape", private_cfg.file.tape, NULL);
+ 	xroar_cfg_print_string(f, all, "tape-write", private_cfg.file.tape_write, NULL);
+ 	xroar_cfg_print_string(f, all, "load-text", private_cfg.file.text, NULL);
++	xroar_cfg_print_double(f, all, "init-delay", xroar.cfg.kbd.init_delay, 0.0);
++	xroar_cfg_print_bool(f, all, "init-delay-random", xroar.cfg.kbd.init_delay_random, 0);
++	xroar_cfg_print_int(f, all, "init-delay-seed", (int)xroar.cfg.kbd.init_delay_seed, 0);
+ 	fputs("\n", f);
+ 
+ 	fputs("# Cassettes\n", f);
+diff --git a/src/xroar.h b/src/xroar.h
+index 6fa67ef..5dbd2b8 100644
+--- a/src/xroar.h
++++ b/src/xroar.h
+@@ -99,6 +99,38 @@ struct xroar_cfg {
+ 	// Keyboard
+ 	struct {
+ 		struct slist *bind_list;
++
++		// -init-delay S: hold the harness back for S EMULATED SECONDS
++		// before it delivers its FIRST input, by ANY route -- an
++		// auto-typed character from -type or -load-text, or the first
++		// step of an -input-script. Fractional, so 0.35 is a third of a
++		// second. Seconds and not ticks or cycles on purpose: this file
++		// already has two tick counters that differ by sixteen (master
++		// ticks at 14318180/s, and the CPU cycles -trap-cycle-print
++		// prints), and a delay expressed in either invites reading it as
++		// the other. Emulated seconds are what the operator means.
++		//
++		// The point is entropy, not pacing. A headless run is otherwise
++		// perfectly repeatable: the guest sees its first input at the same
++		// tick every single time, so anything it seeds from a timer at
++		// that moment produces the same value on every run, and a program
++		// whose behaviour is meant to vary does not. -init-delay-random
++		// makes the delay uniform in [0,S] instead of exactly S, which
++		// puts that variation back.
++		//
++		// ONE deadline, shared. It was -type-delay and reached only the
++		// auto-typer, which meant it silently did nothing on the main
++		// automation path -- an -input-script run got no entropy at all,
++		// because the script's own timeline never consulted it. Both paths
++		// now wait on the same absolute tick, resolved once by whoever
++		// asks first.
++		double init_delay;
++		_Bool init_delay_random;
++		// Seed for the random variant. 0 (the default) seeds from the
++		// wall clock and the pid, i.e. genuinely different per run; set
++		// it to reproduce a specific run. Either way the chosen delay is
++		// logged, so a run that finds something can be repeated.
++		unsigned init_delay_seed;
+ 	} kbd;
+ 
+ 	// Becker port
+@@ -212,6 +244,14 @@ extern uint64_t xroar_master_cycles;
+ struct ui_interface *xroar_init(int argc, char **argv);
+ 
+ /// Finish initialisation (sets first machine options, attaches media).
++// The absolute tick before which no scripted input is delivered. Resolved on
++// the FIRST call -- which is the first moment the harness would have delivered
++// anything by any route -- and the same value thereafter, so the auto-typer
++// and -input-script cannot disagree about when the run starts. Returns an
++// event_ticks (events.h); declared as uint32_t here to keep this header from
++// depending on it.
++uint32_t xroar_init_delay_deadline(void);
++
+ void xroar_init_finish(void);
+ 
+ /// Cleanly shut down before program exit.

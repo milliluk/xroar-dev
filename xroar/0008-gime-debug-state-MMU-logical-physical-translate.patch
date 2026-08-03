@@ -1,0 +1,63 @@
+From dbaead2f1690d2baeab2e9020a7523d46ac1efd8 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:41 -0400
+Subject: [PATCH 08/44] gime-debug-state: MMU logical->physical translate +
+
+---
+ src/tcc1014/tcc1014.c | 21 +++++++++++++++++++++
+ src/tcc1014/tcc1014.h | 10 ++++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/src/tcc1014/tcc1014.c b/src/tcc1014/tcc1014.c
+index a609ff3..33ed3f4 100644
+--- a/src/tcc1014/tcc1014.c
++++ b/src/tcc1014/tcc1014.c
+@@ -834,6 +834,27 @@ void tcc1014_mem_cycle(void *sptr, bool RnW, uint16_t A) {
+ // breakpoint refers to ROM.  Unlike SAM equivalent, RnW doesn't affect the
+ // result.
+ 
++unsigned tcc1014_logical_to_physical(struct TCC1014 *gimep, uint16_t A) {
++	struct TCC1014_private *gime = (struct TCC1014_private *)gimep;
++	_Bool use_mmu = gime->MMUEN;
++	// $FE00-$FFFF is locked to the top of physical RAM when MC3 is set,
++	// regardless of task state (matches the live decode path).
++	if (A >= 0xfe00 && gime->MC3) {
++		use_mmu = 0;
++	}
++	unsigned bank = use_mmu ? gime->mmu_bank[gime->TR | (A >> 13)]
++	                        : (0x38 | (A >> 13));
++	return (bank << 13) | (A & 0x1fff);
++}
++
++// TR is 0 (task one) or 8 (task two) -- it's the bit already pre-shifted
++// into bank-table-index position ($FFA0-$FFA7 vs $FFA8-$FFAF). Report the
++// plain 0/1 task number, not the raw register bit.
++unsigned tcc1014_get_task(struct TCC1014 *gimep) {
++	struct TCC1014_private *gime = (struct TCC1014_private *)gimep;
++	return (gime->TR >> 3) & 1;
++}
++
+ unsigned tcc1014_decode(struct TCC1014 *gimep, uint16_t A) {
+ 	struct TCC1014_private *gime = (struct TCC1014_private *)gimep;
+ 	if (A < 0xff00) {
+diff --git a/src/tcc1014/tcc1014.h b/src/tcc1014/tcc1014.h
+index 9dd87d0..1071841 100644
+--- a/src/tcc1014/tcc1014.h
++++ b/src/tcc1014/tcc1014.h
+@@ -91,6 +91,16 @@ void tcc1014_reset(struct TCC1014 *gimep);
+ void tcc1014_mem_cycle(void *sptr, bool RnW, uint16_t A);
+ 
+ unsigned tcc1014_decode(struct TCC1014 *, uint16_t A);
++
++// Translate a logical CPU address to the physical RAM address the GIME
++// currently maps it to, following the same bank decode as the live bus
++// cycle (tcc1014_mem_cycle).  Read-only: does not touch S/RAS/Z or fire any
++// side effects.  Result is (bank << 13) | (A & 0x1fff).
++unsigned tcc1014_logical_to_physical(struct TCC1014 *, uint16_t A);
++
++// Current MMU task select: 0 = task one (registers $FFA0-$FFA7), 1 = task
++// two ($FFA8-$FFAF).  Mirrors the live $FF91 TR bit (gdb $task register).
++unsigned tcc1014_get_task(struct TCC1014 *);
+ void tcc1014_set_sam_register(struct TCC1014 *gimep, unsigned val);
+ 
+ void tcc1014_set_inverted_text(struct TCC1014 *gimep, bool);

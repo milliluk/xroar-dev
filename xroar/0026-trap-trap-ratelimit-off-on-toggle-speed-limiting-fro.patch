@@ -1,0 +1,72 @@
+From 6da30619a07123fbfa5c1fd4b5c0a457bec39f97 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:20 -0400
+Subject: [PATCH 26/44] trap: -trap-ratelimit-off/on toggle speed limiting from
+
+---
+ src/xroar.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index 70b0722..897bf1e 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -146,6 +146,8 @@ struct trap_def {
+ 	int cycle_reset;    // reset CPU cycle counter when trap fires
+ 	int cycle_print;    // print CPU cycle counter when trap fires
+ 	char *load_spec;    // -trap-load FILE[,opts]; see load_blob()
++	int ratelimit_off;  // -trap-ratelimit-off: run unrestricted from this trap
++	int ratelimit_on;   // -trap-ratelimit-on: back to real time from this trap
+ 
+ 	// Internal
+ 	unsigned long counter;
+@@ -4067,6 +4069,16 @@ static void handle_trap(void *sptr) {
+ 		LOG_MOD_DEBUG(2, "trap", "trace off\n");
+ 		xroar_set_trace(0, 0);
+ 	}
++	if (trap->ratelimit_off) {
++		// Pure pacing: flipping the ratelimit latch cannot alter the
++		// emulated tick sequence, only how fast wall time passes.
++		LOG_MOD_DEBUG(2, "trap", "ratelimit off\n");
++		ui_update_state(-1, ui_tag_ratelimit_latch, 0, NULL);
++	}
++	if (trap->ratelimit_on) {
++		LOG_MOD_DEBUG(2, "trap", "ratelimit on\n");
++		ui_update_state(-1, ui_tag_ratelimit_latch, 1, NULL);
++	}
+ 
+ 	// Cycle counter actions.  Print before reset so -trap-cycle-print-reset
+ 	// reports the elapsed count and then zeroes it.  The reset/print is
+@@ -4212,6 +4224,14 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->load_spec = private_cfg.debug.trap_def.load_spec;
+ 			private_cfg.debug.trap_def.load_spec = NULL;
+ 		}
++		if (private_cfg.debug.trap_def.ratelimit_off) {
++			cur_trap_def->ratelimit_off = 1;
++			private_cfg.debug.trap_def.ratelimit_off = 0;
++		}
++		if (private_cfg.debug.trap_def.ratelimit_on) {
++			cur_trap_def->ratelimit_on = 1;
++			private_cfg.debug.trap_def.ratelimit_on = 0;
++		}
+ 	}
+ 	if (cond) {
+ 		unsigned i = num_trap_defs++;
+@@ -4486,6 +4506,8 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT("profile-hist", &profile_hist_top) },
+ 	{ XC_SET_STRING("profile-out", &profile_out_path) },
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
++	{ XC_SET_INT1("trap-ratelimit-off", &private_cfg.debug.trap_def.ratelimit_off) },
++	{ XC_SET_INT1("trap-ratelimit-on", &private_cfg.debug.trap_def.ratelimit_on) },
+ 	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
+ 	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
+ 	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
+@@ -4748,6 +4770,8 @@ static void helptext(void) {
+ "  -profile-out FILE     write the profile report here (default stderr)\n"
+ "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
+ "    -trap-snap FILE     write snapshot at trap\n"
++"    -trap-ratelimit-off run unrestricted from this trap (wall clock only; cycle-exact)\n"
++"    -trap-ratelimit-on  back to real time from this trap\n"
+ "    -trap-ram FILE      write flat physical RAM at trap (see -export-ram)\n"
+ "    -export-ram FILE    dump flat physical RAM of -load snapshot, then exit\n"
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"

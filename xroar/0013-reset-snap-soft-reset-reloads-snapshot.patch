@@ -1,0 +1,59 @@
+From 05431bd7b3db468c409423a97dd2dc95fe6266e8 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:51 -0400
+Subject: [PATCH 13/44] reset-snap: soft reset reloads snapshot;
+
+---
+ src/xroar.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index 365f22a..799a261 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -228,6 +228,8 @@ struct private_cfg {
+ 		char *tape_write;  // output tape
+ 		char *text;  // text typed from file
+ 		char *snapshot;  // snapshot
++		_Bool reset_snap;  // -reset-snap: soft reset reloads .snapshot
++		char *reset_snap_file;  // -reset-snap-filename: explicit reset target, no -load needed
+ 	} file;
+ 
+ 	// User interface
+@@ -2443,6 +2445,18 @@ void xroar_eject_output_tape(void) {
+ 
+ void xroar_soft_reset(void) {
+ 	if (xroar.machine) {
++		// -reset-snap: a soft reset reverts to the snapshot that was loaded
++		// with -load, instead of a bare machine reset.  -reset-snap-filename
++		// names an explicit target that needs no -load (it can be a file the
++		// run wrote itself via -trap-snap), and wins over the -load snapshot
++		// when both are present.  Falls back to a normal reset if no target
++		// is available or it can't be re-read.  Hard reset is deliberately
++		// left as a true cold boot.
++		char *reset_target = private_cfg.file.reset_snap_file;
++		if (!reset_target && private_cfg.file.reset_snap)
++			reset_target = private_cfg.file.snapshot;
++		if (reset_target && read_snapshot(reset_target) >= 0)
++			return;
+ 		xroar.machine->reset(xroar.machine, RESET_SOFT);
+ 	}
+ }
+@@ -3233,6 +3247,8 @@ static struct xconfig_option const xroar_options[] = {
+ 
+ 	/* Files: */
+ 	{ XC_CALL_STRING_NE("load", &add_load) },
++	{ XC_SET_BOOL("reset-snap", &private_cfg.file.reset_snap) },
++	{ XC_SET_STRING_NE("reset-snap-filename", &private_cfg.file.reset_snap_file) },
+ 	{ XC_CALL_STRING_NE("run", &add_run) },
+ 	{ XC_SET_STRING_NE("load-fd0", &private_cfg.file.fd[0]) },
+ 	{ XC_SET_STRING_NE("load-fd1", &private_cfg.file.fd[1]) },
+@@ -3515,6 +3531,8 @@ static void helptext(void) {
+ 
+ " Files:\n"
+ "  -load FILE            load or attach FILE\n"
++"  -reset-snap          soft reset reloads the -load snapshot (hard reset = cold boot)\n"
++"  -reset-snap-filename FILE  soft reset reloads FILE (no -load needed; overrides -reset-snap target)\n"
+ "  -run FILE             load or attach FILE and attempt autorun\n"
+ "  -load-fdX FILE        insert disk image FILE into floppy drive X (0-3)\n"
+ "  -load-hdX FILE        use hard disk image FILE as drive X (0-1, e.g. for ide)\n"

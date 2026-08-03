@@ -1,0 +1,64 @@
+From f91ecb0e64b769a971292e4a820b12ac308fdc21 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:35 -0400
+Subject: [PATCH 05/44] macosx: kAudioObjectPropertyElementMain, renamed in 12
+
+kAudioObjectPropertyElementMaster was renamed to ...Main in macOS 12 and the
+old spelling is deprecated, so every macOS build warns:
+
+  ao_macosx.c:94: 'kAudioObjectPropertyElementMaster' is deprecated: first
+                  deprecated in macOS 12.0
+
+Use the new name, guarded so SDKs older than 12 -- which do not have it -- keep
+building.
+
+THE GUARD CANNOT BE #ifndef, and the first version of this patch got that wrong
+in a way worth recording. The new name is an **enum constant**, not a macro, so
+`#ifndef kAudioObjectPropertyElementMain` is true even on an SDK that defines
+it. That version therefore defined the new name back to the deprecated one on
+every system: the source read "Main", the compiler saw "Master", and the
+warning it was written to remove survived it -- now pointing at the macro,
+which is the only reason anyone noticed.
+
+Gate on the SDK version instead. MAC_OS_VERSION_12_0 comes from
+<AvailabilityMacros.h> and is defined only by SDKs new enough to have the
+rename, which is exactly the condition being tested.
+
+Upstream's warning, not ours; fixed here for the same reason as the texinfo
+warnings in patch 3.
+---
+ src/macosx/ao_macosx.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/macosx/ao_macosx.c b/src/macosx/ao_macosx.c
+index 259a307..f378785 100644
+--- a/src/macosx/ao_macosx.c
++++ b/src/macosx/ao_macosx.c
+@@ -30,6 +30,18 @@
+ #include <string.h>
+ 
+ #include <CoreAudio/AudioHardware.h>
++#include <AvailabilityMacros.h>
++
++// kAudioObjectPropertyElementMaster was renamed ...Main in macOS 12 and the
++// old spelling is deprecated.  The new name is an ENUM CONSTANT, not a macro,
++// so #ifndef cannot test for it -- an earlier attempt at this used #ifndef,
++// which is always true, and therefore #defined the new name back to the
++// deprecated one.  The code then read "Main" and compiled to "Master", and
++// the warning it was meant to remove survived it.  Gate on the SDK version
++// instead: MAC_OS_VERSION_12_0 is defined only by SDKs that have the rename.
++#if !defined(MAC_OS_VERSION_12_0)
++#define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
++#endif
+ 
+ #include "xalloc.h"
+ 
+@@ -91,7 +103,7 @@ static void *new(void *cfg) {
+ 
+ 	propertyAddress.mSelector = kAudioHardwarePropertyDefaultOutputDevice;
+ 	propertyAddress.mScope = kAudioObjectPropertyScopeGlobal;
+-	propertyAddress.mElement = kAudioObjectPropertyElementMaster;
++	propertyAddress.mElement = kAudioObjectPropertyElementMain;
+ 
+ 	propertySize = sizeof(aomacosx->device);
+ 	if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &propertySize, &aomacosx->device) != noErr) {

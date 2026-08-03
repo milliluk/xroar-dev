@@ -1,0 +1,268 @@
+From 003189adf8d967dd1868edfeee381491187a37d7 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:16 -0400
+Subject: [PATCH 24/44] emuext: physical-PC profiler
+
+---
+ src/xroar.c | 206 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 206 insertions(+)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index fbb3a42..52fdfca 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -205,6 +205,43 @@ static void trap_history_dump(void);
+ static void trap_xpcrange_check(void *, uint32_t A);
+ static void trap_fast_parts_refresh(void);
+ 
++// -profile-range NAME=LO-HI: a physical-PC trampoline/thunk profiler, and a
++// sibling of -trap-history.  It reuses the same ambient any-address fetch hook
++// and the cached trap_fast_phys_pc(), so it pays one MMU translation per
++// instruction while armed and nothing when off.  Each named range accumulates
++// edge-triggered entries, instructions executed inside, and CPU cycles spent
++// inside (the master tick delta between fetches, attributed to the instruction
++// that spent it).  -profile-hist N adds a per-physical-PC hit+cycle table for
++// discovering hot spots you did not name.  Dumped once at shutdown.
++#define PROFILE_MAX_RANGES 64
++#define PROFILE_PADDR_SPAN 0x80000     // 512K physical address space
++struct profile_range {
++	char *name;
++	unsigned long lo, hi;               // physical [lo,hi], inclusive
++	unsigned long entries;              // edge-triggered arrivals into the range
++	unsigned long instrs;               // instruction fetches with PC inside
++	unsigned long long cycles;          // master-tick cycles attributed inside
++};
++static struct profile_range profile_ranges[PROFILE_MAX_RANGES];
++static int profile_num_ranges = 0;
++static int profile_hist_top = 0;              // -profile-hist N: report top N PCs
++static char *profile_out_path = NULL;         // -profile-out FILE (default stderr)
++static uint32_t *profile_hist_hits = NULL;    // [PROFILE_PADDR_SPAN] hits
++static unsigned long long *profile_hist_cyc = NULL; // [PROFILE_PADDR_SPAN] cycles
++static struct breakpoint profile_bp;
++static _Bool profile_installed = 0;
++static int profile_prev_range = -1;           // range inside on the last fetch
++static long profile_prev_pc = -1;             // physical PC of the last fetch
++static uint32_t profile_prev_tick = 0;        // event_current_tick at last fetch
++static unsigned long long profile_total_instrs = 0;
++static unsigned long long profile_total_cycles = 0;
++static void profile_record(void *);
++static void profile_add_range(const char *);  // XC_CALL_STRING callback
++static void profile_dump(void);
++static _Bool profile_active(void) {
++	return profile_num_ranges > 0 || profile_hist_top > 0;
++}
++
+ #else
+ 
+ #define set_trap(s)
+@@ -1637,6 +1674,7 @@ void xroar_shutdown(void) {
+ 	shutting_down = 1;
+ 	screenshot_flush(xroar.vo_interface);
+ 	disable_all_traps();
++	profile_dump();
+ 	save_config();
+ 	messenger_shutdown();
+ 	if (xroar.auto_kbd) {
+@@ -3559,6 +3597,25 @@ static void enable_all_traps(void) {
+ 		machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
+ 		trap_history_installed = 1;
+ 	}
++	// -profile-range / -profile-hist: one more ambient any-address hook,
++	// installed once per machine connect.  Histogram tables are allocated
++	// here on first install and kept across a reconnect, like the ring.
++	if (profile_active() && !profile_installed && xroar.machine) {
++		struct bp_session *bps = xroar.machine->get_interface(xroar.machine, "bp-session");
++		if (bps) {
++			if (profile_hist_top > 0 && !profile_hist_hits) {
++				profile_hist_hits = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_hits));
++				profile_hist_cyc  = xzalloc(PROFILE_PADDR_SPAN * sizeof(*profile_hist_cyc));
++			}
++			profile_bp = (struct breakpoint){
++				.address = 0x0000,
++				.address_end = 0xffff,
++				.handler = DELEGATE_AS0(void, profile_record, NULL),
++			};
++			bp_add_range(bps, &profile_bp);
++			profile_installed = 1;
++		}
++	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+ 		enable_trap(&trap_defs[i], 1);
+ 	}
+@@ -3569,6 +3626,12 @@ static void disable_all_traps(void) {
+ 		machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
+ 		trap_history_installed = 0;
+ 	}
++	if (profile_installed && xroar.machine) {
++		struct bp_session *bps = xroar.machine->get_interface(xroar.machine, "bp-session");
++		if (bps)
++			bp_remove(bps, &profile_bp);
++		profile_installed = 0;
++	}
+ 	for (unsigned i = 0; i < num_trap_defs; ++i) {
+ 		enable_trap(&trap_defs[i], 0);
+ 	}
+@@ -3693,6 +3756,142 @@ static void trap_history_dump(void) {
+ 	}
+ }
+ 
++// -profile-range: one physical PC per instruction fetch.  Attribute the
++// just-elapsed instruction's cycles to wherever the PC sat on the PREVIOUS
++// fetch, so cost lands on the instruction that spent it, then classify this
++// fetch.  Ranges are disjoint in practice, so a PC matches at most one; a
++// range-to-range transition counts as an entry into the new range, which is
++// what "traversed the trampoline" means.
++static void profile_record(void *sptr) {
++	(void)sptr;
++	uint32_t now = (uint32_t)event_current_tick;
++	if (profile_prev_pc >= 0) {
++		uint32_t delta = now - profile_prev_tick;   // unsigned wrap = correct delta
++		if (profile_prev_range >= 0)
++			profile_ranges[profile_prev_range].cycles += delta;
++		if (profile_hist_cyc)
++			profile_hist_cyc[(unsigned long)profile_prev_pc & (PROFILE_PADDR_SPAN - 1)] += delta;
++		profile_total_cycles += delta;
++	}
++	profile_prev_tick = now;
++	long phys = trap_fast_phys_pc();
++	if (phys < 0) { profile_prev_pc = -1; profile_prev_range = -1; return; }
++	int r = -1;
++	for (int i = 0; i < profile_num_ranges; ++i) {
++		if ((unsigned long)phys >= profile_ranges[i].lo &&
++		    (unsigned long)phys <= profile_ranges[i].hi) { r = i; break; }
++	}
++	if (r >= 0) {
++		if (r != profile_prev_range)
++			profile_ranges[r].entries++;
++		profile_ranges[r].instrs++;
++	}
++	if (profile_hist_hits)
++		profile_hist_hits[(unsigned long)phys & (PROFILE_PADDR_SPAN - 1)]++;
++	profile_total_instrs++;
++	profile_prev_range = r;
++	profile_prev_pc = phys;
++}
++
++// -profile-range NAME=LO-HI (repeatable).  LO/HI are physical addresses,
++// 0x-prefixed or bare hex, inclusive.  A bare LO with no dash is a one-byte
++// range.  Duplicate names are allowed; the caller resolves symbols to
++// physical with cmaddr.py and passes the numbers.
++static void profile_add_range(const char *spec) {
++	if (profile_num_ranges >= PROFILE_MAX_RANGES) {
++		LOG_MOD_WARN("profile", "too many -profile-range (max %d), ignoring %s\n",
++		             PROFILE_MAX_RANGES, spec);
++		return;
++	}
++	const char *eq = strchr(spec, '=');
++	if (!eq || eq == spec) {
++		LOG_MOD_WARN("profile", "-profile-range %s: want NAME=LO[-HI]\n", spec);
++		return;
++	}
++	char *name = xstrndup(spec, (size_t)(eq - spec));
++	const char *rng = eq + 1;
++	char *dash = NULL;
++	unsigned long lo = strtoul(rng, &dash, 16);
++	unsigned long hi = lo;
++	if (dash && *dash == '-')
++		hi = strtoul(dash + 1, NULL, 16);
++	if (lo > 0x7ffff || hi > 0x7ffff || hi < lo) {
++		LOG_MOD_WARN("profile", "-profile-range %s: bad physical range\n", spec);
++		free(name);
++		return;
++	}
++	struct profile_range *pr = &profile_ranges[profile_num_ranges++];
++	pr->name = name;
++	pr->lo = lo; pr->hi = hi;
++	pr->entries = pr->instrs = 0; pr->cycles = 0;
++}
++
++static int profile_range_cmp(const void *a, const void *b) {
++	const struct profile_range *x = a, *y = b;
++	if (x->cycles < y->cycles) return 1;
++	if (x->cycles > y->cycles) return -1;
++	return 0;
++}
++
++// Dump the profile once, at shutdown.  Ranges sorted by cycles descending;
++// then, if -profile-hist, the top-N hottest physical PCs by cycles.
++static void profile_dump(void) {
++	if (!profile_active())
++		return;
++	FILE *f = stderr;
++	if (profile_out_path) {
++		FILE *o = fopen(profile_out_path, "w");
++		if (o) f = o;
++		else LOG_MOD_WARN("profile", "-profile-out %s: %s; using stderr\n",
++		                  profile_out_path, strerror(errno));
++	}
++	fprintf(f, "profile: %llu instructions, %llu cycles total\n",
++	        profile_total_instrs, profile_total_cycles);
++	if (profile_num_ranges > 0) {
++		struct profile_range sorted[PROFILE_MAX_RANGES];
++		memcpy(sorted, profile_ranges, (size_t)profile_num_ranges * sizeof(sorted[0]));
++		qsort(sorted, (size_t)profile_num_ranges, sizeof(sorted[0]), profile_range_cmp);
++		fprintf(f, "profile: %-20s %10s %12s %14s %7s %10s\n",
++		        "range", "entries", "instrs", "cycles", "cyc%%", "cyc/entry");
++		for (int i = 0; i < profile_num_ranges; ++i) {
++			struct profile_range *pr = &sorted[i];
++			double pct = profile_total_cycles
++			           ? 100.0 * (double)pr->cycles / (double)profile_total_cycles : 0.0;
++			double per = pr->entries ? (double)pr->cycles / (double)pr->entries : 0.0;
++			fprintf(f, "profile: %-20s %10lu %12lu %14llu %6.2f%% %10.1f\n",
++			        pr->name, pr->entries, pr->instrs, pr->cycles, pct, per);
++		}
++	}
++	if (profile_hist_top > 0 && profile_hist_cyc) {
++		// Selection of the top N by cycles without sorting 512K entries:
++		// a simple running top-N insert, N is tiny.
++		int N = profile_hist_top;
++		long *top = xmalloc((size_t)N * sizeof(*top));
++		int have = 0;
++		for (long p = 0; p < PROFILE_PADDR_SPAN; ++p) {
++			unsigned long long c = profile_hist_cyc[p];
++			if (c == 0) continue;
++			// insert p into the descending-by-cycles top list
++			int pos = have;
++			while (pos > 0 && profile_hist_cyc[top[pos - 1]] < c) pos--;
++			if (pos < N) {
++				int last = (have < N ? have : N - 1);
++				for (int k = last; k > pos; --k) top[k] = top[k - 1];
++				top[pos] = p;
++				if (have < N) have++;
++			}
++		}
++		fprintf(f, "profile: top %d physical PCs by cycles:\n", have);
++		fprintf(f, "profile: %-10s %12s %14s\n", "paddr", "hits", "cycles");
++		for (int i = 0; i < have; ++i)
++			fprintf(f, "profile: 0x%05lX   %12u %14llu\n",
++			        top[i], profile_hist_hits ? profile_hist_hits[top[i]] : 0u,
++			        profile_hist_cyc[top[i]]);
++		free(top);
++	}
++	if (f != stderr) fclose(f);
++}
++
+ // xpcrange= edge detector, called on every instruction fetch while armed.
+ // Fires the moment the physical PC ENTERS [lo,hi]; staying inside does not
+ // re-fire, leaving re-arms.  Level-triggering would fire on every
+@@ -4249,6 +4448,9 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_CALL_STRING("trap", &set_trap) },
+ 	{ XC_CALL_STRING("trap-range", &set_trap_count) },
+ 	{ XC_SET_INT("trap-history", &trap_history_size) },
++	{ XC_CALL_STRING("profile-range", &profile_add_range) },
++	{ XC_SET_INT("profile-hist", &profile_hist_top) },
++	{ XC_SET_STRING("profile-out", &profile_out_path) },
+ 	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
+ 	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
+ 	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
+@@ -4504,6 +4706,10 @@ static void helptext(void) {
+ #ifdef WANT_TRAPS
+ "  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
+ "  -trap-history N       ring of last N executed physical PCs; dump on any trap\n"
++"  -profile-range NAME=LO-HI  count fetches and cycles in a physical range\n"
++"                          (repeatable; LO/HI hex or @Symbol from -symbols)\n"
++"  -profile-hist N       also report the top N physical PCs by cycles\n"
++"  -profile-out FILE     write the profile report here (default stderr)\n"
+ "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
+ "    -trap-snap FILE     write snapshot at trap\n"
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"

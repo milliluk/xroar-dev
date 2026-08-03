@@ -1,0 +1,13 @@
+# The payload of this repo is unified diffs applied to LF sources extracted
+# from a tarball. A checkout with core.autocrlf=true -- the default on Windows,
+# and what GitHub's windows-latest runners use -- rewrites the patch files to
+# CRLF, and `patch -p1` then fails to match a single line. Pin them.
+*.patch     -text
+*.diff      -text
+*.tar.gz    binary
+
+# Built by bash on every platform, including msys2.
+*.sh        text eol=lf
+
+*.md        text
+*.py        text

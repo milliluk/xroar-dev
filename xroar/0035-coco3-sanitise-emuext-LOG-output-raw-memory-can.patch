@@ -1,0 +1,50 @@
+From 51b2a04740364b6c3618f4251a8a40901e4634cf Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:39 -0400
+Subject: [PATCH 35/44] coco3: sanitise emuext LOG output -- raw memory can
+
+---
+ src/coco3.c | 27 ++++++++++++++++++++++++---
+ 1 file changed, 24 insertions(+), 3 deletions(-)
+
+diff --git a/src/coco3.c b/src/coco3.c
+index ae6554e..f025e2b 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -1225,12 +1225,33 @@ static void coco3_emushot(void *sptr, const char *arg) {
+ }
+ 
+ // lwasm emuext LOG ($103E).  The core has already formatted the text; emit it
+-// verbatim to stderr and, with -emuext and a client attached, mirror it to the
+-// gdb console.
++// to stderr (sanitised -- see below) and, with -emuext and a client attached,
++// mirror the RAW text to the gdb console.
++//
++// This fires whenever the CPU executes the byte pair $10 $3E, regardless of
++// -emuext: on real hardware that pair is the ordinary SWI2 opcode, so it can
++// appear in perfectly innocent data, and self-modifying-code bugs can walk
++// the PC into raw data and hit it by accident (this has happened to us: a
++// signed-index bug that let a driver overwrite its own code with raster
++// bytes, some of which decoded as $10 $3E). The "format string" in that case
++// is arbitrary memory, not real log text, and can contain anything --
++// including live ANSI escape sequences, which previously went straight to
++// stderr unfiltered and could leave a real terminal in a corrupted state on
++// an otherwise completely normal exit. Escape anything that isn't printable
++// ASCII (keeping \n and \t, since real multi-line debug text uses them) so
++// garbage is visible as garbage instead of executing as terminal control
++// codes. The unsanitised text still reaches gdb's console (a text widget,
++// not a terminal, so this class of corruption can't happen there).
+ static void coco3_emulog(void *sptr, const char *s) {
+ 	struct coco3 *mcc3 = sptr;
+ 	(void)mcc3;
+-	fprintf(stderr, "%s", s);
++	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
++		if (*p == '\n' || *p == '\t' || (*p >= 0x20 && *p < 0x7f)) {
++			fputc(*p, stderr);
++		} else {
++			fprintf(stderr, "\\x%02x", *p);
++		}
++	}
+ 	fflush(stderr);
+ #ifdef WANT_GDB_TARGET
+ 	if (xroar.cfg.debug.emuext && mcc3->gdb_interface

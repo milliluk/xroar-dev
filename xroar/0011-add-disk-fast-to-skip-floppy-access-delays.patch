@@ -1,0 +1,84 @@
+From 3a104bc25a4e5cc0dcac134087a3553a7da45176 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:40:47 -0400
+Subject: [PATCH 11/44] add -disk-fast to skip floppy access delays
+
+---
+ src/wd279x.c | 16 +++++++++++++++-
+ src/xroar.c  |  3 +++
+ src/xroar.h  |  5 +++++
+ 3 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/wd279x.c b/src/wd279x.c
+index 290fa09..47ffe6a 100644
+--- a/src/wd279x.c
++++ b/src/wd279x.c
+@@ -124,9 +124,23 @@ static const char * const wd279x_type_name[4] = {
+ 		DELEGATE_CALL((fdc)->set_intrq, 0); \
+ 	} while (0)
+ 
++// Fast-floppy delay clamp. When -disk-fast is set, every scheduled FDC delay
++// is capped at the native byte-transfer time (W_BYTE_TIME). The mechanical
++// delays -- seek stepping (EVENT_MS 6..30), head settle (EVENT_MS 30), and
++// rotational latency to the next ID mark / index pulse (up to a full ~200ms
++// revolution) -- are all hundreds to thousands of times W_BYTE_TIME, so they
++// collapse to effectively instant. The byte-transfer delays already equal
++// W_BYTE_TIME, so the cap leaves them untouched: DRQ stays paced at the native
++// data rate and no LOST_DATA can result on any DOS, HALT-driven or polled.
++static inline event_ticks wd279x_dt(event_ticks t) {
++	if (xroar.cfg.disk.fast && t > (event_ticks)W_BYTE_TIME)
++		return (event_ticks)W_BYTE_TIME;
++	return t;
++}
++
+ #define NEXT_STATE(fdc,s,t) do { \
+ 		(fdc)->state = (s); \
+-		event_queue_dt(&(fdc)->state_event, (t)); \
++		event_queue_dt(&(fdc)->state_event, wd279x_dt(t)); \
+ 	} while (0)
+ 
+ #define SET_STATE(fdc,s) (fdc)->state = (s)
+diff --git a/src/xroar.c b/src/xroar.c
+index e78c1e8..fc0565c 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -3261,6 +3261,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_BOOL("disk-write-back", &xroar.cfg.disk.write_back) },
+ 	{ XC_SET_BOOL("disk-auto-os9", &xroar.cfg.disk.auto_os9) },
+ 	{ XC_SET_BOOL("disk-auto-sd", &xroar.cfg.disk.auto_sd) },
++	{ XC_SET_BOOL("disk-fast", &xroar.cfg.disk.fast) },
+ 
+ 	/* Firmware ROM images: */
+ 	{ XC_SET_STRING_NE("rompath", &xroar.cfg.file.rompath) },
+@@ -3476,6 +3477,7 @@ static void helptext(void) {
+ "  -no-disk-write-back   don't default to enabling write-back for disk images\n"
+ "  -no-disk-auto-os9     don't try to detect headerless OS-9 JVC disk images\n"
+ "  -no-disk-auto-sd      don't assume single density for 10 sec/track disks\n"
++"  -disk-fast            skip FDC seek/settle/rotational delays\n"
+ "\n"
+ 
+ " Hard disks:\n"
+@@ -3720,6 +3722,7 @@ static void config_print_all(FILE *f, bool all) {
+ 	xroar_cfg_print_bool(f, all, "disk-write-back", xroar.cfg.disk.write_back, 1);
+ 	xroar_cfg_print_bool(f, all, "disk-auto-os9", xroar.cfg.disk.auto_os9, 1);
+ 	xroar_cfg_print_bool(f, all, "disk-auto-sd", xroar.cfg.disk.auto_sd, 1);
++	xroar_cfg_print_bool(f, all, "disk-fast", xroar.cfg.disk.fast, 0);
+ 	fputs("\n", f);
+ 
+ 	fputs("# Firmware ROM images\n", f);
+diff --git a/src/xroar.h b/src/xroar.h
+index 143c677..973edc2 100644
+--- a/src/xroar.h
++++ b/src/xroar.h
+@@ -127,6 +127,11 @@ struct xroar_cfg {
+ 		bool write_back;
+ 		bool auto_os9;
+ 		bool auto_sd;
++		// -disk-fast: collapse the FDC mechanical delays (seek, head
++		// settle, rotational latency) to the native byte-transfer time.
++		// Byte pacing is left at the native rate, so the DRQ handshake
++		// stays correct on any DOS and no LOST_DATA can result.
++		bool fast;
+ 	} disk;
+ 
+ 	// XXX this might make more sense as a per-machine option

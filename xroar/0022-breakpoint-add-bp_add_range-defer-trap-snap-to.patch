@@ -1,0 +1,333 @@
+From 75316fc06c39fa0db9e139b399f622c02d369b50 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:12 -0400
+Subject: [PATCH 22/44] breakpoint: add bp_add_range; defer trap-snap to
+
+---
+ src/breakpoint.c    | 29 +++++++++++++++++++++++++++++
+ src/breakpoint.h    | 15 +++++++++++++++
+ src/coco3.c         | 22 ++++++++++++++++++++--
+ src/dragon/dragon.c | 22 ++++++++++++++++++++--
+ src/machine.h       |  6 ++++++
+ src/mc10.c          | 22 ++++++++++++++++++++--
+ src/xroar.c         | 40 ++++++++++++++++++++++++++++++++++++++--
+ 7 files changed, 148 insertions(+), 8 deletions(-)
+
+diff --git a/src/breakpoint.c b/src/breakpoint.c
+index 5738042..5596a25 100644
+--- a/src/breakpoint.c
++++ b/src/breakpoint.c
+@@ -189,7 +189,36 @@ static int compar_breakpoint_a(const void *aa, const void *bb) {
+ 
+ // Instruction hook
+ 
++bool bp_instr_hook_add(struct bp_breakpoint_set *bbs, DELEGATE_T1(void, uint32) handler) {
++	struct bp_instr_hook *h = xmalloc(sizeof(*h));
++	h->handler = handler;
++	h->next = bbs->hooks;
++	bbs->hooks = h;
++	return 1;
++}
++
++void bp_instr_hook_remove(struct bp_breakpoint_set *bbs, DELEGATE_T1(void, uint32) handler) {
++	for (struct bp_instr_hook **p = &bbs->hooks; *p; p = &(*p)->next) {
++		if ((*p)->handler.func == handler.func && (*p)->handler.sptr == handler.sptr) {
++			struct bp_instr_hook *dead = *p;
++			*p = dead->next;
++			free(dead);
++			return;
++		}
++	}
++}
++
+ void bp_instruction_hook(void *sptr, uint32_t A) {
++	// Ambient hooks first; a hook may remove itself (one-shots), so walk
++	// via a saved next pointer.
++	{
++		struct bp_breakpoint_set *bbs = sptr;
++		struct bp_instr_hook *next;
++		for (struct bp_instr_hook *h = bbs->hooks; h; h = next) {
++			next = h->next;
++			DELEGATE_CALL(h->handler, A);
++		}
++	}
+ 	struct bp_breakpoint_set *bbs = sptr;
+ 	struct bp_breakpoint key = { .A = A };
+ 	struct bp_breakpoint *ent = NULL;
+diff --git a/src/breakpoint.h b/src/breakpoint.h
+index b0bbde1..a07c29b 100644
+--- a/src/breakpoint.h
++++ b/src/breakpoint.h
+@@ -39,13 +39,28 @@ struct bp_breakpoint {
+ 	DELEGATE_T2(void, bool, uint32) handler[BP_HANDLERS_PER_ADDRESS];
+ };
+ 
++// Ambient per-instruction hook: called with the PC on every instruction
++// fetch while any are registered.  This is the only way to say "at the next
++// instruction boundary" without knowing the next PC (the deferred trap-snap
++// needs exactly that), and it is what the flight recorder and profiler ride.
++struct bp_instr_hook {
++	struct bp_instr_hook *next;
++	DELEGATE_T1(void, uint32) handler;
++};
++
+ struct bp_breakpoint_set {
+ 	size_t nbreakpoints;
+ 	size_t nallocated;
+ 	struct bp_breakpoint *list;
+ 	bool modified;  // an add or delete has occurred during list run
++	struct bp_instr_hook *hooks;  // ambient per-instruction hooks
+ };
+ 
++bool bp_instr_hook_add(struct bp_breakpoint_set *bbs, DELEGATE_T1(void, uint32) handler);
++void bp_instr_hook_remove(struct bp_breakpoint_set *bbs, DELEGATE_T1(void, uint32) handler);
++// True while anything (addresses or ambient hooks) needs the CPU hook.
++#define bp_breakpoint_set_active(bbs) ((bbs)->nbreakpoints > 0 || (bbs)->hooks)
++
+ // Add a breakpoint.  Returns 1 if successful, else 0 (e.g. identical
+ // breakpoint already exists)
+ bool bp_breakpoint_add(struct bp_breakpoint_set *bbs, uint32_t A,
+diff --git a/src/coco3.c b/src/coco3.c
+index bc58f06..5d76af3 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -337,6 +337,22 @@ static void coco3_write_byte(struct machine *m, unsigned A, uint8_t D);
+ static void coco3_op_rts(struct machine *m);
+ static void coco3_dump_ram(struct machine *m, FILE *fd);
+ static int32_t coco3_get_symbol(struct machine *m, const char *label);
++static void coco3_add_instruction_hook(struct machine *m,
++				 DELEGATE_T1(void, uint32) handler) {
++	struct coco3 *mcc3 = (struct coco3 *)m;
++	bp_instr_hook_add(&mcc3->breakpoint_set, handler);
++	mcc3->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mcc3->breakpoint_set);
++}
++
++static void coco3_remove_instruction_hook(struct machine *m,
++				    DELEGATE_T1(void, uint32) handler) {
++	struct coco3 *mcc3 = (struct coco3 *)m;
++	bp_instr_hook_remove(&mcc3->breakpoint_set, handler);
++	if (!bp_breakpoint_set_active(&mcc3->breakpoint_set)) {
++		mcc3->CPU->instruction_hook.func = NULL;
++	}
++}
++
+ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+ 				 DELEGATE_T2(void, bool, uint32) handler);
+ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+@@ -442,6 +458,8 @@ static struct part *coco3_allocate(void) {
+ 	m->dump_ram = coco3_dump_ram;
+ 	m->debug.get_symbol = coco3_get_symbol;
+ 	m->debug.add_breakpoint = coco3_add_breakpoint;
++	m->debug.add_instruction_hook = coco3_add_instruction_hook;
++	m->debug.remove_instruction_hook = coco3_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = coco3_remove_breakpoint;
+ 	m->debug.add_watchpoint = coco3_add_watchpoint;
+ 	m->debug.remove_watchpoint = coco3_remove_watchpoint;
+@@ -1571,7 +1589,7 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+ 	if (!bp_breakpoint_add(&mcc3->breakpoint_set, A, handler)) {
+ 		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
+ 	}
+-	if (mcc3->breakpoint_set.nbreakpoints) {
++	if (bp_breakpoint_set_active(&mcc3->breakpoint_set)) {
+ 		mcc3->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mcc3->breakpoint_set);
+ 	}
+ }
+@@ -1580,7 +1598,7 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+ 				    DELEGATE_T2(void, bool, uint32) handler) {
+ 	struct coco3 *mcc3 = (struct coco3 *)m;
+ 	bp_breakpoint_remove(&mcc3->breakpoint_set, A, handler);
+-	if (!mcc3->breakpoint_set.nbreakpoints) {
++	if (!bp_breakpoint_set_active(&mcc3->breakpoint_set)) {
+ 		mcc3->CPU->instruction_hook.func = NULL;
+ 	}
+ }
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 9fed50f..4bd5fc3 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -232,6 +232,22 @@ static void dragon_write_byte(struct machine *m, unsigned A, uint8_t D);
+ static void dragon_op_rts(struct machine *m);
+ static void dragon_dump_ram(struct machine *m, FILE *fd);
+ static int32_t dragon_get_symbol(struct machine *m, const char *label);
++static void dragon_add_instruction_hook(struct machine *m,
++				 DELEGATE_T1(void, uint32) handler) {
++	struct dragon *md = (struct dragon *)m;
++	bp_instr_hook_add(&md->breakpoint_set, handler);
++	md->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &md->breakpoint_set);
++}
++
++static void dragon_remove_instruction_hook(struct machine *m,
++				    DELEGATE_T1(void, uint32) handler) {
++	struct dragon *md = (struct dragon *)m;
++	bp_instr_hook_remove(&md->breakpoint_set, handler);
++	if (!bp_breakpoint_set_active(&md->breakpoint_set)) {
++		md->CPU->instruction_hook.func = NULL;
++	}
++}
++
+ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
+ 				  DELEGATE_T2(void, bool, uint32) handler);
+ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+@@ -300,6 +316,8 @@ void dragon_allocate_common(struct dragon *md) {
+ 	m->dump_ram = dragon_dump_ram;
+ 	m->debug.get_symbol = dragon_get_symbol;
+ 	m->debug.add_breakpoint = dragon_add_breakpoint;
++	m->debug.add_instruction_hook = dragon_add_instruction_hook;
++	m->debug.remove_instruction_hook = dragon_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = dragon_remove_breakpoint;
+ 	m->debug.add_watchpoint = dragon_add_watchpoint;
+ 	m->debug.remove_watchpoint = dragon_remove_watchpoint;
+@@ -1336,7 +1354,7 @@ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
+ 	if (!bp_breakpoint_add(&md->breakpoint_set, A, handler)) {
+ 		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
+ 	}
+-	if (md->breakpoint_set.nbreakpoints) {
++	if (bp_breakpoint_set_active(&md->breakpoint_set)) {
+ 		md->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &md->breakpoint_set);
+ 	}
+ }
+@@ -1345,7 +1363,7 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+ 				     DELEGATE_T2(void, bool, uint32) handler) {
+ 	struct dragon *md = (struct dragon *)m;
+ 	bp_breakpoint_remove(&md->breakpoint_set, A, handler);
+-	if (!md->breakpoint_set.nbreakpoints) {
++	if (!bp_breakpoint_set_active(&md->breakpoint_set)) {
+ 		md->CPU->instruction_hook.func = NULL;
+ 	}
+ }
+diff --git a/src/machine.h b/src/machine.h
+index d9c4cfc..04299e0 100644
+--- a/src/machine.h
++++ b/src/machine.h
+@@ -236,6 +236,10 @@ struct machine {
+ 					  DELEGATE_T2(void, bool, uint32) handler);
+ 
+ 		// Add a watchpoint
++		// Ambient per-instruction hook (PC on every fetch).
++		void (*add_instruction_hook)(struct machine *, DELEGATE_T1(void, uint32) handler);
++		void (*remove_instruction_hook)(struct machine *, DELEGATE_T1(void, uint32) handler);
++
+ 		void (*add_watchpoint)(struct machine *, bool RnW,
+ 				       uint32_t Astart, uint32_t Aend,
+ 				       DELEGATE_T3(void, bool, uint32, uint8) handler);
+@@ -294,6 +298,8 @@ void machine_remove_hbreak(struct machine *m, int32_t A);
+ #define machine_remove_hbreak_all(m) machine_remove_hbreak((m), -1)
+ #endif
+ 
++#define machine_add_instruction_hook(m,h) (m)->debug.add_instruction_hook((m), (h))
++#define machine_remove_instruction_hook(m,h) (m)->debug.remove_instruction_hook((m), (h))
+ #define machine_add_watchpoint(m,rnw,as,ae,h) (m)->debug.add_watchpoint((m), (rnw), (as), (ae), (h))
+ #define machine_remove_watchpoint(m,rnw,as,ae,h) (m)->debug.remove_watchpoint((m), (rnw), (as), (ae), (h))
+ 
+diff --git a/src/mc10.c b/src/mc10.c
+index b66668e..c9c87cd 100644
+--- a/src/mc10.c
++++ b/src/mc10.c
+@@ -203,6 +203,22 @@ static void mc10_write_byte(struct machine *m, unsigned A, uint8_t D);
+ static void mc10_op_rts(struct machine *m);
+ static void mc10_dump_ram(struct machine *m, FILE *fd);
+ static int32_t mc10_get_symbol(struct machine *m, const char *label);
++static void mc10_add_instruction_hook(struct machine *m,
++				 DELEGATE_T1(void, uint32) handler) {
++	struct mc10 *mp = (struct mc10 *)m;
++	bp_instr_hook_add(&mp->breakpoint_set, handler);
++	mp->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mp->breakpoint_set);
++}
++
++static void mc10_remove_instruction_hook(struct machine *m,
++				    DELEGATE_T1(void, uint32) handler) {
++	struct mc10 *mp = (struct mc10 *)m;
++	bp_instr_hook_remove(&mp->breakpoint_set, handler);
++	if (!bp_breakpoint_set_active(&mp->breakpoint_set)) {
++		mp->CPU->instruction_hook.func = NULL;
++	}
++}
++
+ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
+ 				DELEGATE_T2(void, bool, uint32) handler);
+ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+@@ -280,6 +296,8 @@ static struct part *mc10_allocate(void) {
+ 	m->dump_ram = mc10_dump_ram;
+ 	m->debug.get_symbol = mc10_get_symbol;
+ 	m->debug.add_breakpoint = mc10_add_breakpoint;
++	m->debug.add_instruction_hook = mc10_add_instruction_hook;
++	m->debug.remove_instruction_hook = mc10_remove_instruction_hook;
+ 	m->debug.remove_breakpoint = mc10_remove_breakpoint;
+ 	m->debug.add_watchpoint = mc10_add_watchpoint;
+ 	m->debug.remove_watchpoint = mc10_remove_watchpoint;
+@@ -888,7 +906,7 @@ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
+ 	if (!bp_breakpoint_add(&mp->breakpoint_set, A, handler)) {
+ 		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
+ 	}
+-	if (mp->breakpoint_set.nbreakpoints) {
++	if (bp_breakpoint_set_active(&mp->breakpoint_set)) {
+ 		mp->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mp->breakpoint_set);
+ 	}
+ }
+@@ -897,7 +915,7 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+ 				    DELEGATE_T2(void, bool, uint32) handler) {
+ 	struct mc10 *mp = (struct mc10 *)m;
+ 	bp_breakpoint_remove(&mp->breakpoint_set, A, handler);
+-	if (!mp->breakpoint_set.nbreakpoints) {
++	if (!bp_breakpoint_set_active(&mp->breakpoint_set)) {
+ 		mp->CPU->instruction_hook.func = NULL;
+ 	}
+ }
+diff --git a/src/xroar.c b/src/xroar.c
+index 1f5b1d5..e45ef31 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -3557,6 +3557,32 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
+ 	return out;
+ }
+ 
++// Deferred trap-snap.  seconds=/cycle= traps fire from a scheduled event,
++// which lands mid-instruction: the CPU may have consumed an opcode byte and
++// have PC pointing at its operand -- a position the snapshot cannot fully
++// represent (the prefix latch is serialised; a fetch-in-progress is not).
++// Resuming such a file executes operand bytes as opcodes.  Found the hard
++// way: a 2-byte code shift moved a boot's 62s capture onto a BNE's offset
++// byte at $3612, and every resume of that file executed the offset as LDU,
++// wandered into a puls epilogue with no frame, pulled boot-era stack
++// leftovers into PC, and died executing the framebuffer.  So: park the
++// filename, arm a one-shot any-address breakpoint, and write the snapshot
++// from the instruction fetch hook, where PC is at an opcode boundary by
++// construction.  pc= traps already fire from that hook and write directly.
++static char *deferred_snap_path;
++
++static void deferred_snap_fire(void *sptr, uint32_t A) {
++	(void)A;
++	(void)sptr;
++	machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, deferred_snap_fire, NULL));
++	if (deferred_snap_path) {
++		LOG_MOD_DEBUG(2, "trap", "write snapshot (deferred to instruction boundary): %s\n", deferred_snap_path);
++		write_snapshot(deferred_snap_path);
++		free(deferred_snap_path);
++		deferred_snap_path = NULL;
++	}
++}
++
+ static void handle_trap(void *sptr) {
+ 	struct trap_def *trap = sptr;
+ 
+@@ -3576,8 +3602,18 @@ static void handle_trap(void *sptr) {
+ 
+ 	// Break action
+ 	if (trap->snap) {
+-		LOG_MOD_DEBUG(2, "trap", "write snapshot: %s\n", trap->snap);
+-		write_snapshot(trap->snap);
++		// -trap-timeout 0 exits synchronously at the end of this handler;
++		// a deferred write would be skipped, so take the mid-instruction
++		// snapshot over no snapshot at all in that one case.
++		bool quits_now = trap->timeout && 0 == strcmp(trap->timeout, "0");
++		if (trap->trigger && !quits_now && !deferred_snap_path) {
++			LOG_MOD_DEBUG(2, "trap", "defer snapshot to instruction boundary: %s\n", trap->snap);
++			deferred_snap_path = xstrdup(trap->snap);
++			machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, deferred_snap_fire, NULL));
++		} else {
++			LOG_MOD_DEBUG(2, "trap", "write snapshot: %s\n", trap->snap);
++			write_snapshot(trap->snap);
++		}
+ 	}
+ 	if (trap->screenshot) {
+ 		// Classify the range once, on the first fire, and remember it: xroar

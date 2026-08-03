@@ -1,0 +1,68 @@
+From 8b50f45100d90df6b59527f31e4711c6abf30c0b Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:44 -0400
+Subject: [PATCH 38/44] trap: rebuild xpc= on the xpcrange mechanism so it
+
+---
+ src/xroar.c | 41 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/src/xroar.c b/src/xroar.c
+index 12d13c7..f41ccbf 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -3650,6 +3650,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+ 				} else {
+ 					machine_remove_breakpoint(xroar.machine, a, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
+ 				}
++			} else if (0 == c_strcasecmp(key, "xpc")) {
++				// xpc= matches a PHYSICAL address.  The CPU only breaks on
++				// the logical PC, so something has to bridge the two.  The
++				// masked-logical v2 hooked phys & 0xffff and was right only
++				// when a block's low three bits equalled its MMU slot --
++				// four images in eleven for the program this was built for,
++				// and a silent timeout for the rest.  xpc=P is therefore
++				// exactly xpcrange=P-P: the ambient fetch hook plus one
++				// cached translation per fetch, no mask, no layout
++				// assumption.
++				if (a > 0x7ffff || b > 0x7ffff) {
++					fprintf(stderr, "xroar: -trap %s: physical address > 0x7ffff\n",
++					        trap->cond);
++					exit(EXIT_FAILURE);
++				}
++				if (enable) {
++					trap->xpcr_lo = (long)a;
++					trap->xpcr_hi = (long)b;
++					trap->xpcr_inside = 0;
++					machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_xpcrange_check, trap));
++					trap->xpcr_hooked = 1;
++				} else if (trap->xpcr_hooked) {
++					machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_xpcrange_check, trap));
++					trap->xpcr_hooked = 0;
++				}
+ 			} else if (0 == c_strcasecmp(key, "xpcrange")) {
+ 				// xpcrange=LO-HI: fire the instant the PHYSICAL PC enters
+ 				// the range.  An execution tripwire: arm it over a region
+@@ -4468,13 +4493,15 @@ static void set_trap(const char *cond) {
+ 		cur_trap_def->trace = -1;
+ 		cur_trap_def->no_trace = -1;
+ 		cur_trap_def->match_value = -1;
+-		// -1 is "none" for the xpcrange= bounds; 0 is a valid physical
+-		// address, so the struct's {0} zero-init cannot express it.  Set
+-		// HERE at struct creation, not in enable_trap's condition block:
+-		// cycle=/seconds= traps return out of enable_trap early, and a
+-		// field left 0 would wrongly filter those traps against physical
+-		// address zero (the shape of bug that once silently broke plain
+-		// seconds= traps).
++		// -1 is "no physical filter" for the xpcrange= bounds, which xpc=
++		// now shares.  0 is a valid physical address, so this cannot ride
++		// the struct's {0} zero-init, and it must be set HERE at struct
++		// creation rather than in enable_trap(): cycle=/seconds= traps
++		// return out of enable_trap before reaching the condition block,
++		// so their bounds would stay 0 and the gate would demand a PC that
++		// maps to physical zero -- a trap whose action silently never
++		// fires.  That was a real bug in the xpc= that this replaced,
++		// found by bisecting a plain `seconds=5` run with no xpc= in it.
+ 		cur_trap_def->xpcr_lo = -1;
+ 		cur_trap_def->xpcr_hi = -1;
+ 	}
