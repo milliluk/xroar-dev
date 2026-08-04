@@ -3,17 +3,32 @@ From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:47 -0400
 Subject: [PATCH 11/44] add -disk-fast to skip floppy access delays
 
+Cap every scheduled FDC delay at the native byte-transfer time so the
+mechanical delays (seek stepping, head settle, rotational latency)
+collapse to effectively instant -- EXCEPT the two first-DRQ service
+windows.  After a write-sector ID match (and after write track's command
+accept) the chip raises DRQ and works through the gap run-up before it
+needs the byte; that run-up is the time a polled DOS has to deliver the
+first byte (the WD2797 datasheet gives 22 MFM byte times).  RSDOS's
+DSKCON services the first byte of every sector write from a
+status-polling loop -- only the remaining 255 bytes are HALT-driven --
+and at the 0.89MHz disk-access clock its worst-case poll-plus-store is
+slightly longer than one byte time, so clamping that window made
+LOST_DATA a deterministic race against the poll phase: one disk layout
+failed 3/3 while its neighbours passed.  Those two transitions are
+scheduled unclamped (NEXT_STATE_EXACT); mid-transfer byte pacing is a
+native-rate delay already and is unaffected by the cap.
 ---
- src/wd279x.c | 16 +++++++++++++++-
+ src/wd279x.c | 39 +++++++++++++++++++++++++++++++++++++--
  src/xroar.c  |  3 +++
  src/xroar.h  |  5 +++++
- 3 files changed, 23 insertions(+), 1 deletion(-)
+ 3 files changed, 45 insertions(+), 2 deletions(-)
 
 diff --git a/src/wd279x.c b/src/wd279x.c
-index 290fa09..47ffe6a 100644
+index 290fa09..99d1ec6 100644
 --- a/src/wd279x.c
 +++ b/src/wd279x.c
-@@ -124,9 +124,23 @@ static const char * const wd279x_type_name[4] = {
+@@ -124,7 +124,40 @@ static const char * const wd279x_type_name[4] = {
  		DELEGATE_CALL((fdc)->set_intrq, 0); \
  	} while (0)
  
@@ -22,9 +37,10 @@ index 290fa09..47ffe6a 100644
 +// delays -- seek stepping (EVENT_MS 6..30), head settle (EVENT_MS 30), and
 +// rotational latency to the next ID mark / index pulse (up to a full ~200ms
 +// revolution) -- are all hundreds to thousands of times W_BYTE_TIME, so they
-+// collapse to effectively instant. The byte-transfer delays already equal
-+// W_BYTE_TIME, so the cap leaves them untouched: DRQ stays paced at the native
-+// data rate and no LOST_DATA can result on any DOS, HALT-driven or polled.
++// collapse to effectively instant. The per-byte transfer delays already equal
++// W_BYTE_TIME, so the cap leaves them untouched and DRQ stays paced at the
++// native data rate MID-transfer. The FIRST DRQ of a write is different: see
++// NEXT_STATE_EXACT below.
 +static inline event_ticks wd279x_dt(event_ticks t) {
 +	if (xroar.cfg.disk.fast && t > (event_ticks)W_BYTE_TIME)
 +		return (event_ticks)W_BYTE_TIME;
@@ -32,12 +48,47 @@ index 290fa09..47ffe6a 100644
 +}
 +
  #define NEXT_STATE(fdc,s,t) do { \
- 		(fdc)->state = (s); \
--		event_queue_dt(&(fdc)->state_event, (t)); \
++		(fdc)->state = (s); \
 +		event_queue_dt(&(fdc)->state_event, wd279x_dt(t)); \
++	} while (0)
++
++// Unclamped scheduling for the two first-DRQ service windows, which must
++// NOT be collapsed by -disk-fast. After a write-sector ID match (and after
++// write track's command accept) the chip raises DRQ and then works through
++// the gap run-up before it needs the byte -- that run-up IS the time a
++// polled DOS has to deliver the first byte (the WD2797 datasheet gives 22
++// MFM byte times). RSDOS's DSKCON services the first byte of every sector
++// write from a status-polling loop (only the remaining 255 are HALT-driven),
++// and at the 0.89MHz disk-access clock its worst-case poll-plus-store takes
++// slightly MORE than one byte time. Clamping the run-up to W_BYTE_TIME made
++// LOST_DATA a deterministic race against the poll phase: a write died or
++// survived on which tick of the poll loop DRQ landed on, so one disk layout
++// failed 3/3 while its neighbours passed. Costs at most the gap run-up per
++// sector write; the mid-transfer pacing above is unaffected.
++#define NEXT_STATE_EXACT(fdc,s,t) do { \
+ 		(fdc)->state = (s); \
+ 		event_queue_dt(&(fdc)->state_event, (t)); \
  	} while (0)
+@@ -802,7 +835,8 @@ static void wd279x_state_machine(void *sptr) {
+ 			SET_DRQ(fdc);
+ 			for (int i = 0; i < 8; i++)
+ 				DELEGATE_CALL(fdc->skip);
+-			NEXT_STATE(fdc, WD279X_state_write_sector_2, DELEGATE_CALL(fdc->time_to_next_byte));
++			// First-byte service window: never clamped (see NEXT_STATE_EXACT)
++			NEXT_STATE_EXACT(fdc, WD279X_state_write_sector_2, DELEGATE_CALL(fdc->time_to_next_byte));
+ 			return;
  
- #define SET_STATE(fdc,s) (fdc)->state = (s)
+ 
+@@ -969,7 +1003,8 @@ static void wd279x_state_machine(void *sptr) {
+ 			SET_DRQ(fdc);
+ 			// Data sheet says 3 byte times, but CoCo NitrOS9 fails
+ 			// unless I set this delay higher.
+-			NEXT_STATE(fdc, WD279X_state_write_track_2, 6 * W_BYTE_TIME);
++			// First-byte service window: never clamped (see NEXT_STATE_EXACT)
++			NEXT_STATE_EXACT(fdc, WD279X_state_write_track_2, 6 * W_BYTE_TIME);
+ 			return;
+ 
+ 
 diff --git a/src/xroar.c b/src/xroar.c
 index e78c1e8..fc0565c 100644
 --- a/src/xroar.c
@@ -67,7 +118,7 @@ index e78c1e8..fc0565c 100644
  
  	fputs("# Firmware ROM images\n", f);
 diff --git a/src/xroar.h b/src/xroar.h
-index 143c677..973edc2 100644
+index 143c677..e28fdee 100644
 --- a/src/xroar.h
 +++ b/src/xroar.h
 @@ -127,6 +127,11 @@ struct xroar_cfg {
@@ -76,8 +127,8 @@ index 143c677..973edc2 100644
  		bool auto_sd;
 +		// -disk-fast: collapse the FDC mechanical delays (seek, head
 +		// settle, rotational latency) to the native byte-transfer time.
-+		// Byte pacing is left at the native rate, so the DRQ handshake
-+		// stays correct on any DOS and no LOST_DATA can result.
++		// Byte pacing and the first-DRQ service windows stay at the
++		// native rate (see wd279x.c's NEXT_STATE_EXACT).
 +		bool fast;
  	} disk;
  
