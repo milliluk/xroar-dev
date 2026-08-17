@@ -1,7 +1,7 @@
-From fe60669bcef1d15200e97dcdb7479185f8d132b6 Mon Sep 17 00:00:00 2001
+From 9d69efbd70d15b7c5672971eb2e43f48889711b9 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:39 -0400
-Subject: [PATCH 07/44] gdb: tolerate re-binding the target port instead of
+Subject: [PATCH 07/49] gdb: tolerate re-binding the target port instead of
 
 ---
  src/gdb.c | 59 +++++++++++++++++++++++++++++++++++++++++++++++++++----

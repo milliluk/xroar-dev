@@ -1,7 +1,7 @@
-From 87e06c0ea453fe6950c97a8144306efea3a4db45 Mon Sep 17 00:00:00 2001
+From c99f3ccb6d06a11d9bea60d64e8d4353e549b2ab Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:21 -0400
-Subject: [PATCH 27/44] gdb: register/GIME/flat-RAM debug queries + cycles
+Subject: [PATCH 27/49] gdb: register/GIME/flat-RAM debug queries + cycles
 
 The qxroar. namespace carries no raw chip registers. XRoar's own
 -gdb-pseudo-regs already exposes those as real registers in the target
@@ -14,16 +14,30 @@ and a second way to spell a thing that already had one. It is gone.
 What is left here is what a register dump cannot express: the GIME's
 logical-to-physical translations, flat physical memory that bypasses the
 MMU map entirely, and the input side channels.
+
+Two of these queries were narrower than their implementations.
+qxroar.cycles is a bare event_current_tick read with no GIME dependency,
+but sat inside the gip->gime block, so a Dragon or MC-10 client asking
+for it got E00 for no reason; it moves out and answers on every machine.
+And the RAM part lookup keyed on the id "RAM" only, which the MC-10 does
+not use -- its RAM lives in two parts, RAM0/RAM1 -- so qxroar.physmem was
+dead there.  The lookup now resolves through flat_ram_resolve (patch 9):
+the pair spans as one flat space, internal RAM at [0, size0) and the 16K
+expansion above it, so physmem covers the whole MC-10.  The parts keep
+their names -- their organisations differ, so they could never merge into
+one part, and renaming was only ever cosmetic.  The MMU queries
+(task/block/paddr/xpc) stay GIME-only because they are genuinely GIME
+state.
 ---
- src/gdb.c   | 371 ++++++++++++++++++++++++++++++++++++++++++++++++----
+ src/gdb.c   | 379 ++++++++++++++++++++++++++++++++++++++++++++++++----
  src/xroar.c |   6 +
- 2 files changed, 351 insertions(+), 26 deletions(-)
+ 2 files changed, 359 insertions(+), 26 deletions(-)
 
 diff --git a/src/gdb.c b/src/gdb.c
-index 209fd2e..faad5ce 100644
+index 209fd2e..4d98b0d 100644
 --- a/src/gdb.c
 +++ b/src/gdb.c
-@@ -30,10 +30,55 @@
+@@ -30,10 +30,57 @@
   *
   * Breakpoints and watchpoints are supported ('Z' and 'z').
   *
@@ -40,6 +54,8 @@ index 209fd2e..faad5ce 100644
 - *      qSupported      | XX... | report PacketSize
 - *      qAttached       | 1     | always report attached
 + *      qxroar.trace-pc | XXXX    | get PC of current instruction -> 4 hex digits
++ *      qxroar.cycles   | XXXXXXXX| master tick counter (event_current_tick);
++ *                                  every machine, free-running, take deltas
 + *      qSupported      | XX...   | report PacketSize
 + *      qAttached       | 1       | always report attached
 +
@@ -81,7 +97,7 @@ index 209fd2e..faad5ce 100644
  
   */
  
-@@ -83,16 +128,29 @@
+@@ -83,16 +130,30 @@
  #include "breakpoint.h"
  #include "events.h"
  #include "gdb.h"
@@ -105,13 +121,14 @@ index 209fd2e..faad5ce 100644
  
 +	struct MC6809 *cpu;
 +	struct TCC1014 *gime;  // NULL on non-GIME (e.g. Dragon) machines
-+	struct ram *ram;       // motherboard RAM, for physical-memory access
++	struct flat_ram ram;   // flat physical RAM ("RAM", or the MC-10's
++	                       // RAM0+RAM1 pair); .ram0 NULL if none
 +	bool is_6309;
 +
  	// Thread info
  	int listenfd;
  	struct addrinfo *info;
-@@ -115,6 +173,17 @@ struct gdb_interface_private {
+@@ -115,6 +176,17 @@ struct gdb_interface_private {
  	pthread_cond_t run_state_cv;
  	pthread_mutex_t run_state_mt;
  	int last_signal;
@@ -129,7 +146,7 @@ index 209fd2e..faad5ce 100644
  };
  
  static void *handle_tcp_sock(void *sptr);
-@@ -170,10 +239,22 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
+@@ -170,10 +242,26 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
  	if (!m)
  		return NULL;
  
@@ -140,7 +157,11 @@ index 209fd2e..faad5ce 100644
 +	}
 +
 +	struct TCC1014 *gime = (struct TCC1014 *)part_component_by_id_is_a(&m->part, "GIME", "TCC1014");
-+	struct ram *ram = (struct ram *)part_component_by_id_is_a(&m->part, "RAM", "ram");
++	// One part "RAM" everywhere but the MC-10, whose RAM0+RAM1 pair spans
++	// as a single flat space (see flat_ram_resolve); .ram0 stays NULL on a
++	// machine with no RAM part, and qxroar.physmem answers E00 there.
++	struct flat_ram ram;
++	flat_ram_resolve(&ram, &m->part);
 +
  	struct gdb_interface_private *gip = xmalloc(sizeof(*gip));
  	*gip = (struct gdb_interface_private){0};
@@ -152,7 +173,7 @@ index 209fd2e..faad5ce 100644
  	gip->run_state = gdb_run_state_running;
  
  	struct addrinfo hints;
-@@ -206,7 +287,7 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
+@@ -206,7 +294,7 @@ struct gdb_interface *gdb_interface_new(const char *hostname, const char *portna
  	// quick restart with -gdb does not have to wait it out.  This does NOT
  	// cover the snapshot-load case, where two listeners are briefly live on
  	// the same port; that is handled by the deferred-bind retry below.
@@ -161,7 +182,7 @@ index 209fd2e..faad5ce 100644
  
  	// bind
  	gip->rebind_pending = 0;
-@@ -327,10 +408,36 @@ static void gdb_handle_signal(struct gdb_interface_private *gip, int sig, bool a
+@@ -327,10 +415,36 @@ static void gdb_handle_signal(struct gdb_interface_private *gip, int sig, bool a
  
  void gdb_stop(struct gdb_interface *gi, int sig) {
  	struct gdb_interface_private *gip = (struct gdb_interface_private *)gi;
@@ -198,7 +219,7 @@ index 209fd2e..faad5ce 100644
  void gdb_single_step(struct gdb_interface *gi) {
  	struct gdb_interface_private *gip = (struct gdb_interface_private *)gi;
  	gip->run_state = gdb_run_state_stopped;
-@@ -881,6 +988,99 @@ static void general_query(struct gdb_interface_private *gip, char *args) {
+@@ -881,6 +995,100 @@ static void general_query(struct gdb_interface_private *gip, char *args) {
  		return;
  	}
  	char *query = strsep(&args, ":");
@@ -253,18 +274,19 @@ index 209fd2e..faad5ce 100644
 +				send_packet(gip, packet, 5);
 +				return;
 +			}
-+			if (0 == strcmp(query, "cycles")) {
-+				// $cycles: master emulator tick counter
-+				// (event_current_tick), 32-bit, 8 hex digits.
-+				// Free-running; take deltas between two reads to
-+				// measure elapsed cycles across a code region.
-+				LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.cycles\n");
-+				sprintf((char *)packet, "%08x", (unsigned)event_current_tick);
-+				send_packet(gip, packet, 8);
-+				return;
-+			}
 +		}
-+		if (gip->ram && 0 == strcmp(query, "physmem")) {
++		if (0 == strcmp(query, "cycles")) {
++			// $cycles: master emulator tick counter
++			// (event_current_tick), 32-bit, 8 hex digits.
++			// Free-running; take deltas between two reads to
++			// measure elapsed cycles across a code region.  No GIME
++			// dependency -- answered on every machine.
++			LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.cycles\n");
++			sprintf((char *)packet, "%08x", (unsigned)event_current_tick);
++			send_packet(gip, packet, 8);
++			return;
++		}
++		if (gip->ram.ram0 && 0 == strcmp(query, "physmem")) {
 +			// qxroar.physmem:ADDR,LEN -- read LEN bytes starting at flat
 +			// physical ADDR (same addressing as -load-ram's addr=), raw
 +			// hex pairs in the reply, same wire shape as a normal 'm'.
@@ -280,7 +302,7 @@ index 209fd2e..faad5ce 100644
 +			LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: xroar.physmem\n");
 +			char *p = (char *)packet;
 +			for (unsigned long i = 0; i < length; i++) {
-+				int b = ram_peek_flat(gip->ram, A + i);
++				int b = flat_ram_peek(&gip->ram, A + i);
 +				if (b < 0)
 +					goto physmem_read_error;
 +				sprintf(p, "%02x", (unsigned)b);
@@ -298,13 +320,13 @@ index 209fd2e..faad5ce 100644
  	if (0 == strncmp(query, "Supported", 9) && (query[9] == 0 || query[9] == ':')) {
  		LOG_MOD_DEBUG_GDB(LOG_GDB_QUERY, "gdb", "query: Supported\n");
  		send_supported(gip, args);
-@@ -912,6 +1112,148 @@ static void general_query(struct gdb_interface_private *gip, char *args) {
+@@ -912,6 +1120,148 @@ static void general_query(struct gdb_interface_private *gip, char *args) {
  
  static void general_set(struct gdb_interface_private *gip, char *args) {
  	char *set = strsep(&args, ":");
 +	if (0 == strncmp(set, "xroar.", 6)) {
 +		set += 6;
-+		if (0 == strcmp(set, "physmem") && gip->ram) {
++		if (0 == strcmp(set, "physmem") && gip->ram.ram0) {
 +			// Qxroar.physmem:ADDR,LEN:DATA -- write LEN hex-pair bytes
 +			// from DATA starting at flat physical ADDR. Same addressing
 +			// and same bypass-the-MMU rationale as the read side.
@@ -323,7 +345,7 @@ index 209fd2e..faad5ce 100644
 +				int v = hex8(data);
 +				if (v < 0)
 +					goto physmem_write_error;
-+				if (!ram_poke_flat(gip->ram, A + i, (uint8_t)v))
++				if (!flat_ram_poke(&gip->ram, A + i, (uint8_t)v))
 +					goto physmem_write_error;
 +				data += 2;
 +			}
@@ -447,7 +469,7 @@ index 209fd2e..faad5ce 100644
  	if (0 == strcmp(set, "StartNoAckMode")) {
  		gip->no_ack_mode = 1;
  		send_packet_string(gip, "OK");
-@@ -1052,29 +1394,6 @@ static int qRcmd(struct gdb_interface_private *gip, char *args) {
+@@ -1052,29 +1402,6 @@ static int qRcmd(struct gdb_interface_private *gip, char *args) {
  	return 0;
  }
  
@@ -478,7 +500,7 @@ index 209fd2e..faad5ce 100644
  
  // Convert hex representation of a register to binary in-place and, if valid,
 diff --git a/src/xroar.c b/src/xroar.c
-index 897bf1e..d0b9164 100644
+index a82a9cb..68e0b5a 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -1348,6 +1348,12 @@ struct ui_interface *xroar_init(int argc, char **argv) {

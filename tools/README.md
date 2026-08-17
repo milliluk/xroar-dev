@@ -1,15 +1,16 @@
 # Host-side tools
 
-Four Python tools, no dependencies beyond the standard library. They are the
+Five Python tools, no dependencies beyond the standard library. They are the
 host half of features the patch series adds to the emulator. The emulator can
 consume a symbol file, but something has to *write* one.
 
 | Tool | Pairs with | What it does |
 |---|---|---|
-| `gensym.py` | patch 41 (`-symbols`) | Builds the `.sym` / `.lines` pair from `lwasm` listings and maps |
+| `gensym.py` | patches 41 (`-symbols`), 47 (`-protect-mode`) | Builds the `.sym` / `.lines` pair from `lwasm` listings and maps |
 | `symread.py` | n/a | Reads that pair from Python: name → physical address, and back |
 | `auditreport.py` | patch 37 (`-audit`) | Turns the binary access-audit map into a readable coverage report |
 | `decb.py` | n/a | Creates and manipulates RS-DOS (Disk BASIC) disk images |
+| `gen_mnemonics.py` | `gensym.py` | Regenerates gensym's instruction/directive sets from the vendored `lwasm`'s own table |
 
 ## Configuring them for your project
 
@@ -54,6 +55,26 @@ became loud errors.
 
 `.lines` maps a physical address to `file:line`. Loaded alongside, the gdb stub
 reports source positions and the flight recorder names routines.
+
+**Format 2 adds `M C` code ranges and `M D` data ranges** — every byte an
+instruction mnemonic emitted, and every byte a data directive emitted,
+classified from the listing itself, so an `fcb` table between two routines is
+correctly `D` and not `C`. They are what `-protect-mode` (patch 47) enforces;
+a format-1 file still loads for everything else, but protect mode refuses to
+arm without the `C` ranges. Nothing is tagged in source to make this work.
+A warning lists bytes that unrecognised emitters (unexpanded macros, mostly)
+left in no class: executing those trips `-protect-mode-data`.
+
+**`M D` means *initialized* data and nothing else, and that is load-bearing.**
+An `rmb` reservation emits no bytes into an `lwasm` listing — the line has an
+address column and no emit column — so the classifier never sees one and no
+`M D` range can cover reserved space. A program's own stack, buffers and
+scratch all live there, which is why `-protect-mode-stack` can fault on a
+stack that has wandered onto declared data without faulting on every program
+whose stack sits in an `rmb` block, i.e. all of them. Measured on Color Max
+Deluxe: 445 `rmb`-declared labels, none inside any `M D` range. If that ever
+stops being true, the stack check will cry wolf on every push, and the first
+thing to check is whether the assembler started emitting fill bytes for `rmb`.
 
 ## symread.py: reading it back
 

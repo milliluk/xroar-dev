@@ -1,17 +1,30 @@
-From 08c9de8c37298506cee49df1d4fd5b392b0db693 Mon Sep 17 00:00:00 2001
+From dcbfbacaed50b2a884dbe8e595939752ce170f18 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:42 -0400
-Subject: [PATCH 37/44] audit: physical access-audit map, with a CPU access
+Subject: [PATCH 37/49] audit: physical access-audit map, with a CPU access
 
+The map was coco3-only at first: -audit on any other machine allocated
+the map, recorded nothing, and wrote a well-formed all-zero file --
+worse than refusing, because the output looks like a run that touched no
+memory.  Every input the composition needs (mem_class, irq_depth) lives
+in the shared 6809 core, so the bit composition moves to audit.h as
+audit_bits_mc6809() and the Dragon family marks too, beside its
+physical-watchpoint checks, with the logical address standing in for the
+physical -- the same degrade those watchpoints already use on a flat
+machine.  Machines whose cpu_cycle is overridden (Deluxe CoCo, Dragon
+Professional, iMMUnity) are not marked, matching exactly where physical
+watchpoints already do not fire.  The MC-10 stays out because the 6803
+core has no access classification at all -- inherent, not silent.
 ---
  src/Makefile.am            |  1 +
- src/coco3.c                | 46 ++++++++++++++++++++++++
+ src/coco3.c                |  9 +++++
+ src/dragon/dragon.c        |  7 ++++
  src/mc6809/hd6309.c        | 29 ++++++++++++++--
  src/mc6809/mc6809.c        | 29 ++++++++++++++--
  src/mc6809/mc6809.h        | 27 +++++++++++++++
  src/mc6809/mc6809_common.c | 71 +++++++++++++++++++++++++++++---------
  src/xroar.c                | 54 +++++++++++++++++++++++++++++
- 7 files changed, 237 insertions(+), 20 deletions(-)
+ 8 files changed, 207 insertions(+), 20 deletions(-)
 
 diff --git a/src/Makefile.am b/src/Makefile.am
 index 5219d7c..61d49ed 100644
@@ -26,7 +39,7 @@ index 5219d7c..61d49ed 100644
  	becker.c becker.h \
  	blockdev.c blockdev.h \
 diff --git a/src/coco3.c b/src/coco3.c
-index f025e2b..2097189 100644
+index 0ed721e..038be78 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
 @@ -36,6 +36,7 @@
@@ -37,86 +50,67 @@ index f025e2b..2097189 100644
  #include "breakpoint.h"
  #include "cart.h"
  #include "crc32.h"
-@@ -1446,6 +1447,43 @@ static void coco3_instruction_posthook(void *sptr) {
- 	mcc3->single_step = 0;
- }
- 
-+// Compose one audit byte from the CPU's access class for the cycle.  The core
-+// is the only place that knows an instruction fetch from a data read or a dead
-+// bus cycle from a real one; this is where that knowledge meets the physical
-+// address the GIME's own decode produced.
-+//
-+// EXEC and READ are deliberately exclusive: an instruction fetch is a read, but
-+// conflating them would make READ useless for finding the data reads, which is
-+// most of what the flag is for.
-+static inline uint8_t coco3_audit_bits(struct coco3 *mcc3, _Bool RnW) {
-+	uint8_t cls = mcc3->CPU->mem_class;
-+	if (cls & MC6809_MC_DEAD)
-+		return 0;
-+	uint8_t bits;
-+	if (cls & MC6809_MC_VECTOR) {
-+		// A vector read is a read, not an instruction fetch.  On this
-+		// machine the vectors are in ROM, so this branch never fires
-+		// for a RAM cycle; it is here so that it cannot be wrong on a
-+		// machine where they are not.
-+		bits = AUDIT_READ;
-+	} else if (cls & MC6809_MC_FETCH) {
-+		bits = AUDIT_EXEC;
-+		if (cls & MC6809_MC_OPCODE)
-+			bits |= AUDIT_OPCODE;
-+	} else {
-+		bits = RnW ? AUDIT_READ : AUDIT_WRITE;
-+	}
-+	if (cls & MC6809_MC_STACK_S)
-+		bits |= AUDIT_STACK_S;
-+	if (cls & MC6809_MC_STACK_U)
-+		bits |= AUDIT_STACK_U;
-+	if (cls & MC6809_MC_PUSHPULL)
-+		bits |= AUDIT_PUSHPULL;
-+	if (mcc3->CPU->irq_depth)
-+		bits |= AUDIT_IRQ;
-+	return bits;
-+}
-+
- static void read_byte(struct coco3 *mcc3, unsigned A) {
- 	if (mcc3->cart) {
- 		mcc3->CPU->D = mcc3->cart->read(mcc3->cart, A, 0, 0, mcc3->CPU->D);
-@@ -1510,6 +1548,8 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1368,6 +1369,8 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
  			if (mcc3->pwatchpoint_set.list[1])
  				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, mcc3->GIME->Z, mcc3->CPU->D);
  #endif
 +			if (audit_map)
-+				audit_mark(mcc3->GIME->Z, coco3_audit_bits(mcc3, 1));
++				audit_mark(mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 1));
  		} else {
  			// Otherwise, translate
  			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
-@@ -1519,6 +1559,8 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1377,6 +1380,8 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
  			if (mcc3->pwatchpoint_set.list[1])
  				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
  #endif
 +			if (audit_map)
-+				audit_mark((bank << 19) | mcc3->GIME->Z, coco3_audit_bits(mcc3, 1));
++				audit_mark((bank << 19) | mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 1));
  		}
  	}
  }
-@@ -1593,6 +1635,8 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1451,6 +1456,8 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
  			if (mcc3->pwatchpoint_set.list[0])
  				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, mcc3->GIME->Z, mcc3->CPU->D);
  #endif
 +			if (audit_map)
-+				audit_mark(mcc3->GIME->Z, coco3_audit_bits(mcc3, 0));
++				audit_mark(mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 0));
  		} else {
  			// Otherwise, translate
  			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
-@@ -1602,6 +1646,8 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1460,6 +1467,8 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
  			if (mcc3->pwatchpoint_set.list[0])
  				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
  #endif
 +			if (audit_map)
-+				audit_mark((bank << 19) | mcc3->GIME->Z, coco3_audit_bits(mcc3, 0));
++				audit_mark((bank << 19) | mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 0));
  		}
  	}
  }
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index f17c8f7..222fbe4 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -30,6 +30,7 @@
+ #include "sds.h"
+ 
+ #include "ao.h"
++#include "audit.h"
+ #include "breakpoint.h"
+ #include "cart.h"
+ #include "crc32.h"
+@@ -1242,6 +1243,12 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+ 	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
+ 	if (md->pwatchpoint_set.list[0] || md->pwatchpoint_set.list[1])
+ 		bp_check_watchpoints(&md->pwatchpoint_set, RnW, A, md->CPU->D);
++	// Audit map: the logical address stands in for the physical, the same
++	// degrade the physical watchpoints just above use on this flat machine.
++	// The bit composition is shared with the CoCo 3 (audit.h); a DEAD cycle
++	// composes to 0 and marks nothing.
++	if (audit_map)
++		audit_mark(A, audit_bits_mc6809(md->CPU, RnW));
+ 	xroar_cpu_cycles += 1;  // one call per 6809 bus cycle = one CPU cycle
+ 
+ 	// SAM decode / timing
 diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
 index 7d1bfaa..b3c1d07 100644
 --- a/src/mc6809/hd6309.c
@@ -301,7 +295,7 @@ index 7f89955..87e51b3 100644
  		struct debug_cpu cpu;
  		struct debug_part part;
 diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
-index 8692414..8ce35d5 100644
+index dbeb3a9..25a6483 100644
 --- a/src/mc6809/mc6809_common.c
 +++ b/src/mc6809/mc6809_common.c
 @@ -49,21 +49,42 @@
@@ -375,7 +369,7 @@ index 8692414..8ce35d5 100644
  #define NVMA_CYCLE (peek_byte(cpu, 0xffff))
  
  /*
-@@ -329,38 +358,48 @@ static void mc6809_emuext_break(struct MC6809 *cpu) {
+@@ -353,38 +382,48 @@ static void mc6809_emuext_break(struct MC6809 *cpu) {
   * Stack operations
   */
  
@@ -437,7 +431,7 @@ index 8692414..8ce35d5 100644
 +	return (v << 8) | mem_read_class(cpu, REG_U++, MC6809_MC_STACK_U | MC6809_MC_PUSHPULL);
  }
 diff --git a/src/xroar.c b/src/xroar.c
-index 557a25b..12d13c7 100644
+index 0ee1f90..29e980d 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -52,6 +52,7 @@
@@ -448,7 +442,7 @@ index 557a25b..12d13c7 100644
  #include "auto_kbd.h"
  #include "joystick_script.h"
  #include "becker.h"
-@@ -148,6 +149,10 @@ struct trap_def {
+@@ -155,6 +156,10 @@ struct trap_def {
  	char *load_spec;    // -trap-load FILE[,opts]; see load_blob()
  	int ratelimit_off;  // -trap-ratelimit-off: run unrestricted from this trap
  	int ratelimit_on;   // -trap-ratelimit-on: back to real time from this trap
@@ -459,7 +453,7 @@ index 557a25b..12d13c7 100644
  
  	// Internal
  	unsigned long counter;
-@@ -1697,6 +1702,7 @@ void xroar_shutdown(void) {
+@@ -1704,6 +1709,7 @@ void xroar_shutdown(void) {
  #endif
  	disable_all_traps();
  	profile_dump();
@@ -467,7 +461,7 @@ index 557a25b..12d13c7 100644
  	save_config();
  	messenger_shutdown();
  	if (xroar.auto_kbd) {
-@@ -4257,6 +4263,27 @@ static void handle_trap(void *sptr) {
+@@ -4265,6 +4271,27 @@ static void handle_trap(void *sptr) {
  		ui_update_state(-1, ui_tag_ratelimit_latch, 1, NULL);
  	}
  
@@ -495,7 +489,7 @@ index 557a25b..12d13c7 100644
  	// Cycle counter actions.  Print before reset so -trap-cycle-print-reset
  	// reports the elapsed count and then zeroes it.  The reset/print is
  	// taken at the point the trapped write reaches the bus, so probe
-@@ -4414,6 +4441,23 @@ static void set_trap(const char *cond) {
+@@ -4422,6 +4449,23 @@ static void set_trap(const char *cond) {
  			cur_trap_def->ratelimit_on = 1;
  			private_cfg.debug.trap_def.ratelimit_on = 0;
  		}
@@ -519,7 +513,7 @@ index 557a25b..12d13c7 100644
  	}
  	if (cond) {
  		unsigned i = num_trap_defs++;
-@@ -4704,6 +4748,11 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4708,6 +4752,11 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
  	{ XC_SET_INT1("trap-ratelimit-off", &private_cfg.debug.trap_def.ratelimit_off) },
  	{ XC_SET_INT1("trap-ratelimit-on", &private_cfg.debug.trap_def.ratelimit_on) },
@@ -531,7 +525,7 @@ index 557a25b..12d13c7 100644
  	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
  	{ XC_SET_STRING("trap-byte", &private_cfg.debug.trap_def.byte_path) },
  	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
-@@ -4979,6 +5028,11 @@ static void helptext(void) {
+@@ -4983,6 +5032,11 @@ static void helptext(void) {
  "    -trap-ratelimit-off run unrestricted from this trap (wall clock only; cycle-exact)\n"
  "    -trap-ratelimit-on  back to real time from this trap\n"
  "    -trap-ram FILE      write flat physical RAM at trap (see -export-ram)\n"

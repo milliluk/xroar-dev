@@ -1,29 +1,38 @@
-From 8615e3f1965746c84741c6810154d3ee53c4e285 Mon Sep 17 00:00:00 2001
+From 409d8b87a33dda5e674d88758230485e15492e37 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:26 -0400
-Subject: [PATCH 29/44] coco: fix -lp-file serial hook address, $A2C1 -> $A2BF
+Subject: [PATCH 29/49] coco: fix -lp-file serial hook address, $A2C1 -> $A2BF
 
 ---
- src/dragon/coco.c | 8 +++++++-
- src/symtab.c      | 6 +++++-
- 2 files changed, 12 insertions(+), 2 deletions(-)
+ src/dragon/coco.c | 17 ++++++++++++-----
+ src/symtab.c      |  6 +++++-
+ 2 files changed, 17 insertions(+), 6 deletions(-)
 
 diff --git a/src/dragon/coco.c b/src/dragon/coco.c
-index 395978c..9771a2c 100644
+index 90fe9a3..cab49a5 100644
 --- a/src/dragon/coco.c
 +++ b/src/dragon/coco.c
-@@ -269,5 +269,11 @@ static void coco_print_byte(void *sptr, bool RnW, uint32_t A) {
+@@ -274,9 +274,16 @@ static void coco_print_byte(void *sptr, bool RnW, uint32_t A) {
  	int byte = MC6809_REG_A(md->CPU);
  	printer_strobe(md->printer_interface, 0, byte);
  	printer_strobe(md->printer_interface, 1, byte);
--	md->CPU->reg_pc = 0xa2df;
+-	// Normally we shortcut past the ROM's slow bit-bang timing loop.  When
+-	// capturing serial at the signal level, let the ROM actually bit-bang the
+-	// byte out PIA1-A bit 1 so the -serial-out tap sees ROM output too.
+-	if (!md->serial_out.stream)
+-		md->CPU->reg_pc = 0xa2df;
 +	// $A2BF is the routine entry, reached before its own PSHS runs, so the
 +	// byte is in A and the stack still holds only the caller's return address.
 +	// Return with an RTS rather than jumping into the body (the coco3 build
 +	// hooks two bytes later at $A2C1 and can jump to $A2DF; the coco ROM lays
 +	// the routine out differently, so entry + RTS is the portable form).
-+	struct machine *m = &md->public;
-+	m->op_rts(m);
++	// When capturing serial at the signal level (-serial-out), skip the
++	// shortcut instead and let the ROM bit-bang the byte out PIA1-A bit 1
++	// so the tap sees ROM output too.
++	if (!md->serial_out.stream) {
++		struct machine *m = &md->public;
++		m->op_rts(m);
++	}
  }
 diff --git a/src/symtab.c b/src/symtab.c
 index ffa62c1..d91eb13 100644

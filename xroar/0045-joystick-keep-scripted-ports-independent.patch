@@ -1,0 +1,324 @@
+From 0e9c5c22ae58ce073b4bb66a66371a4972a4c089 Mon Sep 17 00:00:00 2001
+From: Dino Wars integration <build@localhost>
+Date: Thu, 6 Aug 2026 12:30:00 -0400
+Subject: [PATCH 45/49] joystick: keep scripted ports independent
+
+The scripted joystick module stores one global pair of axes and maps every
+configured port to it.  It also treats `right` and `left` script prefixes as
+unknown commands.  A two-player hardware-path test therefore cannot drive the
+physical ports independently: both read the same value, or remain centred
+when the prefixed commands are rejected.
+
+Keep separate state for the right and left ports, expose explicit joystick
+profiles for each one, and route port-qualified move, axis and button commands
+to that state.  Preserve `script` and the unqualified grammar as right-port
+compatibility aliases, including the existing gdb direct-poke behavior.
+---
+ src/joystick_script.c | 103 ++++++++++++++++++++++++++++++++++--------
+ src/joystick_script.h |   2 +
+ src/xroar.c           |  32 +++++++++----
+ 3 files changed, 111 insertions(+), 26 deletions(-)
+
+diff --git a/src/joystick_script.c b/src/joystick_script.c
+index 7cd3a5c..efc4063 100644
+--- a/src/joystick_script.c
++++ b/src/joystick_script.c
+@@ -74,6 +74,9 @@
+ // One emulated NTSC frame, near enough for `frames`. Use `wait MS` when you
+ // need the double-click window measured precisely.
+ #define SCRIPT_FRAME_TICKS ((event_ticks)(EVENT_TICK_RATE / 60))
++#define SCRIPT_RIGHT_PORT 0u
++#define SCRIPT_LEFT_PORT  1u
++#define SCRIPT_PORT_COUNT 2u
+ 
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ // Synthetic pointer state. Read by the control delegates below; written by the
+@@ -83,8 +86,9 @@
+ static struct {
+ 	int axis[JOYSTICK_NUM_AXES];      // 0..65535
+ 	_Bool button[JOYSTICK_NUM_BUTTONS];
+-} script_state = {
+-	.axis = { 32767, 32767 },
++} script_state[SCRIPT_PORT_COUNT] = {
++	{ .axis = { 32767, 32767 } },
++	{ .axis = { 32767, 32767 } },
+ };
+ 
+ static int clamp16(int v) {
+@@ -93,14 +97,22 @@ static int clamp16(int v) {
+ 	return v;
+ }
+ 
++void script_js_set_axis_port(unsigned port, unsigned axis, int value) {
++	if (port < SCRIPT_PORT_COUNT && axis < JOYSTICK_NUM_AXES)
++		script_state[port].axis[axis] = clamp16(value);
++}
++
++void script_js_set_button_port(unsigned port, unsigned button, _Bool down) {
++	if (port < SCRIPT_PORT_COUNT && button < JOYSTICK_NUM_BUTTONS)
++		script_state[port].button[button] = down;
++}
++
+ void script_js_set_axis(unsigned axis, int value) {
+-	if (axis < JOYSTICK_NUM_AXES)
+-		script_state.axis[axis] = clamp16(value);
++	script_js_set_axis_port(SCRIPT_RIGHT_PORT, axis, value);
+ }
+ 
+ void script_js_set_button(unsigned button, _Bool down) {
+-	if (button < JOYSTICK_NUM_BUTTONS)
+-		script_state.button[button] = down;
++	script_js_set_button_port(SCRIPT_RIGHT_PORT, button, down);
+ }
+ 
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+@@ -109,69 +121,105 @@ void script_js_set_button(unsigned button, _Bool down) {
+ 
+ struct script_axis {
+ 	struct joystick_control joystick_control;
++	unsigned port;
+ 	unsigned axis;
+ };
+ 
+ struct script_button {
+ 	struct joystick_control joystick_control;
++	unsigned port;
+ 	unsigned button;
+ };
+ 
+ static int script_read_axis(void *sptr) {
+ 	struct script_axis *a = sptr;
+-	return script_state.axis[a->axis];
++	return script_state[a->port].axis[a->axis];
+ }
+ 
+ static int script_read_button(void *sptr) {
+ 	struct script_button *b = sptr;
+-	return script_state.button[b->button] ? 1 : 0;
++	return script_state[b->port].button[b->button] ? 1 : 0;
+ }
+ 
+ // spec is the CONTROL-SPEC after the "script:" prefix. For an axis it may be
+ // "x"/"y" or "0"/"1"; empty falls back to the slot index. For a button it's the
+ // 1-based button number like the mouse submodule, empty falls back to slot.
+-static struct joystick_control *script_configure_axis(char *spec, unsigned jaxis) {
++static struct joystick_control *configure_axis_for_port(char *spec, unsigned jaxis,
++							 unsigned port) {
+ 	unsigned idx = jaxis;
+ 	if (spec && *spec) {
+ 		if (*spec == 'x' || *spec == 'X') idx = 0;
+ 		else if (*spec == 'y' || *spec == 'Y') idx = 1;
+ 		else idx = (unsigned)strtol(spec, NULL, 0);
+ 	}
+-	if (idx >= JOYSTICK_NUM_AXES)
++	if (port >= SCRIPT_PORT_COUNT || idx >= JOYSTICK_NUM_AXES)
+ 		return NULL;
+ 
+ 	struct script_axis *a = xmalloc(sizeof(*a));
+ 	*a = (struct script_axis){0};
++	a->port = port;
+ 	a->axis = idx;
+ 	a->joystick_control.read = DELEGATE_AS0(int, script_read_axis, a);
+ 	a->joystick_control.free = DELEGATE_AS0(void, free, a);
+ 	return &a->joystick_control;
+ }
+ 
+-static struct joystick_control *script_configure_button(char *spec, unsigned jbutton) {
++static struct joystick_control *configure_button_for_port(char *spec, unsigned jbutton,
++							   unsigned port) {
+ 	unsigned idx = jbutton;
+ 	if (spec && *spec)
+ 		idx = (unsigned)(strtol(spec, NULL, 0));
+-	if (idx >= JOYSTICK_NUM_BUTTONS)
++	if (port >= SCRIPT_PORT_COUNT || idx >= JOYSTICK_NUM_BUTTONS)
+ 		return NULL;
+ 
+ 	struct script_button *b = xmalloc(sizeof(*b));
+ 	*b = (struct script_button){0};
++	b->port = port;
+ 	b->button = idx;
+ 	b->joystick_control.read = DELEGATE_AS0(int, script_read_button, b);
+ 	b->joystick_control.free = DELEGATE_AS0(void, free, b);
+ 	return &b->joystick_control;
+ }
+ 
++static struct joystick_control *script_right_axis(char *spec, unsigned axis) {
++	return configure_axis_for_port(spec, axis, SCRIPT_RIGHT_PORT);
++}
++
++static struct joystick_control *script_right_button(char *spec, unsigned button) {
++	return configure_button_for_port(spec, button, SCRIPT_RIGHT_PORT);
++}
++
++static struct joystick_control *script_left_axis(char *spec, unsigned axis) {
++	return configure_axis_for_port(spec, axis, SCRIPT_LEFT_PORT);
++}
++
++static struct joystick_control *script_left_button(char *spec, unsigned button) {
++	return configure_button_for_port(spec, button, SCRIPT_LEFT_PORT);
++}
++
+ static struct joystick_submodule script_js_submod = {
+ 	.name = "script",
+ 	.init = NULL,
+-	.configure_axis = script_configure_axis,
+-	.configure_button = script_configure_button,
++	.configure_axis = script_right_axis,
++	.configure_button = script_right_button,
++};
++
++static struct joystick_submodule script_right_submod = {
++	.name = "script-right",
++	.configure_axis = script_right_axis,
++	.configure_button = script_right_button,
++};
++
++static struct joystick_submodule script_left_submod = {
++	.name = "script-left",
++	.configure_axis = script_left_axis,
++	.configure_button = script_left_button,
+ };
+ 
+ static struct joystick_submodule *script_js_submodlist[] = {
+ 	&script_js_submod,
++	&script_right_submod,
++	&script_left_submod,
+ 	NULL
+ };
+ 
+@@ -238,6 +286,7 @@ enum { ACT_MOVE, ACT_AXIS, ACT_BUTTON, ACT_TYPE, ACT_KEY };
+ struct script_step {
+ 	event_ticks delay;   // ticks to wait before applying, relative to prev step
+ 	int type;
++	unsigned port;
+ 	int a, b;            // MOVE: a=x,b=y | AXIS: a=idx,b=val | BUTTON: a=idx,b=down
+ 	char *str;           // TYPE: text for ak_parse_type_string (backslash escapes ok)
+ };
+@@ -251,14 +300,14 @@ static _Bool event_inited = 0;
+ static void apply_step(const struct script_step *s) {
+ 	switch (s->type) {
+ 	case ACT_MOVE:
+-		script_js_set_axis(0, s->a);
+-		script_js_set_axis(1, s->b);
++		script_js_set_axis_port(s->port, 0, s->a);
++		script_js_set_axis_port(s->port, 1, s->b);
+ 		break;
+ 	case ACT_AXIS:
+-		script_js_set_axis((unsigned)s->a, s->b);
++		script_js_set_axis_port(s->port, (unsigned)s->a, s->b);
+ 		break;
+ 	case ACT_BUTTON:
+-		script_js_set_button((unsigned)s->a, s->b ? 1 : 0);
++		script_js_set_button_port(s->port, (unsigned)s->a, s->b ? 1 : 0);
+ 		break;
+ 	case ACT_TYPE:
+ 		// Reuse XRoar's auto-typer. It breakpoints the ROM key-poll at
+@@ -308,6 +357,18 @@ static struct script_step *push_step(event_ticks *pending_delay) {
+ 	return s;
+ }
+ 
++static unsigned parse_port_prefix(char **tok) {
++	if (*tok && strcmp(*tok, "right") == 0) {
++		*tok = strtok(NULL, " \t\r\n");
++		return SCRIPT_RIGHT_PORT;
++	}
++	if (*tok && strcmp(*tok, "left") == 0) {
++		*tok = strtok(NULL, " \t\r\n");
++		return SCRIPT_LEFT_PORT;
++	}
++	return SCRIPT_RIGHT_PORT;
++}
++
+ int script_js_load(const char *path) {
+ 	if (!path)
+ 		return 0;
+@@ -329,6 +390,9 @@ int script_js_load(const char *path) {
+ 			*hash = '\0';
+ 
+ 		char *tok = strtok(line, " \t\r\n");
++		if (!tok)
++			continue;
++		unsigned port = parse_port_prefix(&tok);
+ 		if (!tok)
+ 			continue;
+ 
+@@ -346,6 +410,7 @@ int script_js_load(const char *path) {
+ 			if (a && b) {
+ 				struct script_step *s = push_step(&pending_delay);
+ 				s->type = ACT_MOVE;
++				s->port = port;
+ 				s->a = clamp16((int)strtol(a, NULL, 0));
+ 				s->b = clamp16((int)strtol(b, NULL, 0));
+ 			}
+@@ -358,6 +423,7 @@ int script_js_load(const char *path) {
+ 				             : (unsigned)strtoul(a, NULL, 0);
+ 				struct script_step *s = push_step(&pending_delay);
+ 				s->type = ACT_AXIS;
++				s->port = port;
+ 				s->a = (int)idx;
+ 				s->b = clamp16((int)strtol(b, NULL, 0));
+ 			}
+@@ -365,6 +431,7 @@ int script_js_load(const char *path) {
+ 			char *a = strtok(NULL, " \t\r\n");
+ 			struct script_step *s = push_step(&pending_delay);
+ 			s->type = ACT_BUTTON;
++			s->port = port;
+ 			s->a = a ? (int)strtol(a, NULL, 0) : 0;
+ 			s->b = (tok[0] == 'd');
+ 		} else if (strcmp(tok, "key") == 0) {
+diff --git a/src/joystick_script.h b/src/joystick_script.h
+index dc9b251..66f6742 100644
+--- a/src/joystick_script.h
++++ b/src/joystick_script.h
+@@ -27,5 +27,7 @@ int script_js_load(const char *path);
+ // value is 0..65535 (centre 32767); axis 0 = X, 1 = Y.
+ void script_js_set_axis(unsigned axis, int value);
+ void script_js_set_button(unsigned button, _Bool down);
++void script_js_set_axis_port(unsigned port, unsigned axis, int value);
++void script_js_set_button_port(unsigned port, unsigned button, _Bool down);
+ 
+ #endif
+diff --git a/src/xroar.c b/src/xroar.c
+index d788075..8e1d6f6 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -1489,15 +1489,31 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+ 	}
+ 	joystick_init();
+ 
+-	// Builtin scripted-pointer config, so the runner needs only
+-	// "-joy-right script". Submodule "script" lives in joystick_script.c.
+-	if (!joystick_config_by_name("script")) {
++	// Builtin deterministic scripted joystick profiles.  "script" is a
++	// compatibility alias for the right port; explicit profiles keep the two
++	// physical ports independent.
++	struct {
++		const char *name;
++		const char *submodule;
++		const char *description;
++	} script_profiles[] = {
++		{ "script",       "script",       "Scripted right joystick (compatibility alias)" },
++		{ "script-right", "script-right", "Scripted right joystick" },
++		{ "script-left",  "script-left",  "Scripted left joystick" },
++	};
++	for (unsigned i = 0; i < ARRAY_N_ELEMENTS(script_profiles); i++) {
++		if (joystick_config_by_name(script_profiles[i].name))
++			continue;
+ 		struct joystick_config *jc = joystick_config_new();
+-		jc->name = xstrdup("script");
+-		jc->description = xstrdup("Scripted synthetic pointer");
+-		jc->axis_specs[0] = xstrdup("script:x");
+-		jc->axis_specs[1] = xstrdup("script:y");
+-		jc->button_specs[0] = xstrdup("script:0");
++		jc->name = xstrdup(script_profiles[i].name);
++		jc->description = xstrdup(script_profiles[i].description);
++		char spec[64];
++		snprintf(spec, sizeof(spec), "%s:x", script_profiles[i].submodule);
++		jc->axis_specs[0] = xstrdup(spec);
++		snprintf(spec, sizeof(spec), "%s:y", script_profiles[i].submodule);
++		jc->axis_specs[1] = xstrdup(spec);
++		snprintf(spec, sizeof(spec), "%s:0", script_profiles[i].submodule);
++		jc->button_specs[0] = xstrdup(spec);
+ 	}
+ #ifdef HAVE_WASM
+ 	if (private_cfg.joy.wasm_virtual) {

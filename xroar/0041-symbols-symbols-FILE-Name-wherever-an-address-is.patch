@@ -1,8 +1,12 @@
-From bdebc754aa9c64822c5881d204d8fe51a3f2df3f Mon Sep 17 00:00:00 2001
+From 6db6450228dfa4714e4f945b4a34f050d7e5f4e1 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:51 -0400
-Subject: [PATCH 41/44] symbols: -symbols FILE, @Name wherever an address is,
+Subject: [PATCH 41/49] symbols: -symbols FILE, @Name wherever an address is,
 
+The sym: stop-reply pair rides the every-machine T packet, so a Dragon
+stop is symbolized too: the reverse lookup keys on the physical PC,
+which on a flat machine is the logical PC by the same degrade the rest
+of the fork uses.
 ---
  src/Makefile.am            |   3 +-
  src/gdb.c                  |  32 ++++++++++--
@@ -34,20 +38,20 @@ index 61d49ed..6407ee1 100644
  	tape_cas.c \
  	tape_sndfile.c \
 diff --git a/src/gdb.c b/src/gdb.c
-index 526f642..0a9f61f 100644
+index b0e37de..41dea21 100644
 --- a/src/gdb.c
 +++ b/src/gdb.c
-@@ -104,6 +104,9 @@
+@@ -108,6 +108,9 @@
   * Use that, not paddr: paddr is the machine's last bus cycle, which by the
   * time a stop reply is formatted has moved past the triggering access -- a
   * 16-bit store to a watched byte reports the byte AFTER it.
 + * With -symbols loaded, a further sym: pair carries "Name+off (IMAGE)" and,
 + * if line records were loaded too, " file:line" -- hex-encoded, because an
 + * RSP value is hex.
-  * Unrecognised pairs are ignorable by protocol.  Machines with no GIME reply
-  * 'S' exactly as before.
+  * Unrecognised pairs are ignorable by protocol.
  
-@@ -172,6 +175,8 @@
+  * The four derived values above are as far as this should go. Anything that is
+@@ -175,6 +178,8 @@
  #include "mc6809/mc6809.h"
  #include "mc6883.h"
  #include "ram.h"
@@ -56,47 +60,47 @@ index 526f642..0a9f61f 100644
  #include "tcc1014/tcc1014.h"
  #include "xroar.h"
  
-@@ -910,7 +915,7 @@ static int send_char(struct gdb_interface_private *gip, char c) {
- // stop rather than "whatever is mapped by the time you ask".  Machines with
- // no MMU have nothing to add and reply 'S' as before.
+@@ -920,7 +925,7 @@ static int send_char(struct gdb_interface_private *gip, char c) {
+ // rather than 'S', so a machine-independent field added to this reply reaches
+ // every machine instead of riding the GIME branch.
  static void send_last_signal(struct gdb_interface_private *gip) {
 -	char tmpbuf[96];
 +	char tmpbuf[512];
- 	if (gip->gime) {
- 		uint16_t pc = mc6809_get_pc(gip->cpu);
- 		unsigned xpc = tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff;
-@@ -927,8 +932,29 @@ static void send_last_signal(struct gdb_interface_private *gip) {
- 		// so it describes this stop and not an earlier one.
- 		if (n > 0 && (size_t)n < sizeof(tmpbuf) &&
- 		    gip->machine->debug.wp_match_pending) {
--			snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
--				 gip->machine->debug.wp_match_address & 0x1fffff);
-+			n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
-+				      gip->machine->debug.wp_match_address & 0x1fffff);
+ 	uint16_t pc = mc6809_get_pc(gip->cpu);
+ 	// With no MMU the physical PC is the logical PC -- the same degrade
+ 	// trap_fast_phys() applies everywhere else in this fork.
+@@ -942,8 +947,29 @@ static void send_last_signal(struct gdb_interface_private *gip) {
+ 	// so it describes this stop and not an earlier one.
+ 	if (n > 0 && (size_t)n < sizeof(tmpbuf) &&
+ 	    gip->machine->debug.wp_match_pending) {
+-		snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
+-			 gip->machine->debug.wp_match_address & 0x1fffff);
++		n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, "watch:%05x;",
++			      gip->machine->debug.wp_match_address & 0x1fffff);
++	}
++	// With -symbols, say where the stop is in the program's own
++	// terms.  An RSP value is hex, so the text goes over
++	// hex-encoded -- the pair is ignorable by protocol, and a
++	// client that does not decode it loses nothing.  This is the
++	// same reverse lookup the flight recorder and the profiler
++	// print, so a stop and a trace name a routine identically.
++	const char *where = symfile_whereis(xpc, 0);
++	if (where && n > 0 && (size_t)n < sizeof(tmpbuf)) {
++		const char *src = symfile_line(xpc);
++		char text[192];
++		snprintf(text, sizeof(text), "%s%s%s", where,
++			 src ? " " : "", src ? src : "");
++		size_t room = sizeof(tmpbuf) - (size_t)n;
++		if (room > 8 + strlen(text) * 2) {
++			n += snprintf(tmpbuf + n, room, "sym:");
++			for (const char *p = text; *p; p++)
++				n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n,
++					      "%02x", (unsigned char)*p);
++			snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, ";");
 +		}
-+		// With -symbols, say where the stop is in the program's own
-+		// terms.  An RSP value is hex, so the text goes over
-+		// hex-encoded -- the pair is ignorable by protocol, and a
-+		// client that does not decode it loses nothing.  This is the
-+		// same reverse lookup the flight recorder and the profiler
-+		// print, so a stop and a trace name a routine identically.
-+		const char *where = symfile_whereis(xpc, 0);
-+		if (where && n > 0 && (size_t)n < sizeof(tmpbuf)) {
-+			const char *src = symfile_line(xpc);
-+			char text[192];
-+			snprintf(text, sizeof(text), "%s%s%s", where,
-+				 src ? " " : "", src ? src : "");
-+			size_t room = sizeof(tmpbuf) - (size_t)n;
-+			if (room > 8 + strlen(text) * 2) {
-+				n += snprintf(tmpbuf + n, room, "sym:");
-+				for (const char *p = text; *p; p++)
-+					n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n,
-+						      "%02x", (unsigned char)*p);
-+				snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n, ";");
-+			}
- 		}
- 		send_packet_string(gip, tmpbuf);
- 		return;
+ 	}
+ 	send_packet_string(gip, tmpbuf);
+ }
 diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
 index b3c1d07..21764ac 100644
 --- a/src/mc6809/hd6309.c
@@ -124,10 +128,10 @@ index 59b514f..74fe38e 100644
  #ifdef TRACE
  #include "mc6809_trace.h"
 diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
-index 8ce35d5..fd6ff13 100644
+index 25a6483..a62f4be 100644
 --- a/src/mc6809/mc6809_common.c
 +++ b/src/mc6809/mc6809_common.c
-@@ -236,6 +236,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -258,6 +258,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  		//   a b cc dp   8-bit  -> 2 hex     d x y u s pc  16-bit -> 4 hex
  		//   xpc paddr   phys   -> 5 hex     block task    -> 2 hex
  		//   cycles      event_current_tick -> decimal
@@ -135,7 +139,7 @@ index 8ce35d5..fd6ff13 100644
  		// A bare '$' not followed by '{' is emitted literally.
  		if (c == '$') {
  			uint8_t n1 = DELEGATE_CALL(cpu->debug.cpu.debug_read, fmt + i + 1);
-@@ -266,6 +267,31 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -288,6 +289,31 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  			else if (0 == strcmp(name, "s"))   snprintf(piece, sizeof(piece), "%04x", REG_S);
  			else if (0 == strcmp(name, "pc"))  snprintf(piece, sizeof(piece), "%04x", REG_PC);
  			else if (0 == strcmp(name, "cycles")) snprintf(piece, sizeof(piece), "%u", (unsigned)event_current_tick);
@@ -165,10 +169,10 @@ index 8ce35d5..fd6ff13 100644
 +					continue;
 +			}
  			else if (cpu->debug.cpu.state_read.func) {
- 				// xpc/paddr/block/task -- machine-specific, routed via a
- 				// named state delegate wired in coco3.c.
+ 				// xpc/paddr/block/task -- machine-specific, routed
+ 				// via a named state delegate wired per machine.  A
 diff --git a/src/xroar.c b/src/xroar.c
-index dbe0d77..93a8a67 100644
+index d8ec9b5..d9d65e3 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -79,6 +79,8 @@
@@ -180,7 +184,7 @@ index dbe0d77..93a8a67 100644
  #include "tape.h"
  #include "tcc1014/tcc1014.h"  // tcc1014_logical_to_physical, for xpc=
  #include "ui.h"
-@@ -1703,6 +1705,7 @@ void xroar_shutdown(void) {
+@@ -1710,6 +1712,7 @@ void xroar_shutdown(void) {
  	disable_all_traps();
  	profile_dump();
  	audit_shutdown();
@@ -188,7 +192,7 @@ index dbe0d77..93a8a67 100644
  	save_config();
  	messenger_shutdown();
  	if (xroar.auto_kbd) {
-@@ -3045,11 +3048,21 @@ static void add_load(const char *arg) {
+@@ -3052,11 +3055,21 @@ static void add_load(const char *arg) {
  // and not silently 0 -- it's an error). Base is always explicit (10 or 16):
  // strtoul's base-0 auto-detect would also treat a leading "0" as octal,
  // which is exactly the kind of silent wrong-base surprise this avoids.
@@ -210,7 +214,7 @@ index dbe0d77..93a8a67 100644
  	int base = 10;
  	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
  		s += 2;
-@@ -3471,6 +3484,14 @@ static void handle_seconds_trigger(void *sptr) {
+@@ -3479,6 +3492,14 @@ static void handle_seconds_trigger(void *sptr) {
  static int trap_addr_space(const char *tok) {
  	if (!tok || !*tok)
  		return -1;
@@ -225,7 +229,7 @@ index dbe0d77..93a8a67 100644
  	if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
  		tok += 2;
  		int n = 0;
-@@ -3935,6 +3956,36 @@ static void trap_history_dump(void) {
+@@ -3943,6 +3964,36 @@ static void trap_history_dump(void) {
  	unsigned start = (trap_history_pos + (unsigned)trap_history_size - n)
  	                 % (unsigned)trap_history_size;
  	fprintf(stderr, "trap-history: last %u physical PCs, oldest first:\n", n);
@@ -262,7 +266,7 @@ index dbe0d77..93a8a67 100644
  	for (unsigned i = 0; i < n; ++i) {
  		unsigned long v = trap_history_ring[(start + i) % (unsigned)trap_history_size];
  		if ((i % 8) == 0)
-@@ -3983,9 +4034,16 @@ static void profile_record(void *sptr, uint32_t A) {
+@@ -3991,9 +4042,16 @@ static void profile_record(void *sptr, uint32_t A) {
  }
  
  // -profile-range NAME=LO-HI (repeatable).  LO/HI are physical addresses,
@@ -282,7 +286,7 @@ index dbe0d77..93a8a67 100644
  static void profile_add_range(const char *spec) {
  	if (profile_num_ranges >= PROFILE_MAX_RANGES) {
  		LOG_MOD_WARN("profile", "too many -profile-range (max %d), ignoring %s\n",
-@@ -3999,11 +4057,14 @@ static void profile_add_range(const char *spec) {
+@@ -4007,11 +4065,14 @@ static void profile_add_range(const char *spec) {
  	}
  	char *name = xstrndup(spec, (size_t)(eq - spec));
  	const char *rng = eq + 1;
@@ -302,7 +306,7 @@ index dbe0d77..93a8a67 100644
  	if (lo > 0x7ffff || hi > 0x7ffff || hi < lo) {
  		LOG_MOD_WARN("profile", "-profile-range %s: bad physical range\n", spec);
  		free(name);
-@@ -4071,11 +4132,16 @@ static void profile_dump(void) {
+@@ -4079,11 +4140,16 @@ static void profile_dump(void) {
  			}
  		}
  		fprintf(f, "profile: top %d physical PCs by cycles:\n", have);
@@ -323,7 +327,7 @@ index dbe0d77..93a8a67 100644
  		free(top);
  	}
  	if (f != stderr) fclose(f);
-@@ -4767,6 +4833,11 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4771,6 +4837,11 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_BOOL("gdb-pseudo-regs", &xroar.cfg.debug.gdb_pseudo_regs) },
  	{ XC_SET_BOOL("trace", &logging.trace_cpu) },
  	{ XC_SET_BOOL("trace-timing", &logging.trace_cpu_timing) },
@@ -335,7 +339,7 @@ index dbe0d77..93a8a67 100644
  #ifdef WANT_TRAPS
  	{ XC_CALL_STRING("trap", &set_trap) },
  	{ XC_CALL_STRING("trap-range", &set_trap_count) },
-@@ -5041,6 +5112,13 @@ static void helptext(void) {
+@@ -5045,6 +5116,13 @@ static void helptext(void) {
  "  -debug-ui FLAGS       UI debugging (see manual, or -1 for all)\n"
  "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
  "  -q, -quiet            equivalent to -verbose 0\n"

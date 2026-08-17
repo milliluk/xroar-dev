@@ -1,14 +1,14 @@
-From 003189adf8d967dd1868edfeee381491187a37d7 Mon Sep 17 00:00:00 2001
+From 4ae2109222b52dfd0ed13618ed19e0dabe2a02bb Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:16 -0400
-Subject: [PATCH 24/44] emuext: physical-PC profiler
+Subject: [PATCH 24/49] emuext: physical-PC profiler
 
 ---
  src/xroar.c | 206 ++++++++++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 206 insertions(+)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index fbb3a42..52fdfca 100644
+index 611d95c..2ab896f 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -205,6 +205,43 @@ static void trap_history_dump(void);
@@ -63,7 +63,7 @@ index fbb3a42..52fdfca 100644
  	save_config();
  	messenger_shutdown();
  	if (xroar.auto_kbd) {
-@@ -3559,6 +3597,25 @@ static void enable_all_traps(void) {
+@@ -3560,6 +3598,25 @@ static void enable_all_traps(void) {
  		machine_add_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
  		trap_history_installed = 1;
  	}
@@ -89,7 +89,7 @@ index fbb3a42..52fdfca 100644
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
  		enable_trap(&trap_defs[i], 1);
  	}
-@@ -3569,6 +3626,12 @@ static void disable_all_traps(void) {
+@@ -3570,6 +3627,12 @@ static void disable_all_traps(void) {
  		machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_history_record, NULL));
  		trap_history_installed = 0;
  	}
@@ -102,7 +102,7 @@ index fbb3a42..52fdfca 100644
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
  		enable_trap(&trap_defs[i], 0);
  	}
-@@ -3693,6 +3756,142 @@ static void trap_history_dump(void) {
+@@ -3694,6 +3757,142 @@ static void trap_history_dump(void) {
  	}
  }
  
@@ -245,7 +245,7 @@ index fbb3a42..52fdfca 100644
  // xpcrange= edge detector, called on every instruction fetch while armed.
  // Fires the moment the physical PC ENTERS [lo,hi]; staying inside does not
  // re-fire, leaving re-arms.  Level-triggering would fire on every
-@@ -4249,6 +4448,9 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4250,6 +4449,9 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_CALL_STRING("trap", &set_trap) },
  	{ XC_CALL_STRING("trap-range", &set_trap_count) },
  	{ XC_SET_INT("trap-history", &trap_history_size) },
@@ -255,7 +255,7 @@ index fbb3a42..52fdfca 100644
  	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
  	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
  	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
-@@ -4504,6 +4706,10 @@ static void helptext(void) {
+@@ -4505,6 +4707,10 @@ static void helptext(void) {
  #ifdef WANT_TRAPS
  "  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
  "  -trap-history N       ring of last N executed physical PCs; dump on any trap\n"

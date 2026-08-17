@@ -1,0 +1,583 @@
+From 972c054989fa5d5d88accc0156ca11bb6c304ee9 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 10 Aug 2026 21:52:39 -0400
+Subject: [PATCH 48/49] backtrace: shadow call stack, -backtrace /
+ -trap-backtrace, protect faults
+
+The 6809 has no frame pointer, so walking the S stack after a crash is
+guesswork: return addresses interleave with pushed registers and locals,
+and an interrupt drops a 12-byte frame wherever S points.  An emulator
+does not have to guess.  One callback per instruction -- the ambient hook
+-trap-history already rides -- keeps the call stack the program actually
+built:
+
+  - the instruction after a JSR/BSR/LBSR opens a frame.  Calls are
+    recognised one boundary late, by the callee's first instruction, when
+    the return address is already pushed and S is exact.  First opcode
+    bytes only, and neither $10 nor $11 prefixes a call, so a prefixed
+    opcode can never alias one.
+  - a rise in the core's interrupt depth opens an interrupt frame.
+  - any frame whose recorded S is below the current S has been left,
+    however it was left.  RTS, RTI, `puls pc`, LEAS unwinding and
+    longjmp-style tricks all fall out of this one rule; the return path
+    needs no opcode knowledge at all.
+
+-trap-backtrace dumps it, symbolized, when a trap fires -- `-trap
+xpc=@DrawBrush -trap-backtrace` answers "who calls this" without a
+debugger attached.  A protect fault dumps it on stderr next to the
+register report.  -backtrace arms it alone; protect mode or any
+-trap-backtrace action implies it; -no-backtrace refuses both
+implications (the -headless rule).
+
+The cores grow get_sp / get_irq_depth delegates beside get_pc, restored
+for the same reason get_pc was: the machine's debug_cpu copy is taken
+before coco3_finish wires the emuext delegates, so anything wired at CPU
+creation is the only thing reliably in it.
+
+The opcode peek reads FLAT PHYSICAL RAM (flat_ram_peek), not the
+machine's debug bus read.  The first attempt used machine->read_byte and
+promptly faulted -protect-mode-read on the program's own code: the debug
+read routes through the same memory path the protect checks watch, and
+arrived classified with the previous cycle's stale access class.  The
+flat peek touches no machine state.  Its one lie is a PC executing from
+ROM, where the MMU translation is fiction and the peek reads whatever RAM
+sits behind it: boot-time frames may be junk, frames after the program
+takes over are exact, and the S rule keeps the stack consistent either
+way.
+
+Known limits, deliberate: a program running multiple stacks (a task
+switcher repointing S) interleaves the tasks' frames, and a call whose
+target is preempted by an interrupt before its first instruction loses
+that one frame.  Both degrade the dump, never the emulation.
+
+The flat-RAM lookup goes through flat_ram_resolve (patch 9), the same
+resolution every consumer of flat physical RAM uses (-load-ram, the gdb
+stub): one part "RAM" everywhere but the MC-10, whose RAM0+RAM1 pair
+spans as a single flat space, expansion included.  The pair is resolved
+once, at attach; the per-instruction peek stays a compare and the same
+arithmetic as before, never a part lookup.  On the MC-10 itself the
+6803's missing stack-pointer delegate still refuses the backtrace first
+-- loudly, as before -- but the RAM lookup is no longer a second, silent
+way to fail.
+---
+ src/Makefile.am     |   1 +
+ src/backtrace.c     | 212 ++++++++++++++++++++++++++++++++++++++++++++
+ src/backtrace.h     |  63 +++++++++++++
+ src/debug.h         |   5 ++
+ src/mc6809/hd6309.c |   2 +
+ src/mc6809/mc6809.c |  12 +++
+ src/mc6809/mc6809.h |   2 +
+ src/protect.c       |   7 +-
+ src/xroar.c         |  43 +++++++++
+ 9 files changed, 346 insertions(+), 1 deletion(-)
+ create mode 100644 src/backtrace.c
+ create mode 100644 src/backtrace.h
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index d08a836..c7b217c 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -22,6 +22,7 @@ xroar_SOURCES = \
+ 	auto_kbd.c auto_kbd.h \
+ 	audit.c audit.h \
+ 	protect.c protect.h \
++	backtrace.c backtrace.h \
+ 	symtab.c symtab.h \
+ 	ay891x.c ay891x.h \
+ 	becker.c becker.h \
+diff --git a/src/backtrace.c b/src/backtrace.c
+new file mode 100644
+index 0000000..c5c8173
+--- /dev/null
++++ b/src/backtrace.c
+@@ -0,0 +1,212 @@
++/** \file
++ *
++ *  \brief Shadow call stack and symbolized backtrace.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ */
++
++#include "top-config.h"
++
++#include <stdio.h>
++#include <string.h>
++
++#include "delegate.h"
++
++#include "backtrace.h"
++#include "logging.h"
++#include "machine.h"
++#include "part.h"
++#include "ram.h"
++#include "symfile.h"
++#include "tcc1014/tcc1014.h"
++
++// Deep enough for any sane program; a runaway recursion hits the protect
++// checks or the breakpoint long before frame 128 is interesting.  On
++// overflow the OUTERMOST frame is dropped: the innermost frames are the
++// ones a crash report is for.
++#define BACKTRACE_MAX (128)
++
++struct bt_frame {
++	uint32_t call_phys;   // physical PC of the call (or interrupted) instruction
++	uint32_t target_phys; // physical PC of the callee's (or handler's) first instruction
++	uint16_t call_pc;     // logical forms of the same
++	uint16_t target_pc;
++	uint16_t s_after;     // S once the return context was pushed
++	uint8_t irq;          // interrupt frame, not a call
++};
++
++static struct bt_frame frames[BACKTRACE_MAX];
++static unsigned bt_depth = 0;
++static unsigned long bt_dropped = 0;
++
++static struct machine *bt_machine = NULL;
++static struct TCC1014 *bt_gime = NULL;
++static struct flat_ram bt_ram;
++
++// Per-instruction state carried to the next boundary.  The hook fires
++// BEFORE an instruction executes, so a call is recognised one boundary
++// late: by its callee's first instruction, when the return address is
++// already on the stack and S says everything there is to know.
++static _Bool bt_primed = 0;
++static uint8_t bt_prev_op = 0;
++static uint16_t bt_prev_pc = 0;
++static uint32_t bt_prev_phys = 0;
++static unsigned bt_prev_irq = 0;
++
++static uint32_t bt_phys(uint16_t pc) {
++	if (!bt_gime)
++		return pc;
++	return tcc1014_logical_to_physical(bt_gime, pc) & 0x7ffff;
++}
++
++// JSR direct/indexed/extended, BSR, LBSR.  First bytes only: neither $10
++// nor $11 prefixes a call, so a prefixed opcode can never alias one.
++static _Bool bt_is_call(uint8_t op) {
++	return op == 0x8d || op == 0x17 ||
++	       op == 0x9d || op == 0xad || op == 0xbd;
++}
++
++static void bt_push(uint16_t pc, uint32_t phys, unsigned s, _Bool irq_frame) {
++	if (bt_depth == BACKTRACE_MAX) {
++		memmove(&frames[0], &frames[1],
++		        (BACKTRACE_MAX - 1) * sizeof(frames[0]));
++		bt_depth--;
++		bt_dropped++;
++	}
++	struct bt_frame *f = &frames[bt_depth++];
++	f->call_phys = bt_prev_phys;
++	f->call_pc = bt_prev_pc;
++	f->target_phys = phys;
++	f->target_pc = pc;
++	f->s_after = (uint16_t)s;
++	f->irq = irq_frame;
++}
++
++static void bt_hook(void *sptr, uint32_t A) {
++	(void)sptr;
++	struct machine *m = bt_machine;
++	if (!m)
++		return;
++	uint16_t pc = (uint16_t)A;
++	unsigned s = DELEGATE_CALL(m->debug.cpu.get_sp);
++	unsigned irq = DELEGATE_CALL(m->debug.cpu.get_irq_depth);
++	uint32_t phys = bt_phys(pc);
++
++	if (bt_primed) {
++		// The one rule of the return path: a frame whose post-call S
++		// is below the current S has been left, however it was left.
++		while (bt_depth && frames[bt_depth - 1].s_after < (uint16_t)s)
++			bt_depth--;
++		if (irq > bt_prev_irq) {
++			// An interrupt dispatched since the last boundary; this
++			// instruction is its handler's first.  A call in the
++			// same window lost the race and its frame -- see the
++			// header -- but S accounting stays exact.
++			bt_push(pc, phys, s, 1);
++		} else if (bt_is_call(bt_prev_op)) {
++			bt_push(pc, phys, s, 0);
++		}
++	}
++
++	// The opcode ABOUT to execute, peeked from flat physical RAM.  NOT
++	// machine->read_byte: the debug bus read routes through the same
++	// memory path the audit map and the protect checks watch, and a
++	// per-instruction peek classified with the previous cycle's stale
++	// access class faulted -protect-mode-read on the program's own code.
++	// The flat peek touches no machine state at all.  Its one lie is a PC
++	// executing from ROM, where the MMU translation is fiction and the
++	// peek reads whatever RAM sits behind it -- boot-time frames may be
++	// junk; frames after the program takes over are exact.
++	int op = flat_ram_peek(&bt_ram, phys);
++	bt_prev_op = (op < 0) ? 0 : (uint8_t)op;
++	bt_prev_pc = pc;
++	bt_prev_phys = phys;
++	bt_prev_irq = irq;
++	bt_primed = 1;
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++void backtrace_attach(struct machine *m) {
++	if (!m || bt_machine == m)
++		return;
++	// If a previous machine was attached, its hook died with it; only the
++	// bookkeeping needs resetting.
++	bt_machine = NULL;
++	if (!m->debug.cpu.get_sp.func || !m->debug.cpu.get_irq_depth.func) {
++		LOG_MOD_WARN("backtrace", "this machine's CPU exposes no stack "
++		             "pointer; backtrace not armed\n");
++		return;
++	}
++	bt_depth = 0;
++	bt_dropped = 0;
++	bt_primed = 0;
++	// Resolve the flat RAM pair ONCE, here: the per-instruction peek in
++	// bt_hook must never pay for a part lookup.  (Academic on the MC-10
++	// itself -- its 6803 core fails the get_sp check above -- but the
++	// lookup should not be the thing that breaks a future machine with
++	// the same two-part naming.)
++	if (!flat_ram_resolve(&bt_ram, &m->part)) {
++		LOG_MOD_WARN("backtrace", "this machine exposes no flat RAM; "
++		             "backtrace not armed\n");
++		return;
++	}
++	bt_machine = m;
++	bt_gime = (struct TCC1014 *)part_component_by_id_is_a(&m->part, "GIME", "TCC1014");
++	machine_add_instruction_hook(m, DELEGATE_AS1(void, uint32, bt_hook, NULL));
++}
++
++void backtrace_detach(struct machine *m) {
++	if (bt_machine && m == bt_machine)
++		machine_remove_instruction_hook(m, DELEGATE_AS1(void, uint32, bt_hook, NULL));
++	bt_machine = NULL;
++	bt_gime = NULL;
++	bt_ram = (struct flat_ram){0};
++	bt_depth = 0;
++	bt_primed = 0;
++}
++
++_Bool backtrace_attached(void) {
++	return bt_machine != NULL;
++}
++
++void backtrace_dump(FILE *f) {
++	if (!bt_machine) {
++		fprintf(f, "backtrace: not armed (pass -backtrace)\n");
++		return;
++	}
++	if (!bt_depth) {
++		fprintf(f, "backtrace: no frames (top level, or nothing called yet)\n");
++		return;
++	}
++	fprintf(f, "backtrace: %u frame(s), innermost first", bt_depth);
++	if (bt_dropped)
++		fprintf(f, " (%lu outermost dropped)", bt_dropped);
++	fprintf(f, ":\n");
++	unsigned n = 0;
++	for (unsigned d = bt_depth; d-- > 0; n++) {
++		const struct bt_frame *fr = &frames[d];
++		const char *in_w = symfile_whereis(fr->target_phys, 0);
++		const char *at_w = symfile_whereis(fr->call_phys, 0);
++		const char *at_l = symfile_line(fr->call_phys);
++		fprintf(f, "backtrace: #%-2u %s 0x%05X%s%s%s <- 0x%05X%s%s%s%s%s s=%04X\n",
++		        n, fr->irq ? "irq" : "in ",
++		        fr->target_phys,
++		        in_w ? " (" : "", in_w ? in_w : "", in_w ? ")" : "",
++		        fr->call_phys,
++		        at_w ? " (" : "", at_w ? at_w : "", at_w ? ")" : "",
++		        at_l ? " " : "", at_l ? at_l : "",
++		        fr->s_after);
++	}
++}
+diff --git a/src/backtrace.h b/src/backtrace.h
+new file mode 100644
+index 0000000..5ab8a4c
+--- /dev/null
++++ b/src/backtrace.h
+@@ -0,0 +1,63 @@
++/** \file
++ *
++ *  \brief Shadow call stack and symbolized backtrace.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ *
++ *  The 6809 has no frame pointer, so walking the S stack after the fact is
++ *  guesswork: return addresses interleave with pushed registers and locals,
++ *  and an interrupt drops a 12-byte frame wherever S points.  An emulator
++ *  does not have to guess.  This watches the machine run -- one callback per
++ *  instruction, the hook -trap-history already rides -- and keeps the call
++ *  stack the program actually built:
++ *
++ *   - the instruction after a JSR/BSR/LBSR opens a frame (call site,
++ *     target, S after the return address was pushed);
++ *   - a rise in the core's interrupt depth opens an interrupt frame;
++ *   - any frame whose recorded S is below the current S has been returned
++ *     from -- or discarded with LEAS/PULS/LDS -- and closes.  RTS, RTI,
++ *     `puls pc` and stack-unwinding longjmp tricks all fall out of that one
++ *     rule, with no opcode knowledge on the return path at all.
++ *
++ *  What it cannot follow: a program that runs multiple stacks (a task
++ *  switcher pointing S at another task's stack leaves the old task's frames
++ *  interleaved), and a JSR whose target is preempted by an interrupt before
++ *  its first instruction loses that one frame.  Both degrade the dump, not
++ *  the emulation.
++ */
++
++#ifndef XROAR_BACKTRACE_H_
++#define XROAR_BACKTRACE_H_
++
++#include <stdio.h>
++
++struct machine;
++
++// Install the per-instruction hook on this machine and start (or restart)
++// the shadow stack.  Declines, with a warning, a machine whose CPU does not
++// expose S and interrupt depth (the MC-10's 6803 does not).  A previous
++// machine's hook died with that machine and is never touched.
++void backtrace_attach(struct machine *m);
++
++// Remove the hook if it is attached to this machine, and forget the stack.
++void backtrace_detach(struct machine *m);
++
++_Bool backtrace_attached(void);
++
++// Print the shadow stack, innermost frame first, symbolized when -symbols
++// is loaded.  Prints a one-line note when not armed, so a -trap-backtrace
++// that fires without -backtrace explains itself.
++void backtrace_dump(FILE *f);
++
++#endif
+diff --git a/src/debug.h b/src/debug.h
+index 8410b5f..65c13c7 100644
+--- a/src/debug.h
++++ b/src/debug.h
+@@ -60,6 +60,11 @@ struct debug_cpu {
+ 	// it; the emuext handlers, trap access context, and the flight recorder
+ 	// all want the PC without a round trip through the register interface.
+ 	DELEGATE_T0(unsigned) get_pc;
++	// Stack pointer and interrupt nesting depth, restored for the same
++	// reason as get_pc: the shadow call stack samples both once per
++	// instruction and cannot afford the register-interface round trip.
++	DELEGATE_T0(unsigned) get_sp;
++	DELEGATE_T0(unsigned) get_irq_depth;
+ 	// lwasm emulator-extension opcodes (pragma emuext).  Called by the CPU
+ 	// core when it decodes BREAK ($113E) or LOG ($103E).  The machine wires
+ 	// these to route to gdb / stderr; see coco3.c and dragon/dragon.c, which
+diff --git a/src/mc6809/hd6309.c b/src/mc6809/hd6309.c
+index 21764ac..db68159 100644
+--- a/src/mc6809/hd6309.c
++++ b/src/mc6809/hd6309.c
+@@ -221,6 +221,8 @@ static struct part *hd6309_allocate(void) {
+ 	cpu->debug.cpu.register_sp = 7;  // S
+ 	cpu->debug.cpu.register_pc = 8;  // PC
+ 	cpu->debug.cpu.get_pc = DELEGATE_AS0(unsigned, mc6809_get_pc, cpu);
++	cpu->debug.cpu.get_sp = DELEGATE_AS0(unsigned, mc6809_get_s, cpu);
++	cpu->debug.cpu.get_irq_depth = DELEGATE_AS0(unsigned, mc6809_get_irq_depth, cpu);
+ 	cpu->debug.cpu.get_flag = DELEGATE_AS1(bool, int, mc6809_get_flag, cpu);
+ 	cpu->debug.cpu.set_flag = DELEGATE_AS2(void, int, bool, mc6809_set_flag, cpu);
+ 
+diff --git a/src/mc6809/mc6809.c b/src/mc6809/mc6809.c
+index 74fe38e..14100b2 100644
+--- a/src/mc6809/mc6809.c
++++ b/src/mc6809/mc6809.c
+@@ -199,6 +199,8 @@ static struct part *mc6809_allocate(void) {
+ 	cpu->debug.cpu.register_sp = 7;  // S
+ 	cpu->debug.cpu.register_pc = 8;  // PC
+ 	cpu->debug.cpu.get_pc = DELEGATE_AS0(unsigned, mc6809_get_pc, cpu);
++	cpu->debug.cpu.get_sp = DELEGATE_AS0(unsigned, mc6809_get_s, cpu);
++	cpu->debug.cpu.get_irq_depth = DELEGATE_AS0(unsigned, mc6809_get_irq_depth, cpu);
+ 	cpu->debug.cpu.get_flag = DELEGATE_AS1(bool, int, mc6809_get_flag, cpu);
+ 	cpu->debug.cpu.set_flag = DELEGATE_AS2(void, int, bool, mc6809_set_flag, cpu);
+ 
+@@ -1641,6 +1643,16 @@ unsigned mc6809_get_pc(void *sptr) {
+ 	return cpu->reg_pc;
+ }
+ 
++unsigned mc6809_get_s(void *sptr) {
++	struct MC6809 *cpu = sptr;
++	return cpu->reg_s;
++}
++
++unsigned mc6809_get_irq_depth(void *sptr) {
++	struct MC6809 *cpu = sptr;
++	return cpu->irq_depth;
++}
++
+ // PC of the instruction currently being traced/executed (start-of-instruction
+ // PC, stable mid-instruction).  1.11 carried this; restored for the
+ // qxroar.trace-pc gdb query.
+diff --git a/src/mc6809/mc6809.h b/src/mc6809/mc6809.h
+index 87e51b3..d1dea89 100644
+--- a/src/mc6809/mc6809.h
++++ b/src/mc6809/mc6809.h
+@@ -181,6 +181,8 @@ void mc6809_init_debug_info(struct MC6809 *cpu);
+ extern const struct debug_feature m6809_core_feature;
+ bool mc6809_get_flag(void *sptr, int n);
+ unsigned mc6809_get_pc(void *sptr);
++unsigned mc6809_get_s(void *sptr);
++unsigned mc6809_get_irq_depth(void *sptr);
+ unsigned mc6809_get_trace_pc(void *sptr);
+ void mc6809_set_flag(void *sptr, int n, bool v);
+ 
+diff --git a/src/protect.c b/src/protect.c
+index eb97c38..967d38e 100644
+--- a/src/protect.c
++++ b/src/protect.c
+@@ -26,6 +26,7 @@
+ 
+ #include "xalloc.h"
+ 
++#include "backtrace.h"
+ #include "logging.h"
+ #include "machine.h"
+ #include "mc6809/mc6809.h"
+@@ -278,9 +279,13 @@ void protect_fault(struct MC6809 *cpu, unsigned pc, unsigned phys_pc,
+ 	        (bits & AUDIT_PUSHPULL) ? " pushpull" : "");
+ 
+ 	// The ring, if -trap-history armed one: last N instructions, the
+-	// faulting one last.  Backtrace, when built, hangs off the same spot.
++	// faulting one last.
+ 	xroar_trap_history_dump();
+ 
++	// The shadow call stack (armed by default whenever protect mode is);
++	// with symbols this is the crash's "how did we get here".
++	backtrace_dump(stderr);
++
+ 	const char *path = dump_path ? dump_path : "protect-crash.ram";
+ 	if (xroar.machine && xroar.machine->dump_ram) {
+ 		FILE *fd = fopen(path, "wb");
+diff --git a/src/xroar.c b/src/xroar.c
+index 34b4825..7871b3a 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -55,6 +55,7 @@
+ #include "ao.h"
+ #include "audit.h"
+ #include "auto_kbd.h"
++#include "backtrace.h"
+ #include "protect.h"
+ #include "joystick_script.h"
+ #include "becker.h"
+@@ -176,6 +177,7 @@ struct trap_def {
+ 	char *audit_write;  // -trap-audit-write FILE: write the map at this trap
+ 	int protect_on;     // -trap-protect-on: protect checks live from this trap
+ 	int protect_off;    // -trap-protect-off: protect checks dormant from this trap
++	int backtrace;      // -trap-backtrace: dump the shadow call stack
+ 
+ 	// Internal
+ 	unsigned long counter;
+@@ -287,6 +289,16 @@ static _Bool profile_active(void) {
+ 
+ #endif
+ 
++// -backtrace: maintain the shadow call stack.  Tri-state so that the things
++// that PRINT it -- protect mode, a -trap-backtrace action -- can imply it,
++// while -no-backtrace still wins from either side (the -headless rule).
++static int backtrace_wanted = -1;
++
++static void set_backtrace(_Bool v) {
++	backtrace_wanted = v;
++}
++
++
+ // Private
+ 
+ struct private_cfg {
+@@ -2629,6 +2641,25 @@ void xroar_connect_machine(void) {
+ 	// Protect mode arms here for the same reason the traps enable here:
+ 	// this is the first moment the machine the checks describe exists.
+ 	protect_arm();
++
++	// The shadow call stack arms when asked for, or when anything that
++	// prints it exists: a protect fault dumps it, and so does a
++	// -trap-backtrace action.  -no-backtrace refuses both implications.
++	bool bt = (backtrace_wanted > 0);
++#ifdef WANT_TRAPS
++	if (backtrace_wanted < 0) {
++		bt = protect_checks != 0;
++		for (unsigned i = 0; !bt && i < num_trap_defs; ++i)
++			bt = trap_defs[i].backtrace;
++	}
++#else
++	if (backtrace_wanted < 0)
++		bt = protect_checks != 0;
++#endif
++	if (bt)
++		backtrace_attach(xroar.machine);
++	else
++		backtrace_detach(xroar.machine);
+ }
+ 
+ void xroar_configure_machine(struct machine_config *mc) {
+@@ -4610,6 +4641,9 @@ static void handle_trap(void *sptr) {
+ 		LOG_MOD_DEBUG(2, "trap", "protect on\n");
+ 		protect_set_active(1);
+ 	}
++	if (trap->backtrace) {
++		backtrace_dump(stdout);
++	}
+ 
+ 	// Cycle counter actions.  Print before reset so -trap-cycle-print-reset
+ 	// reports the elapsed count and then zeroes it.  The reset/print is
+@@ -4793,6 +4827,10 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->protect_off = 1;
+ 			private_cfg.debug.trap_def.protect_off = 0;
+ 		}
++		if (private_cfg.debug.trap_def.backtrace) {
++			cur_trap_def->backtrace = 1;
++			private_cfg.debug.trap_def.backtrace = 0;
++		}
+ 	}
+ 	if (cond) {
+ 		unsigned i = num_trap_defs++;
+@@ -5106,6 +5144,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_CALL_STRING("protect-allow", &set_protect_allow) },
+ 	{ XC_CALL_STRING("protect-stack-floor", &set_protect_stack_floor) },
+ 	{ XC_CALL_STRING("protect-dump", &protect_opt_dump) },
++	{ XC_CALL_BOOL("backtrace", &set_backtrace) },
+ #ifdef WANT_TRAPS
+ 	{ XC_CALL_STRING("trap", &set_trap) },
+ 	{ XC_CALL_STRING("trap-range", &set_trap_count) },
+@@ -5123,6 +5162,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_STRING("trap-audit-write", &private_cfg.debug.trap_def.audit_write) },
+ 	{ XC_SET_INT1("trap-protect-on", &private_cfg.debug.trap_def.protect_on) },
+ 	{ XC_SET_INT1("trap-protect-off", &private_cfg.debug.trap_def.protect_off) },
++	{ XC_SET_INT1("trap-backtrace", &private_cfg.debug.trap_def.backtrace) },
+ 	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
+ 	{ XC_SET_STRING("trap-byte", &private_cfg.debug.trap_def.byte_path) },
+ 	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
+@@ -5426,6 +5466,9 @@ static void helptext(void) {
+ "    -trap-protect-on    arm protect checks at this trap, NOT at the first mapped\n"
+ "                          code fetch (which is the default without this)\n"
+ "    -trap-protect-off   protect checks dormant from this trap\n"
++"  -backtrace            maintain a shadow call stack (implied by -protect-mode\n"
++"                        and -trap-backtrace; -no-backtrace overrides)\n"
++"    -trap-backtrace     dump the symbolized call stack when this trap fires\n"
+ "    -export-ram FILE    dump flat physical RAM of -load snapshot, then exit\n"
+ #ifdef SCREENSHOT
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"

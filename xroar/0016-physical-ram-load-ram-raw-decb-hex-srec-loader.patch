@@ -1,14 +1,73 @@
-From 04501e19ad8c21aabd55c23116e4593544768cf5 Mon Sep 17 00:00:00 2001
+From aa5c0cfb24618f07f15b00fb861495cf3c52d81e Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:57 -0400
-Subject: [PATCH 16/44] physical-ram: -load-ram (raw/decb/hex/srec loader) +
+Subject: [PATCH 16/49] physical-ram: -load-ram (raw/decb/hex/srec loader) +
 
+The raw loader looked up the machine's RAM part by the id "RAM" only, and
+the MC-10 splits its RAM across two parts, RAM0/RAM1 -- so on that
+machine a raw -load-ram warned "machine has no RAM to load into" despite
+the RAM being right there under different ids.  The lookup now goes
+through flat_ram_resolve (patch 9): every machine's flat RAM as an
+ordered pair, "RAM" alone everywhere else, the MC-10's RAM0 at [0, size0)
+with RAM1 above it, so addr= reaches the whole machine, 16K expansion
+included.  (The parts keep their names: their organisations differ -- 2K
+banks vs 4K banks -- so they could never have merged into one part, and
+renaming was only ever cosmetic.)
+
+The MC-10's dump_ram wrote a file no flat address described: RAM0's
+present banks, then RAM1's present banks in CREATION order -- 1,2,3,0,
+because the expansion adds bank 0 last -- with absent banks silently
+skipped.  -export-ram (and every later dump_ram consumer) promises file
+offset == flat physical address == what addr= means here, and the coco3
+and dragon dumps already keep that promise, so the MC-10 dump now writes
+both parts' banks in index order with absent banks zero-filled.
 ---
- src/xroar.c | 214 ++++++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 214 insertions(+)
+ src/mc10.c  |  29 ++++---
+ src/xroar.c | 215 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 232 insertions(+), 12 deletions(-)
 
+diff --git a/src/mc10.c b/src/mc10.c
+index f38847e..fa1229f 100644
+--- a/src/mc10.c
++++ b/src/mc10.c
+@@ -855,18 +855,23 @@ static void mc10_op_rts(struct machine *m) {
+ 
+ static void mc10_dump_ram(struct machine *m, FILE *fd) {
+ 	struct mc10 *mp = (struct mc10 *)m;
+-	struct ram *ram0 = mp->RAM0;
+-	for (unsigned bank = 0; bank < ram0->nbanks; bank++) {
+-		if (ram0->d && ram0->d[bank]) {
+-			fwrite(ram0->d[bank], ram0->bank_nelems, 1, fd);
+-		}
+-	}
+-	struct ram *ram1 = mp->RAM1;
+-	if (ram1) {
+-		for (unsigned i = 0; i < ram1->nbanks; i++) {
+-			unsigned bank = (i + 1) & 3;
+-			if (ram1->d && ram1->d[bank]) {
+-				fwrite(ram1->d[bank], ram1->bank_nelems, 1, fd);
++	// Both parts, banks in index order, absent banks zero-filled, so that
++	// file offset == flat physical address (RAM0 at 0, RAM1 above it) ==
++	// the addressing -load-ram's addr= uses.  Upstream wrote only the
++	// PRESENT banks, RAM1's in creation order (1,2,3,0 -- the expansion
++	// adds bank 0 last), which matched no address space at all.
++	struct ram *rams[2] = { mp->RAM0, mp->RAM1 };
++	for (unsigned i = 0; i < 2; i++) {
++		struct ram *ram = rams[i];
++		if (!ram)
++			continue;
++		for (unsigned bank = 0; bank < ram->nbanks; bank++) {
++			if (ram->d && ram->d[bank]) {
++				fwrite(ram->d[bank], ram->bank_nelems, 1, fd);
++			} else {
++				for (size_t z = 0; z < ram->bank_nelems; z++) {
++					fputc(0, fd);
++				}
+ 			}
+ 		}
+ 	}
 diff --git a/src/xroar.c b/src/xroar.c
-index bf2065a..a2b9ee6 100644
+index bf2065a..cbaf39a 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -233,6 +233,8 @@ struct private_cfg {
@@ -70,7 +129,7 @@ index bf2065a..a2b9ee6 100644
  	// Type strings into machine
  	while (private_cfg.kbd.type_list) {
  		sds data = private_cfg.kbd.type_list->data;
-@@ -2826,6 +2864,180 @@ static void add_load(const char *arg) {
+@@ -2826,6 +2864,181 @@ static void add_load(const char *arg) {
  	}
  }
  
@@ -180,9 +239,10 @@ index bf2065a..a2b9ee6 100644
 +			free(s);
 +			return;
 +		}
-+		struct ram *ram = (struct ram *)part_component_by_id_is_a(
-+			(struct part *)xroar.machine, "RAM", "ram");
-+		if (!ram) {
++		// One part "RAM" everywhere but the MC-10, whose RAM0+RAM1
++		// pair spans as a single flat space (see flat_ram_resolve).
++		struct flat_ram fr;
++		if (!flat_ram_resolve(&fr, (struct part *)xroar.machine)) {
 +			LOG_MOD_WARN("load", "machine has no RAM to load into\n");
 +			free(s);
 +			return;
@@ -208,7 +268,7 @@ index bf2065a..a2b9ee6 100644
 +		uint8_t *buf = xmalloc(want);
 +		size_t got = fread(buf, 1, want, f);
 +		fclose(f);
-+		size_t n = ram_load_flat(ram, addr, buf, got);
++		size_t n = flat_ram_load(&fr, addr, buf, got);
 +		free(buf);
 +		LOG_MOD_PRINT("load", "%s -> phys:0x%06lX, %zu bytes (raw)\n", file, addr, n);
 +		if (n < got)
@@ -251,7 +311,7 @@ index bf2065a..a2b9ee6 100644
  // Add a file to load and mark its slot to autorun.
  
  static void add_run(const char *arg) {
-@@ -3275,6 +3487,7 @@ static struct xconfig_option const xroar_options[] = {
+@@ -3275,6 +3488,7 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_CALL_STRING_NE("load", &add_load) },
  	{ XC_SET_BOOL("reset-snap", &private_cfg.file.reset_snap) },
  	{ XC_SET_STRING_NE("reset-snap-filename", &private_cfg.file.reset_snap_file) },
@@ -259,7 +319,7 @@ index bf2065a..a2b9ee6 100644
  	{ XC_CALL_STRING_NE("run", &add_run) },
  	{ XC_SET_STRING_NE("load-fd0", &private_cfg.file.fd[0]) },
  	{ XC_SET_STRING_NE("load-fd1", &private_cfg.file.fd[1]) },
-@@ -3563,6 +3776,7 @@ static void helptext(void) {
+@@ -3563,6 +3777,7 @@ static void helptext(void) {
  "  -load FILE            load or attach FILE\n"
  "  -reset-snap          soft reset reloads the -load snapshot (hard reset = cold boot)\n"
  "  -reset-snap-filename FILE  soft reset reloads FILE (no -load needed; overrides -reset-snap target)\n"

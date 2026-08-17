@@ -1,7 +1,7 @@
-From e35c8ac1b9ba97f839184873b34c0d6cd215baf8 Mon Sep 17 00:00:00 2001
+From 3770d2396d2f8b166ebc8b1b491884ebd5e40446 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:30 -0400
-Subject: [PATCH 31/44] trap: physical read=/write= watches via GIME Z, and
+Subject: [PATCH 31/49] trap: physical read=/write= watches via GIME Z, and
 
 ---
  src/breakpoint.h    |  14 ++++
@@ -37,10 +37,10 @@ index a07c29b..beeee97 100644
 +
  #endif
 diff --git a/src/coco3.c b/src/coco3.c
-index c4d69ca..8bb5726 100644
+index fdceff6..0ed721e 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
-@@ -177,6 +177,7 @@ struct coco3 {
+@@ -170,6 +170,7 @@ struct coco3 {
  #endif
  	struct bp_breakpoint_set breakpoint_set;
  	struct bp_watchpoint_set watchpoint_set;
@@ -48,7 +48,7 @@ index c4d69ca..8bb5726 100644
  
  	struct tape_interface *tape_interface;
  	DELEGATE_T1(void, float) tape_update_audio;
-@@ -377,9 +378,29 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+@@ -370,9 +371,29 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
  				 DELEGATE_T2(void, bool, uint32) handler);
  static void coco3_remove_breakpoint(struct machine *m, int32_t A,
  				    DELEGATE_T2(void, bool, uint32) handler);
@@ -78,7 +78,7 @@ index c4d69ca..8bb5726 100644
  static void coco3_remove_watchpoint(struct machine *m, int RnW,
  				    int32_t Astart, uint32_t Aend,
  				    DELEGATE_T3(void, bool, uint32, uint8) handler);
-@@ -483,6 +504,8 @@ static struct part *coco3_allocate(void) {
+@@ -476,6 +497,8 @@ static struct part *coco3_allocate(void) {
  	m->debug.remove_instruction_hook = coco3_remove_instruction_hook;
  	m->debug.remove_breakpoint = coco3_remove_breakpoint;
  	m->debug.add_watchpoint = coco3_add_watchpoint;
@@ -87,7 +87,7 @@ index c4d69ca..8bb5726 100644
  	m->debug.remove_watchpoint = coco3_remove_watchpoint;
  
  	m->keyboard.type = dkbd_layout_coco3;
-@@ -1453,10 +1476,21 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1339,10 +1362,21 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
  		if (!mcc3->dat.MMUEN || (mcc3->dat.MC3 && A >= 0xfe00 && A < 0xff00)) {
  			// MMU not enabled, or CRM enabled and CRM region
  			ram_d8(mcc3->RAM, nWE, 0, Zrow, Zcol, &mcc3->CPU->D);
@@ -109,7 +109,7 @@ index c4d69ca..8bb5726 100644
  		}
  	}
  }
-@@ -1525,10 +1559,21 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1411,10 +1445,21 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
  		if (!mcc3->dat.MMUEN || (mcc3->dat.MC3 && A >= 0xfe00 && A < 0xff00)) {
  			// MMU not enabled, or CRM enabled and CRM region
  			ram_d8(mcc3->RAM, nWE, 0, Zrow, Zcol, &mcc3->CPU->D);
@@ -132,7 +132,7 @@ index c4d69ca..8bb5726 100644
  	}
  }
 diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
-index 4bd5fc3..3b08c0b 100644
+index 54c3fa3..f17c8f7 100644
 --- a/src/dragon/dragon.c
 +++ b/src/dragon/dragon.c
 @@ -255,6 +255,12 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
@@ -148,7 +148,7 @@ index 4bd5fc3..3b08c0b 100644
  static void dragon_remove_watchpoint(struct machine *m, int RnW,
  				     int32_t Astart, uint32_t Aend,
  				     DELEGATE_T3(void, bool, uint32, uint8) handler);
-@@ -320,6 +326,8 @@ void dragon_allocate_common(struct dragon *md) {
+@@ -328,6 +334,8 @@ void dragon_allocate_common(struct dragon *md) {
  	m->debug.remove_instruction_hook = dragon_remove_instruction_hook;
  	m->debug.remove_breakpoint = dragon_remove_breakpoint;
  	m->debug.add_watchpoint = dragon_add_watchpoint;
@@ -157,7 +157,7 @@ index 4bd5fc3..3b08c0b 100644
  	m->debug.remove_watchpoint = dragon_remove_watchpoint;
  
  	m->keyboard.type = dkbd_layout_dragon;
-@@ -1092,6 +1100,8 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+@@ -1232,6 +1240,8 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
  
  	// Check watchpoints
  	bp_check_watchpoints(&md->watchpoint_set, RnW, A, md->CPU->D);
@@ -166,7 +166,7 @@ index 4bd5fc3..3b08c0b 100644
  	xroar_cpu_cycles += 1;  // one call per 6809 bus cycle = one CPU cycle
  
  	// SAM decode / timing
-@@ -1368,6 +1378,20 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+@@ -1508,6 +1518,20 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
  	}
  }
  
@@ -188,7 +188,7 @@ index 4bd5fc3..3b08c0b 100644
  				  uint32_t Astart, uint32_t Aend,
  				  DELEGATE_T3(void, bool, uint32, uint8) handler) {
 diff --git a/src/dragon/dragon.h b/src/dragon/dragon.h
-index 36cc61c..26b2bd8 100644
+index 5989b52..8851d6b 100644
 --- a/src/dragon/dragon.h
 +++ b/src/dragon/dragon.h
 @@ -94,6 +94,7 @@ struct dragon {
@@ -231,7 +231,7 @@ index 04299e0..9bab82c 100644
  
  #define machine_remove_watchpoint_all(m,s) machine_remove_watchpoint((m), -1, 0, DELEGATE_AS3(void, bool, uint32, uint8, NULL, (s)))
 diff --git a/src/mc10.c b/src/mc10.c
-index c9c87cd..b9d3ae9 100644
+index 9117baa..07abaa1 100644
 --- a/src/mc10.c
 +++ b/src/mc10.c
 @@ -92,6 +92,7 @@ struct mc10 {
@@ -264,7 +264,7 @@ index c9c87cd..b9d3ae9 100644
  	m->debug.remove_watchpoint = mc10_remove_watchpoint;
  
  	m->get_interface = mc10_get_interface;
-@@ -920,6 +929,20 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+@@ -934,6 +943,20 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
  	}
  }
  
@@ -285,20 +285,20 @@ index c9c87cd..b9d3ae9 100644
  static void mc10_add_watchpoint(struct machine *m, bool RnW,
  				  uint32_t Astart, uint32_t Aend,
  				  DELEGATE_T3(void, bool, uint32, uint8) handler) {
-@@ -1095,6 +1118,8 @@ static void mc10_mem_cycle(void *sptr, bool RnW, uint16_t A) {
+@@ -1109,6 +1132,8 @@ static void mc10_mem_cycle(void *sptr, bool RnW, uint16_t A) {
  	}
  #ifdef WANT_GDB_TARGET
  	bp_check_watchpoints(&mp->watchpoint_set, RnW, A, mp->CPU->D);
 +	if (mp->pwatchpoint_set.list[0] || mp->pwatchpoint_set.list[1])
 +		bp_check_watchpoints(&mp->pwatchpoint_set, RnW, A, mp->CPU->D);
  #endif
+ 	xroar_cpu_cycles += 1;  // one call per 6803 bus cycle = one CPU cycle
  
- 	int ncycles = 16;
 diff --git a/src/xroar.c b/src/xroar.c
-index b56cfa7..f677d52 100644
+index 579f254..38efa02 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -155,6 +155,11 @@ struct trap_def {
+@@ -162,6 +162,11 @@ struct trap_def {
  	int screenshot_kind;         // 0=unset, 1=single, 2=bounded, 3=unbounded
  	unsigned long screenshot_last;   // captured upper bound when bounded
  	long match_value;   // value= qualifier for write traps, or -1 for none
@@ -310,7 +310,7 @@ index b56cfa7..f677d52 100644
  	long xpcr_lo;       // xpcrange= physical range low, or -1 for none
  	long xpcr_hi;       // xpcrange= physical range high
  	bool xpcr_inside;   // xpcrange= edge state: PC was inside on the last fetch
-@@ -3418,6 +3423,57 @@ static void handle_seconds_trigger(void *sptr) {
+@@ -3426,6 +3431,57 @@ static void handle_seconds_trigger(void *sptr) {
  	event_queue(&trg->event);
  }
  
@@ -368,7 +368,7 @@ index b56cfa7..f677d52 100644
  static void enable_trap(struct trap_def *trap, bool enable) {
  	if (0 == c_strcasecmp(trap->cond, "immediate") ||
  	    0 == strcmp(trap->cond, "-")) {
-@@ -3527,6 +3583,14 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3535,6 +3591,14 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  		unsigned long a = -1UL, b = -1UL;
  		parse_range_ul(val, &a, &b);
  
@@ -383,7 +383,7 @@ index b56cfa7..f677d52 100644
  		if (a != -1UL) {
  			if (b == -1UL) {
  				b = a;
-@@ -3567,30 +3631,86 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3575,30 +3639,86 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  					machine_remove_instruction_hook(xroar.machine, DELEGATE_AS1(void, uint32, trap_xpcrange_check, trap));
  					trap->xpcr_hooked = 0;
  				}
@@ -486,7 +486,7 @@ index b56cfa7..f677d52 100644
  }
  
  static void enable_all_traps(void) {
-@@ -3977,6 +4097,15 @@ static void handle_trap(void *sptr) {
+@@ -3985,6 +4105,15 @@ static void handle_trap(void *sptr) {
  		return;
  	}
  
@@ -502,7 +502,7 @@ index b56cfa7..f677d52 100644
  	// Flight recorder: a real trap fire dumps the -trap-history ring,
  	// newest entry last.  Both range bounds are checked here: the engine's
  	// disable-at-tail design lets one trigger past range->last reach the
-@@ -4181,6 +4310,11 @@ static void set_trap(const char *cond) {
+@@ -4189,6 +4318,11 @@ static void set_trap(const char *cond) {
  			cur_trap_def->ram = private_cfg.debug.trap_def.ram;
  			private_cfg.debug.trap_def.ram = NULL;
  		}
@@ -514,7 +514,7 @@ index b56cfa7..f677d52 100644
  		if (private_cfg.debug.trap_def.screenshot) {
  			free(cur_trap_def->screenshot);
  			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
-@@ -4526,6 +4660,7 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4530,6 +4664,7 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_INT1("trap-ratelimit-off", &private_cfg.debug.trap_def.ratelimit_off) },
  	{ XC_SET_INT1("trap-ratelimit-on", &private_cfg.debug.trap_def.ratelimit_on) },
  	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
@@ -522,7 +522,7 @@ index b56cfa7..f677d52 100644
  	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
  	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
  	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
-@@ -4781,7 +4916,9 @@ static void helptext(void) {
+@@ -4785,7 +4920,9 @@ static void helptext(void) {
  "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
  "  -q, -quiet            equivalent to -verbose 0\n"
  #ifdef WANT_TRAPS

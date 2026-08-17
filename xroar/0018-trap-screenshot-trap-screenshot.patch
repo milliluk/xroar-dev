@@ -1,31 +1,34 @@
-From b5eef5b1e8c63d2c2f747368b55d231c74700c81 Mon Sep 17 00:00:00 2001
+From 43433122a9177c7a5bd348eca75f4f38e1389fcb Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:03 -0400
-Subject: [PATCH 18/44] trap-screenshot: -trap-screenshot +
+Subject: [PATCH 18/49] trap-screenshot: -trap-screenshot +
 
+The SHOT handler first landed in coco3.c with the instruction_shot
+delegate wired for that machine only.  The core decodes the LOG command
+for every 6809 machine and DELEGATE_SAFE_CALL swallows a call through an
+unwired delegate, so a Dragon-family guest requesting SHOT got no file
+and no warning -- the worst kind of no.  Nothing in the handler ever
+touched machine state (its sptr was unused), so it moves to debug.c
+beside the other shared emuext bodies, and both 6809 machine families
+wire the delegate through the same thin trampoline shape emuext_log
+already uses.
 ---
- src/coco3.c                |  97 +++++++++++++++++++++++++++++++++
- src/debug.h                |   1 +
- src/mc6809/mc6809_common.c |  83 +++++++++++++++++++++++++++++
+ src/coco3.c                |   9 ++++
+ src/debug.c                |  96 +++++++++++++++++++++++++++++++++
+ src/debug.h                |   2 +
+ src/dragon/dragon.c        |   7 +++
+ src/mc6809/mc6809_common.c |  84 +++++++++++++++++++++++++++++
  src/screenshot.c           |  89 +++++++++++++++++++++++++++++++
  src/screenshot.h           |  23 ++++++++
  src/vo.h                   |   5 ++
  src/xroar.c                | 106 +++++++++++++++++++++++++++++++++++++
- 7 files changed, 404 insertions(+)
+ 9 files changed, 421 insertions(+)
 
 diff --git a/src/coco3.c b/src/coco3.c
-index 399bc40..88b88b7 100644
+index 9537b7e..542090e 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
-@@ -61,6 +61,7 @@
- #include "tcc1014/tcc1014.h"
- #include "ui.h"
- #include "vo.h"
-+#include "screenshot.h"
- #include "xroar.h"
- 
- #ifndef M_PI
-@@ -398,6 +399,7 @@ static void coco3_free(struct part *p);
+@@ -398,6 +398,7 @@ static void coco3_free(struct part *p);
  // lwasm emuext opcode handlers (wired into the CPU's debug_cpu delegates)
  static void coco3_emubreak(void *sptr);
  static void coco3_emulog(void *sptr, const char *s);
@@ -33,7 +36,7 @@ index 399bc40..88b88b7 100644
  static uint8_t coco3_emuread(void *sptr, uint16_t A);
  static int32_t coco3_emustate(void *sptr, const char *name);
  
-@@ -755,6 +757,7 @@ static bool coco3_finish(struct part *p) {
+@@ -755,6 +756,7 @@ static bool coco3_finish(struct part *p) {
  	mcc3->CPU->debug.cpu.emuext = xroar.cfg.debug.emuext;
  	mcc3->CPU->debug.cpu.instruction_break = DELEGATE_AS0(void, coco3_emubreak, mcc3);
  	mcc3->CPU->debug.cpu.instruction_log = DELEGATE_AS1(void, charcp, coco3_emulog, mcc3);
@@ -41,13 +44,42 @@ index 399bc40..88b88b7 100644
  	mcc3->CPU->debug.cpu.debug_read = DELEGATE_AS1(uint8, uint16, coco3_emuread, mcc3);
  	mcc3->CPU->debug.cpu.state_read = DELEGATE_AS1(int32, charcp, coco3_emustate, mcc3);
  
-@@ -1023,6 +1026,100 @@ static void coco3_emubreak(void *sptr) {
- 	LOG_MOD_DEBUG(1, "emu", "BREAK at $%04x\n", pc);
+@@ -1024,6 +1026,13 @@ static uint8_t coco3_emuread(void *sptr, uint16_t A) {
+ 	return emuext_read(&mcc3->public, A);
+ }
+ 
++// lwasm emuext LOG screenshot command (SHOT).  Nothing here is specific to
++// this machine; the body is shared with the Dragon family in debug.c.
++static void coco3_emushot(void *sptr, const char *arg) {
++	(void)sptr;
++	emuext_shot(arg);
++}
++
+ // Named machine-state read for LOG ${name}: xpc, paddr, block, task -- the
+ // same values gdb's qxroar.* queries expose.  Returns -1 for an unknown name.
+ // This is the one emuext delegate that CANNOT be shared: it answers for the
+diff --git a/src/debug.c b/src/debug.c
+index 23e377a..309754f 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -32,6 +32,8 @@
+ #include "gdb.h"
+ #include "logging.h"
+ #include "machine.h"
++#include "screenshot.h"
++#include "vo.h"
+ #include "xroar.h"
+ 
+ // Some built-in composite types used in target descriptions
+@@ -359,6 +361,100 @@ void emuext_log(struct gdb_interface *gdb, const char *s) {
+ #endif
  }
  
 +// lwasm emuext LOG screenshot commands (CMD 1 = now, CMD 2 = next frame).  The
 +// core hands over one byte of defer flag (0 = now, 1 = defer to vsync) followed
 +// by the raw filename template from ROM; everything policy-shaped lives here.
++// One shared copy, for every machine that wires the delegate -- nothing in it
++// touches machine state, so a per-machine copy would only be a copy.
 +//
 +// Template tokens:
 +//   {##}   two-digit auto index, 00 upward, one step per shot this run.
@@ -68,13 +100,12 @@ index 399bc40..88b88b7 100644
 +// instruction of a run may not land on disk; shoot it CMD 1, or leave the
 +// machine a frame to run.  Hit 99 and the command stops writing and stays
 +// silent, no wrap, no overwrite.
-+#define COCO3_SHOT_CAP 99
++#define EMUEXT_SHOT_CAP 99
 +
-+static void coco3_emushot(void *sptr, const char *arg) {
-+	struct coco3 *mcc3 = sptr;
++void emuext_shot(const char *arg) {
 +	static unsigned shot_count = 0;
 +
-+	if (shot_count >= COCO3_SHOT_CAP)
++	if (shot_count >= EMUEXT_SHOT_CAP)
 +		return;                          // cap reached: silent, as specified
 +
 +	int defer = (arg[0] != 0);               // byte 0: 0 = now, 1 = next frame
@@ -136,14 +167,13 @@ index 399bc40..88b88b7 100644
 +	              defer ? "next" : "now", path,
 +	              had_index ? "" : " (no {##}: each shot overwrites)");
 +	shot_count++;
-+	(void)mcc3;
 +}
 +
- // lwasm emuext LOG ($103E).  The core has already formatted the text; emit it
- // verbatim to stderr and, with -emuext and a client attached, mirror it to the
- // gdb console.
+ // Side-effect-free read for the emuext LOG handler.  Uses the machine debug
+ // read path (same as gdb memory reads): no clock advance, no interrupt latch.
+ uint8_t emuext_read(struct machine *m, uint16_t A) {
 diff --git a/src/debug.h b/src/debug.h
-index 083575e..efec80d 100644
+index 44c6fb4..14381e6 100644
 --- a/src/debug.h
 +++ b/src/debug.h
 @@ -66,6 +66,7 @@ struct debug_cpu {
@@ -154,13 +184,53 @@ index 083575e..efec80d 100644
  
  	// Side-effect-free memory read for the LOG handler.  Routes to the
  	// machine's debug read_byte (no clock advance, no interrupt latching),
+@@ -255,6 +256,7 @@ struct machine;
+ 
+ void emuext_break(struct machine *m, struct gdb_interface *gdb, unsigned pc);
+ void emuext_log(struct gdb_interface *gdb, const char *s);
++void emuext_shot(const char *arg);
+ uint8_t emuext_read(struct machine *m, uint16_t A);
+ 
+ #endif
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index bffdee2..da95e12 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -251,6 +251,7 @@ static void update_sound_mux_source(void *sptr);
+ // lwasm emuext opcode handlers (wired into the CPU's debug_cpu delegates)
+ static void dragon_emubreak(void *sptr);
+ static void dragon_emulog(void *sptr, const char *s);
++static void dragon_emushot(void *sptr, const char *arg);
+ static uint8_t dragon_emuread(void *sptr, uint16_t A);
+ static int32_t dragon_emustate(void *sptr, const char *name);
+ 
+@@ -659,6 +660,7 @@ bool dragon_finish_common(struct dragon *md) {
+ 	md->CPU->debug.cpu.emuext = xroar.cfg.debug.emuext;
+ 	md->CPU->debug.cpu.instruction_break = DELEGATE_AS0(void, dragon_emubreak, md);
+ 	md->CPU->debug.cpu.instruction_log = DELEGATE_AS1(void, charcp, dragon_emulog, md);
++	md->CPU->debug.cpu.instruction_shot = DELEGATE_AS1(void, charcp, dragon_emushot, md);
+ 	md->CPU->debug.cpu.debug_read = DELEGATE_AS1(uint8, uint16, dragon_emuread, md);
+ 	md->CPU->debug.cpu.state_read = DELEGATE_AS1(int32, charcp, dragon_emustate, md);
+ 
+@@ -935,6 +937,11 @@ static void dragon_emulog(void *sptr, const char *s) {
+ 	emuext_log(EMUEXT_GDB(md), s);
+ }
+ 
++static void dragon_emushot(void *sptr, const char *arg) {
++	(void)sptr;
++	emuext_shot(arg);
++}
++
+ static uint8_t dragon_emuread(void *sptr, uint16_t A) {
+ 	struct dragon *md = sptr;
+ 	return emuext_read(&md->public, A);
 diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
-index 419fcd1..8692414 100644
+index 16dfb44..6a964ab 100644
 --- a/src/mc6809/mc6809_common.c
 +++ b/src/mc6809/mc6809_common.c
-@@ -105,11 +105,94 @@ static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
-  * to keep a disabled program running.
-  */
+@@ -124,6 +124,84 @@ static _Bool mc6809_emuext_supported(struct MC6809 *cpu) {
+ 	return cpu->debug.cpu.debug_read.func != NULL;
+ }
  
 +// LOG command forms.  A format string whose FIRST byte is 0 is not text (an
 +// empty string prints nothing) so it is free to mean "command".  Byte 0 is the
@@ -241,7 +311,9 @@ index 419fcd1..8692414 100644
 +}
 +
  static void mc6809_emuext_log(struct MC6809 *cpu) {
- 	uint16_t p = REG_PC;             // cursor over operands; REG_PC untouched
+ 	if (!mc6809_emuext_supported(cpu))
+ 		return;                  // no emuext here: native illegal opcode
+@@ -131,6 +209,12 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  	uint16_t fmt = DELEGATE_CALL(cpu->debug.cpu.debug_read, p) << 8; p++;
  	fmt |= DELEGATE_CALL(cpu->debug.cpu.debug_read, p); p++;
  
@@ -249,6 +321,7 @@ index 419fcd1..8692414 100644
 +	// text formatting.  p already points past the single format pointer.
 +	if (mc6809_emuext_command(cpu, fmt, p))
 +		return;
++
 +
  	char out[1024];
  	unsigned o = 0;
@@ -403,7 +476,7 @@ index 6733695..6101935 100644
  
  // Refresh the display by calling draw().  Useful while single-stepping, where
 diff --git a/src/xroar.c b/src/xroar.c
-index 6bffbfc..7ccaab8 100644
+index 5efface..8296eb0 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -128,6 +128,7 @@ struct trap_def {
@@ -474,7 +547,7 @@ index 6bffbfc..7ccaab8 100644
  	disable_all_traps();
  	save_config();
  	messenger_shutdown();
-@@ -3351,6 +3384,22 @@ static void handle_trap_watch(void *sptr, bool RnW, uint32_t A, uint8_t D) {
+@@ -3352,6 +3385,22 @@ static void handle_trap_watch(void *sptr, bool RnW, uint32_t A, uint8_t D) {
  	handle_trap(trap);
  }
  
@@ -497,7 +570,7 @@ index 6bffbfc..7ccaab8 100644
  static void handle_trap(void *sptr) {
  	struct trap_def *trap = sptr;
  
-@@ -3373,6 +3422,46 @@ static void handle_trap(void *sptr) {
+@@ -3374,6 +3423,46 @@ static void handle_trap(void *sptr) {
  		LOG_MOD_DEBUG(2, "trap", "write snapshot: %s\n", trap->snap);
  		write_snapshot(trap->snap);
  	}
@@ -544,7 +617,7 @@ index 6bffbfc..7ccaab8 100644
  	if (trap->timeout) {
  		LOG_MOD_DEBUG(2, "trap", "timeout: %s\n", trap->timeout);
  		trap->timeout_data = xroar_set_timeout(trap->timeout);
-@@ -3465,6 +3554,11 @@ static void set_trap(const char *cond) {
+@@ -3466,6 +3555,11 @@ static void set_trap(const char *cond) {
  			cur_trap_def->snap = private_cfg.debug.trap_def.snap;
  			private_cfg.debug.trap_def.snap = NULL;
  		}
@@ -556,7 +629,7 @@ index 6bffbfc..7ccaab8 100644
  		if (private_cfg.debug.trap_def.timeout) {
  			free(cur_trap_def->timeout);
  			cur_trap_def->timeout = private_cfg.debug.trap_def.timeout;
-@@ -3558,6 +3652,14 @@ static struct xconfig_enum ao_format_list[] = {
+@@ -3559,6 +3653,14 @@ static struct xconfig_enum ao_format_list[] = {
  	{ XC_ENUM_END() }
  };
  
@@ -571,7 +644,7 @@ index 6bffbfc..7ccaab8 100644
  /* Configuration directives */
  
  static struct xconfig_option const xroar_options[] = {
-@@ -3746,6 +3848,8 @@ static struct xconfig_option const xroar_options[] = {
+@@ -3747,6 +3849,8 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_CALL_STRING("trap", &set_trap) },
  	{ XC_CALL_STRING("trap-range", &set_trap_count) },
  	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
@@ -580,7 +653,7 @@ index 6bffbfc..7ccaab8 100644
  	{ XC_SET_STRING("trap-timeout", &private_cfg.debug.trap_def.timeout) },
  	{ XC_SET_INT0("trap-trace", &private_cfg.debug.trap_def.trace) },
  	{ XC_SET_INT("trap-trace-n", &private_cfg.debug.trap_def.trace) },
-@@ -3993,6 +4097,8 @@ static void helptext(void) {
+@@ -3994,6 +4098,8 @@ static void helptext(void) {
  "  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
  "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
  "    -trap-snap FILE     write snapshot at trap\n"

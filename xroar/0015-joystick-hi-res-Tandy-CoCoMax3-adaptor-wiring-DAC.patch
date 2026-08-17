@@ -1,7 +1,7 @@
-From e3abb73a8d1c589c1565e2135aef49db2b59a659 Mon Sep 17 00:00:00 2001
+From d26f7ae821a26640d6bd2caca047546345689329 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:55 -0400
-Subject: [PATCH 15/44] joystick: hi-res (Tandy/CoCoMax3) adaptor wiring + DAC
+Subject: [PATCH 15/49] joystick: hi-res (Tandy/CoCoMax3) adaptor wiring + DAC
 
 ---
  src/coco3.c         | 196 +++++++++++++++++++++++++++++++++++++++++++-
@@ -13,7 +13,7 @@ Subject: [PATCH 15/44] joystick: hi-res (Tandy/CoCoMax3) adaptor wiring + DAC
  6 files changed, 333 insertions(+), 4 deletions(-)
 
 diff --git a/src/coco3.c b/src/coco3.c
-index f1fbe68..52ff237 100644
+index 3060f49..51c5a4d 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
 @@ -67,6 +67,14 @@
@@ -129,7 +129,7 @@ index f1fbe68..52ff237 100644
  	if (mcc3->cart && mcc3->cart->reset) {
  		mcc3->cart->reset(mcc3->cart, hard);
  	}
-@@ -1490,18 +1545,137 @@ static void keyboard_update(void *sptr) {
+@@ -1470,18 +1525,137 @@ static void keyboard_update(void *sptr) {
  	mcc3->GIME->IL1 = (PIA_VALUE_A(mcc3->PIA0) | 0x80) != 0xff;
  }
  
@@ -269,7 +269,7 @@ index f1fbe68..52ff237 100644
  static void update_sound_mux_source(void *sptr) {
  	struct coco3 *mcc3 = sptr;
  	unsigned source = (PIA_VALUE_CB2(mcc3->PIA0) << 1)
-@@ -1516,10 +1690,26 @@ static void pia0a_data_preread(void *sptr) {
+@@ -1496,10 +1670,26 @@ static void pia0a_data_preread(void *sptr) {
  	joystick_update(sptr);
  }
  
@@ -297,7 +297,7 @@ index f1fbe68..52ff237 100644
  
  static void pia1a_control_postwrite(void *sptr) {
 diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
-index 170b376..4b2f89c 100644
+index 7c8f36c..81c790c 100644
 --- a/src/dragon/dragon.c
 +++ b/src/dragon/dragon.c
 @@ -76,6 +76,9 @@ static const struct ser_struct ser_struct_dragon[] = {
@@ -318,8 +318,8 @@ index 170b376..4b2f89c 100644
 +static void hires_joystick_fire(void *sptr);
  static void update_sound_mux_source(void *sptr);
  
- static void single_bit_feedback(void *sptr, bool level);
-@@ -257,7 +262,7 @@ static void vdg_fetch_handler(void *sptr, uint16_t A, int nbytes, uint16_t *dest
+ // lwasm emuext opcode handlers (wired into the CPU's debug_cpu delegates)
+@@ -263,7 +268,7 @@ static void vdg_fetch_handler(void *sptr, uint16_t A, int nbytes, uint16_t *dest
  static void vdg_fetch_handler_chargen(void *sptr, uint16_t A, int nbytes, uint16_t *dest);
  
  static void pia0a_data_preread(void *sptr);
@@ -328,7 +328,7 @@ index 170b376..4b2f89c 100644
  #define pia0a_control_postwrite update_sound_mux_source
  #define pia0b_data_preread dragon_keyboard_update
  #define pia0b_data_postwrite NULL
-@@ -483,6 +488,17 @@ bool dragon_finish_common(struct dragon *md) {
+@@ -489,6 +494,17 @@ bool dragon_finish_common(struct dragon *md) {
  	md->PIA1->b.data_postwrite = DELEGATE_AS0(void, dragon_pia1b_data_postwrite, md);
  	md->PIA1->b.control_postwrite = DELEGATE_AS0(void, pia1b_control_postwrite, md);
  
@@ -346,7 +346,7 @@ index 170b376..4b2f89c 100644
  	// Single-bit sound feedback
  	md->snd->sbs_feedback = DELEGATE_AS1(void, bool, single_bit_feedback, md);
  
-@@ -657,6 +673,11 @@ void dragon_free_common(struct part *p) {
+@@ -675,6 +691,11 @@ void dragon_free_common(struct part *p) {
  	if (md->printer_interface) {
  		printer_interface_free(md->printer_interface);
  	}
@@ -358,7 +358,7 @@ index 170b376..4b2f89c 100644
  	rombank_free(md->ext_charset);
  }
  
-@@ -813,6 +834,9 @@ void dragon_reset(struct machine *m, bool hard) {
+@@ -831,6 +852,9 @@ void dragon_reset(struct machine *m, bool hard) {
  	}
  	mc6821_reset(md->PIA0);
  	mc6821_reset(md->PIA1);
@@ -368,7 +368,7 @@ index 170b376..4b2f89c 100644
  	if (md->cart && md->cart->reset) {
  		md->cart->reset(md->cart, hard);
  	}
-@@ -1360,6 +1384,18 @@ static void joystick_update(void *sptr) {
+@@ -1424,6 +1448,18 @@ static void joystick_update(void *sptr) {
  	struct dragon *md = sptr;
  	int port = PIA_VALUE_CB2(md->PIA0);
  	int axis = PIA_VALUE_CA2(md->PIA0);
@@ -387,7 +387,7 @@ index 170b376..4b2f89c 100644
  	int dac_value = ((md->PIA1->a.out_sink & 0xfc) | 2) << 8;
  	int js_value = joystick_read_axis(port, axis);
  	if (js_value >= dac_value)
-@@ -1368,6 +1404,58 @@ static void joystick_update(void *sptr) {
+@@ -1432,6 +1468,58 @@ static void joystick_update(void *sptr) {
  		md->PIA0->a.in_sink &= 0x7f;
  }
  
@@ -446,7 +446,7 @@ index 170b376..4b2f89c 100644
  static void update_sound_mux_source(void *sptr) {
  	struct dragon *md = sptr;
  	unsigned source = (PIA_VALUE_CB2(md->PIA0) << 1)
-@@ -1389,12 +1477,24 @@ static void pia0a_data_preread(void *sptr) {
+@@ -1453,12 +1541,24 @@ static void pia0a_data_preread(void *sptr) {
  	joystick_update(sptr);
  }
  

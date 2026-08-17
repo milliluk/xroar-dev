@@ -127,6 +127,13 @@ the single most common way to be intermittently wrong on a banked machine. Use
 `xpc=` over `pc=`, flat physical peek/poke over logical reads, physical
 watchpoints over logical ones.
 
+**Disassemble with Capstone, not f9dasm.** Capstone knows the 6809 and the
+6309 (`CS_ARCH_M680X`, `CS_MODE_M680X_6809` / `CS_MODE_M680X_6309`) and has
+Python bindings (`pip install capstone`), so a script gets structured
+instructions -- mnemonic, operands, size -- instead of parsing another tool's
+text layout. f9dasm is fine as an interactive listing generator; it is the
+wrong substrate to build tooling on.
+
 **Say what you did not verify.** If you could not run the thing, say so plainly
 rather than implying a test happened. This matters more than usual with an
 emulator, because "it built" and "it works" are very far apart.

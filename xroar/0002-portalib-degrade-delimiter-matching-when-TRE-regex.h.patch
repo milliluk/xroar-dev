@@ -1,7 +1,7 @@
-From 6ed3c92ef147adbc422cdfef07a1449e352c1710 Mon Sep 17 00:00:00 2001
+From 399742d017688bba39d4862fc6c35e70bd48adcc Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:39:37 -0400
-Subject: [PATCH 02/44] portalib: degrade delimiter matching when TRE/regex.h
+Subject: [PATCH 02/49] portalib: degrade delimiter matching when TRE/regex.h
 
 ---
  portalib/sdsx.c | 94 ++++++++++++++++++++++++++++++++++++++++++++++---

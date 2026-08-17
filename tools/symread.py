@@ -73,6 +73,7 @@ class SymbolFile:
         self.by_name = {}       # name -> [Sym, ...]
         self.dpvars = {}        # name -> DPVar
         self.equates = {}       # name -> int
+        self.code_ranges = []   # [(phys_lo, phys_hi)] inclusive, gensym 2's M C
         self._sorted_phys = []  # for whereis()
         self._sorted_syms = []
         self._lines = None      # lazily loaded (physical -> 'file:line')
@@ -214,6 +215,10 @@ def load(path=None, check_stale=True):
         elif kind == "E":
             name, value = rest.split()
             S.equates[name] = int(value, 16)
+        elif kind == "M":
+            cls, lo, hi = rest.split()
+            if cls == "C":
+                S.code_ranges.append((int(lo, 16), int(hi, 16)))
     S._finish()
 
     if check_stale:

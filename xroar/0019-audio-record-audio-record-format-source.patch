@@ -1,7 +1,7 @@
-From 25963292ee5fc1fa15ff4d49801b02ee854b1fb5 Mon Sep 17 00:00:00 2001
+From 0cc9a6f3beea4359b2ddbccd9621656634e886ab Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:05 -0400
-Subject: [PATCH 19/44] audio-record: -audio-record[-format/-source] +
+Subject: [PATCH 19/49] audio-record: -audio-record[-format/-source] +
 
 ---
  src/Makefile.am    |  1 +
@@ -105,7 +105,7 @@ index 552c3bb..103cadd 100644
  		}
  		snd->buffer_frame += count;
 diff --git a/src/xroar.c b/src/xroar.c
-index 7ccaab8..b2bf9f5 100644
+index 8296eb0..0bc90f2 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -71,6 +71,7 @@
@@ -157,7 +157,7 @@ index 7ccaab8..b2bf9f5 100644
  	if (xroar.ao_interface) {
  		DELEGATE_SAFE_CALL(xroar.ao_interface->free);
  	}
-@@ -3109,6 +3123,12 @@ static void set_gain(double gain) {
+@@ -3110,6 +3124,12 @@ static void set_gain(double gain) {
  	private_cfg.ao.volume = -1;
  }
  
@@ -170,7 +170,7 @@ index 7ccaab8..b2bf9f5 100644
  static void cfg_mpi_load_cart(const char *arg) {
  	(void)arg;
  #ifdef WANT_CART_ARCH_DRAGON
-@@ -3462,9 +3482,19 @@ static void handle_trap(void *sptr) {
+@@ -3463,9 +3483,19 @@ static void handle_trap(void *sptr) {
  			++trap->screenshot_count;
  		}
  	}
@@ -193,7 +193,7 @@ index 7ccaab8..b2bf9f5 100644
  	}
  	if (trap->trace >= 0) {
  		LOG_MOD_DEBUG(2, "trap", "trace on\n");
-@@ -3505,6 +3535,14 @@ static void handle_trap(void *sptr) {
+@@ -3506,6 +3536,14 @@ static void handle_trap(void *sptr) {
  	if (trap->load_spec) {
  		load_blob(trap->load_spec);
  	}
@@ -208,7 +208,7 @@ index 7ccaab8..b2bf9f5 100644
  
  	if (range) {
  		if (range->last == (unsigned long)-1) {
-@@ -3559,6 +3597,19 @@ static void set_trap(const char *cond) {
+@@ -3560,6 +3598,19 @@ static void set_trap(const char *cond) {
  			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
  			private_cfg.debug.trap_def.screenshot = NULL;
  		}
@@ -228,7 +228,7 @@ index 7ccaab8..b2bf9f5 100644
  		if (private_cfg.debug.trap_def.timeout) {
  			free(cur_trap_def->timeout);
  			cur_trap_def->timeout = private_cfg.debug.trap_def.timeout;
-@@ -3797,6 +3848,9 @@ static struct xconfig_option const xroar_options[] = {
+@@ -3798,6 +3849,9 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_INT("ao-buffer-frames", &xroar.cfg.ao.buffer_nframes) },
  	{ XC_CALL_DOUBLE("ao-gain", &set_gain) },
  	{ XC_SET_INT("ao-volume", &private_cfg.ao.volume) },
@@ -238,7 +238,7 @@ index 7ccaab8..b2bf9f5 100644
  	/* Deliberately undocumented: */
  	{ XC_SET_INT("volume", &private_cfg.ao.volume) },
  	/* Backwards-compatibility: */
-@@ -3850,6 +3904,9 @@ static struct xconfig_option const xroar_options[] = {
+@@ -3851,6 +3905,9 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
  	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
  	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
@@ -248,7 +248,7 @@ index 7ccaab8..b2bf9f5 100644
  	{ XC_SET_STRING("trap-timeout", &private_cfg.debug.trap_def.timeout) },
  	{ XC_SET_INT0("trap-trace", &private_cfg.debug.trap_def.trace) },
  	{ XC_SET_INT("trap-trace-n", &private_cfg.debug.trap_def.trace) },
-@@ -4070,6 +4127,9 @@ static void helptext(void) {
+@@ -4071,6 +4128,9 @@ static void helptext(void) {
  "  -ao-buffer-frames N   set total audio buffer size in samples (if supported)\n"
  "  -ao-gain DB           audio gain in dB relative to 0 dBFS [-3.0]\n"
  "  -ao-volume VOLUME     older way to specify audio volume, linear (0-100)\n"
@@ -258,7 +258,7 @@ index 7ccaab8..b2bf9f5 100644
  "\n"
  
  " Debugging:\n"
-@@ -4099,6 +4159,9 @@ static void helptext(void) {
+@@ -4100,6 +4160,9 @@ static void helptext(void) {
  "    -trap-snap FILE     write snapshot at trap\n"
  "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
  "    -trap-screenshot-when next|now  capture next clean frame (default) or now\n"

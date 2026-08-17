@@ -1,7 +1,7 @@
-From 3969b17de1a1ef01d7fbcb0e52cac556530f6255 Mon Sep 17 00:00:00 2001
+From 23c9a08c3bb9431cfa4e803a6f75ce220b8a12f6 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:34 -0400
-Subject: [PATCH 33/44] sdl: -zoom N, integer window scale at startup (old
+Subject: [PATCH 33/49] sdl: -zoom N, integer window scale at startup (old
 
 ---
  src/sdl2/vo_sdl2.c | 9 +++++++++
@@ -28,10 +28,10 @@ index c44ff43..628471b 100644
  	SDL_SetWindowSize(uisdl2->vo_window, w, h);
  }
 diff --git a/src/xroar.c b/src/xroar.c
-index 0a45531..068908a 100644
+index c1e6cb8..043a4b8 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -342,6 +342,7 @@ struct private_cfg {
+@@ -349,6 +349,7 @@ struct private_cfg {
  	// Video
  	struct {
  		bool fullscreen;
@@ -39,7 +39,7 @@ index 0a45531..068908a 100644
  		int frameskip;
  		int ccr;
  		int gl_filter;
-@@ -1484,6 +1485,10 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+@@ -1491,6 +1492,10 @@ struct ui_interface *xroar_init(int argc, char **argv) {
  	ui_update_state(-1, ui_tag_vsync, private_cfg.vo.vsync, NULL);
  	ui_update_state(-1, ui_tag_picture, private_cfg.vo.picture, NULL);
  	ui_update_state(-1, ui_tag_fullscreen, private_cfg.vo.fullscreen, NULL);
@@ -50,7 +50,7 @@ index 0a45531..068908a 100644
  	ui_update_state(-1, ui_tag_ntsc_scaling, private_cfg.vo.ntsc_scaling, NULL);
  	ui_update_state(-1, ui_tag_brightness, private_cfg.vo.brightness, NULL);
  	ui_update_state(-1, ui_tag_contrast, private_cfg.vo.contrast, NULL);
-@@ -4574,6 +4579,7 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4578,6 +4583,7 @@ static struct xconfig_option const xroar_options[] = {
  
  	/* Video: */
  	{ XC_SET_BOOL("fs", &private_cfg.vo.fullscreen) },
@@ -58,7 +58,7 @@ index 0a45531..068908a 100644
  	{ XC_SET_BOOL("hide-cursor", &xroar_ui_cfg.vo_cfg.hide_cursor) },
  	{ XC_SET_INT("fskip", &private_cfg.vo.frameskip) },
  	{ XC_SET_ENUM("ccr", &private_cfg.vo.ccr, vo_cmp_ccr_list) },
-@@ -4874,6 +4880,7 @@ static void helptext(void) {
+@@ -4878,6 +4884,7 @@ static void helptext(void) {
  "  -fskip FRAMES         frameskip (default: 0)\n"
  "  -ccr RENDERER         cross-colour renderer (-ccr help for list)\n"
  "  -gl-filter FILTER     OpenGL texture filter (-gl-filter help for list)\n"

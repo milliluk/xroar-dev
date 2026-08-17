@@ -1,14 +1,14 @@
-From a488adbaadaace3946750536ab894999633df98a Mon Sep 17 00:00:00 2001
+From fa59704dbb94016719dfd92204fd105fb2e148f9 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:14 -0400
-Subject: [PATCH 23/44] trap: xpc= range condition and -trap-history flight
+Subject: [PATCH 23/49] trap: xpc= range condition and -trap-history flight
 
 ---
  src/xroar.c | 174 ++++++++++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 174 insertions(+)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index e45ef31..fbb3a42 100644
+index d3f081f..611d95c 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -79,6 +79,7 @@
@@ -51,7 +51,7 @@ index e45ef31..fbb3a42 100644
  #else
  
  #define set_trap(s)
-@@ -3477,6 +3496,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3478,6 +3497,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  				} else {
  					machine_remove_breakpoint(xroar.machine, a, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
  				}
@@ -83,7 +83,7 @@ index e45ef31..fbb3a42 100644
  			} else if (0 == c_strcasecmp(key, "read")) {
  				if (enable) {
  					machine_add_watchpoint(xroar.machine, 1, a, b, DELEGATE_AS3(void, bool, uint32, uint8, handle_trap_watch, trap));
-@@ -3504,12 +3548,27 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3505,12 +3549,27 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  }
  
  static void enable_all_traps(void) {
@@ -111,7 +111,7 @@ index e45ef31..fbb3a42 100644
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
  		enable_trap(&trap_defs[i], 0);
  	}
-@@ -3557,6 +3616,101 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
+@@ -3558,6 +3617,101 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
  	return out;
  }
  
@@ -213,7 +213,7 @@ index e45ef31..fbb3a42 100644
  // Deferred trap-snap.  seconds=/cycle= traps fire from a scheduled event,
  // which lands mid-instruction: the CPU may have consumed an opcode byte and
  // have PC pointing at its operand -- a position the snapshot cannot fully
-@@ -3600,6 +3754,14 @@ static void handle_trap(void *sptr) {
+@@ -3601,6 +3755,14 @@ static void handle_trap(void *sptr) {
  		return;
  	}
  
@@ -228,7 +228,7 @@ index e45ef31..fbb3a42 100644
  	// Break action
  	if (trap->snap) {
  		// -trap-timeout 0 exits synchronously at the end of this handler;
-@@ -3827,6 +3989,15 @@ static void set_trap(const char *cond) {
+@@ -3828,6 +3990,15 @@ static void set_trap(const char *cond) {
  		cur_trap_def->trace = -1;
  		cur_trap_def->no_trace = -1;
  		cur_trap_def->match_value = -1;
@@ -244,7 +244,7 @@ index e45ef31..fbb3a42 100644
  	}
  }
  
-@@ -4077,6 +4248,7 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4078,6 +4249,7 @@ static struct xconfig_option const xroar_options[] = {
  #ifdef WANT_TRAPS
  	{ XC_CALL_STRING("trap", &set_trap) },
  	{ XC_CALL_STRING("trap-range", &set_trap_count) },
@@ -252,7 +252,7 @@ index e45ef31..fbb3a42 100644
  	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
  	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
  	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
-@@ -4331,6 +4503,7 @@ static void helptext(void) {
+@@ -4332,6 +4504,7 @@ static void helptext(void) {
  "  -q, -quiet            equivalent to -verbose 0\n"
  #ifdef WANT_TRAPS
  "  -trap CONDITION       configure trap (write=A may add ,value=V)\n"
@@ -260,7 +260,7 @@ index e45ef31..fbb3a42 100644
  "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
  "    -trap-snap FILE     write snapshot at trap\n"
  "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
-@@ -4394,6 +4567,7 @@ static void helptext(void) {
+@@ -4395,6 +4568,7 @@ static void helptext(void) {
  "  pc=ADDR               trigger at CPU Program Counter value\n"
  "  read=A[-B]            trigger on read from address range\n"
  "  write=A[-B]           trigger on write to address range\n"

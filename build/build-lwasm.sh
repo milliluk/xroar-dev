@@ -33,7 +33,7 @@ tar xzf "lwtools-$VER.tar.gz"
 echo ">> applying patches"
 for p in "$HERE"/lwasm/patches/[0-9]*.patch; do
     echo "   $(basename "$p")"
-    patch -p1 -d "lwtools-$VER" < "$p" || { echo "FAILED: $(basename "$p")" >&2; exit 1; }
+    patch -p1 --no-backup-if-mismatch -d "lwtools-$VER" < "$p" || { echo "FAILED: $(basename "$p")" >&2; exit 1; }
 done
 
 make -C "lwtools-$VER" -j"$JOBS"

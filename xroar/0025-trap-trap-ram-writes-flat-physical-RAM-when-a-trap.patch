@@ -1,14 +1,14 @@
-From 5017967aa5e7565936ba2afa156c1aec87e03b1a Mon Sep 17 00:00:00 2001
+From e5d1dc29754cb342d193b307eac61b5420740be1 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:17 -0400
-Subject: [PATCH 25/44] trap: -trap-ram writes flat physical RAM when a trap
+Subject: [PATCH 25/49] trap: -trap-ram writes flat physical RAM when a trap
 
 ---
  src/xroar.c | 94 +++++++++++++++++++++++++++++++++++++----------------
  1 file changed, 66 insertions(+), 28 deletions(-)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index 52fdfca..70b0722 100644
+index 2ab896f..2e5df4c 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -135,6 +135,7 @@ struct trap_def {
@@ -36,7 +36,7 @@ index 52fdfca..70b0722 100644
  static void profile_add_range(const char *);  // XC_CALL_STRING callback
  static void profile_dump(void);
  static _Bool profile_active(void) {
-@@ -3601,20 +3601,12 @@ static void enable_all_traps(void) {
+@@ -3602,20 +3602,12 @@ static void enable_all_traps(void) {
  	// installed once per machine connect.  Histogram tables are allocated
  	// here on first install and kept across a reconnect, like the ring.
  	if (profile_active() && !profile_installed && xroar.machine) {
@@ -62,7 +62,7 @@ index 52fdfca..70b0722 100644
  	}
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
  		enable_trap(&trap_defs[i], 1);
-@@ -3627,9 +3619,7 @@ static void disable_all_traps(void) {
+@@ -3628,9 +3620,7 @@ static void disable_all_traps(void) {
  		trap_history_installed = 0;
  	}
  	if (profile_installed && xroar.machine) {
@@ -73,7 +73,7 @@ index 52fdfca..70b0722 100644
  		profile_installed = 0;
  	}
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
-@@ -3762,7 +3752,7 @@ static void trap_history_dump(void) {
+@@ -3763,7 +3753,7 @@ static void trap_history_dump(void) {
  // fetch.  Ranges are disjoint in practice, so a PC matches at most one; a
  // range-to-range transition counts as an entry into the new range, which is
  // what "traversed the trampoline" means.
@@ -82,7 +82,7 @@ index 52fdfca..70b0722 100644
  	(void)sptr;
  	uint32_t now = (uint32_t)event_current_tick;
  	if (profile_prev_pc >= 0) {
-@@ -3774,7 +3764,7 @@ static void profile_record(void *sptr) {
+@@ -3775,7 +3765,7 @@ static void profile_record(void *sptr) {
  		profile_total_cycles += delta;
  	}
  	profile_prev_tick = now;
@@ -91,7 +91,7 @@ index 52fdfca..70b0722 100644
  	if (phys < 0) { profile_prev_pc = -1; profile_prev_range = -1; return; }
  	int r = -1;
  	for (int i = 0; i < profile_num_ranges; ++i) {
-@@ -3923,6 +3913,26 @@ static void trap_xpcrange_check(void *sptr, uint32_t A) {
+@@ -3924,6 +3914,26 @@ static void trap_xpcrange_check(void *sptr, uint32_t A) {
  // from the instruction fetch hook, where PC is at an opcode boundary by
  // construction.  pc= traps already fire from that hook and write directly.
  static char *deferred_snap_path;
@@ -118,7 +118,7 @@ index 52fdfca..70b0722 100644
  
  static void deferred_snap_fire(void *sptr, uint32_t A) {
  	(void)A;
-@@ -3934,6 +3944,12 @@ static void deferred_snap_fire(void *sptr, uint32_t A) {
+@@ -3935,6 +3945,12 @@ static void deferred_snap_fire(void *sptr, uint32_t A) {
  		free(deferred_snap_path);
  		deferred_snap_path = NULL;
  	}
@@ -131,7 +131,7 @@ index 52fdfca..70b0722 100644
  }
  
  static void handle_trap(void *sptr) {
-@@ -3962,18 +3978,31 @@ static void handle_trap(void *sptr) {
+@@ -3963,18 +3979,31 @@ static void handle_trap(void *sptr) {
  		trap_history_dump();
  
  	// Break action
@@ -170,7 +170,7 @@ index 52fdfca..70b0722 100644
  		}
  	}
  	if (trap->screenshot) {
-@@ -4129,6 +4158,11 @@ static void set_trap(const char *cond) {
+@@ -4130,6 +4159,11 @@ static void set_trap(const char *cond) {
  			cur_trap_def->snap = private_cfg.debug.trap_def.snap;
  			private_cfg.debug.trap_def.snap = NULL;
  		}
@@ -182,7 +182,7 @@ index 52fdfca..70b0722 100644
  		if (private_cfg.debug.trap_def.screenshot) {
  			free(cur_trap_def->screenshot);
  			cur_trap_def->screenshot = private_cfg.debug.trap_def.screenshot;
-@@ -4452,6 +4486,8 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4453,6 +4487,8 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_INT("profile-hist", &profile_hist_top) },
  	{ XC_SET_STRING("profile-out", &profile_out_path) },
  	{ XC_SET_STRING("trap-snap", &private_cfg.debug.trap_def.snap) },
@@ -191,7 +191,7 @@ index 52fdfca..70b0722 100644
  	{ XC_SET_STRING("trap-screenshot", &private_cfg.debug.trap_def.screenshot) },
  	{ XC_SET_ENUM("trap-screenshot-when", &option_screenshot_when, screenshot_when_list) },
  	{ XC_SET_STRING("trap-audio-start", &private_cfg.debug.trap_def.audio_start) },
-@@ -4712,6 +4748,8 @@ static void helptext(void) {
+@@ -4713,6 +4749,8 @@ static void helptext(void) {
  "  -profile-out FILE     write the profile report here (default stderr)\n"
  "    -trap-range M[-N]   action only on Mth-Nth trigger\n"
  "    -trap-snap FILE     write snapshot at trap\n"

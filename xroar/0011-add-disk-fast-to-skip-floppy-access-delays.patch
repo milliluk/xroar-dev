@@ -1,7 +1,7 @@
-From 3a104bc25a4e5cc0dcac134087a3553a7da45176 Mon Sep 17 00:00:00 2001
+From dcd7417cb9ba1467c15796c822132309a478b0bc Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:47 -0400
-Subject: [PATCH 11/44] add -disk-fast to skip floppy access delays
+Subject: [PATCH 11/49] add -disk-fast to skip floppy access delays
 
 Cap every scheduled FDC delay at the native byte-transfer time so the
 mechanical delays (seek stepping, head settle, rotational latency)

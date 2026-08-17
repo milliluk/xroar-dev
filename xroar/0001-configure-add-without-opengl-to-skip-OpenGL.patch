@@ -1,7 +1,7 @@
-From 67c08761116be475711dbcc79dd610e0b915ea49 Mon Sep 17 00:00:00 2001
+From d1f8308da0f4a59d58b92c9a1af539a0f41ccd55 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:39:35 -0400
-Subject: [PATCH 01/44] configure: add --without-opengl to skip OpenGL
+Subject: [PATCH 01/49] configure: add --without-opengl to skip OpenGL
 
 ---
  configure.ac   |    5 +-

@@ -1,14 +1,14 @@
-From 2c73973c633b07f345cbbc7ef653938c7d58cc91 Mon Sep 17 00:00:00 2001
+From 392bb90f3b2447d51d10b7c5295c08b774f73273 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:09 -0400
-Subject: [PATCH 21/44] trap-time-conditions: seconds= / cycle= scheduled trap
+Subject: [PATCH 21/49] trap-time-conditions: seconds= / cycle= scheduled trap
 
 ---
  src/xroar.c | 121 ++++++++++++++++++++++++++++++++++++++++++++++++++++
  1 file changed, 121 insertions(+)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index d918c6e..1f5b1d5 100644
+index f9c7cf3..5502b82 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -120,6 +120,11 @@ struct trap_count_range {
@@ -40,7 +40,7 @@ index d918c6e..1f5b1d5 100644
  
  static bool tape_motor_state = 0;
  static event_ticks tape_motor_on_time = 0;
-@@ -3299,6 +3309,50 @@ static void parse_range_ul(const char *str, unsigned long *a, unsigned long *b)
+@@ -3300,6 +3310,50 @@ static void parse_range_ul(const char *str, unsigned long *a, unsigned long *b)
  	free(str_copy);
  }
  
@@ -91,7 +91,7 @@ index d918c6e..1f5b1d5 100644
  static void enable_trap(struct trap_def *trap, bool enable) {
  	if (0 == c_strcasecmp(trap->cond, "immediate") ||
  	    0 == strcmp(trap->cond, "-")) {
-@@ -3314,6 +3368,67 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3315,6 +3369,67 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  		}
  		return;
  	}
@@ -159,7 +159,7 @@ index d918c6e..1f5b1d5 100644
  	assert(xroar.machine != NULL);
  	char *cond_copy = xstrdup(trap->cond);
  	char *val = cond_copy;
-@@ -3398,6 +3513,10 @@ static void disable_all_traps(void) {
+@@ -3399,6 +3514,10 @@ static void disable_all_traps(void) {
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
  		enable_trap(&trap_defs[i], 0);
  	}
@@ -170,7 +170,7 @@ index d918c6e..1f5b1d5 100644
  }
  
  // Breakpoint (pc=) dispatch: no access context to record.
-@@ -4240,6 +4359,8 @@ static void helptext(void) {
+@@ -4241,6 +4360,8 @@ static void helptext(void) {
  "  read=A[-B]            trigger on read from address range\n"
  "  write=A[-B]           trigger on write to address range\n"
  "  access=A[-B]          trigger on either read or write\n"

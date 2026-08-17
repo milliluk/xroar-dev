@@ -1,0 +1,334 @@
+From 22b27a78dfe1bc18930b7185b4c6299225b162ee Mon Sep 17 00:00:00 2001
+From: XRoar dev <dev@example.invalid>
+Date: Mon, 10 Aug 2026 18:06:57 -0400
+Subject: [PATCH 46/49] cart: emulate CoCo Max and X-Pad input devices
+
+Add selectable CoCo Max Hi-Res Input Module and X-Pad GT-116 cartridge profiles. Both source input from the right virtual joystick, including its two buttons.
+
+CoCo Max retains the hardware A/D pipeline: every read returns the preceding conversion and starts the selected conversion. The normal CoCo address is $FF90-$FF97; on a CoCo 3 it uses the documented hardware modification at $FF60-$FF67 so it cannot collide with GIME registers.
+
+X-Pad is already a low-address device at $FF60-$FF62 and therefore works on a CoCo 3 without a hardware modification. Its X read atomically latches the matching Y and status values, and its status follows the GT-116 bit definitions.
+---
+ src/Makefile.am |   1 +
+ src/cocomax.c   | 245 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/part.c      |   4 +
+ src/xroar.c     |   8 ++
+ 4 files changed, 258 insertions(+)
+ create mode 100644 src/cocomax.c
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 6407ee1..805740d 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -137,6 +137,7 @@ if CART_ARCH_DRAGON
+ xroar_SOURCES += \
+ 	deltados.c \
+ 	dragondos.c \
++	cocomax.c \
+ 	gmc.c \
+ 	ide.c ide.h \
+ 	idecart.c idecart.h \
+diff --git a/src/cocomax.c b/src/cocomax.c
+new file mode 100644
+index 0000000..158d204
+--- /dev/null
++++ b/src/cocomax.c
+@@ -0,0 +1,245 @@
++/** \file
++ *
++ *  \brief CoCo Max Hi-Res Input Module and X-Pad cartridges.
++ *
++ *  \copyright Copyright 2026 Ciaran Anscomb
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ */
++
++#include "top-config.h"
++
++#include <assert.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "array.h"
++
++#include "cart.h"
++#include "joystick.h"
++#include "machine.h"
++#include "part.h"
++#include "serialise.h"
++#include "xroar.h"
++
++struct cocomax {
++	struct cart cart;
++	uint8_t a2d_result;
++};
++
++struct xpad {
++	struct cart cart;
++	uint8_t x;
++	uint8_t y;
++	uint8_t status;
++};
++
++static const struct ser_struct ser_struct_cocomax[] = {
++	SER_ID_STRUCT_NEST(1, &cart_ser_struct_data),
++	SER_ID_STRUCT_ELEM(2, struct cocomax, a2d_result),
++};
++
++static const struct ser_struct_data cocomax_ser_struct_data = {
++	.elems = ser_struct_cocomax,
++	.num_elems = ARRAY_N_ELEMENTS(ser_struct_cocomax),
++};
++
++static const struct ser_struct ser_struct_xpad[] = {
++	SER_ID_STRUCT_NEST(1, &cart_ser_struct_data),
++	SER_ID_STRUCT_ELEM(2, struct xpad, x),
++	SER_ID_STRUCT_ELEM(3, struct xpad, y),
++	SER_ID_STRUCT_ELEM(4, struct xpad, status),
++};
++
++static const struct ser_struct_data xpad_ser_struct_data = {
++	.elems = ser_struct_xpad,
++	.num_elems = ARRAY_N_ELEMENTS(ser_struct_xpad),
++};
++
++static uint8_t cocomax_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D);
++static void cocomax_reset(struct cart *c, bool hard);
++static uint8_t xpad_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D);
++static void xpad_reset(struct cart *c, bool hard);
++
++static struct part *cocomax_allocate(void);
++static void cocomax_initialise(struct part *p, void *options);
++static bool cocomax_finish(struct part *p);
++static struct part *xpad_allocate(void);
++static void xpad_initialise(struct part *p, void *options);
++static bool xpad_finish(struct part *p);
++
++static const struct partdb_entry_funcs cocomax_funcs = {
++	.allocate = cocomax_allocate,
++	.initialise = cocomax_initialise,
++	.finish = cocomax_finish,
++	.free = cart_rom_free,
++
++	.ser_struct_data = &cocomax_ser_struct_data,
++
++	.is_a = dragon_cart_is_a,
++};
++
++static const struct partdb_entry_funcs xpad_funcs = {
++	.allocate = xpad_allocate,
++	.initialise = xpad_initialise,
++	.finish = xpad_finish,
++	.free = cart_rom_free,
++
++	.ser_struct_data = &xpad_ser_struct_data,
++
++	.is_a = dragon_cart_is_a,
++};
++
++const struct cart_partdb_entry cocomax_part = { .partdb_entry = { .name = "cocomax", .description = "Colorware | CoCo Max Hi-Res Input Module", .funcs = &cocomax_funcs } };
++const struct cart_partdb_entry xpad_part = { .partdb_entry = { .name = "xpad", .description = "Tandy | X-Pad GT-116", .funcs = &xpad_funcs } };
++
++static struct part *cocomax_allocate(void) {
++	struct cocomax *cm = part_new(sizeof(*cm));
++	struct cart *c = &cm->cart;
++
++	*cm = (struct cocomax){0};
++	cart_rom_init(c);
++	c->read = cocomax_read;
++	c->reset = cocomax_reset;
++
++	return &c->part;
++}
++
++static void cocomax_initialise(struct part *p, void *options) {
++	assert(options != NULL);
++	cart_rom_initialise(p, options);
++}
++
++static bool cocomax_finish(struct part *p) {
++	return cart_rom_finish(p);
++}
++
++static struct part *xpad_allocate(void) {
++	struct xpad *xp = part_new(sizeof(*xp));
++	struct cart *c = &xp->cart;
++
++	*xp = (struct xpad){0};
++	cart_rom_init(c);
++	c->read = xpad_read;
++	c->reset = xpad_reset;
++
++	return &c->part;
++}
++
++static void xpad_initialise(struct part *p, void *options) {
++	assert(options != NULL);
++	cart_rom_initialise(p, options);
++}
++
++static bool xpad_finish(struct part *p) {
++	return cart_rom_finish(p);
++}
++
++static uint8_t axis8(int axis) {
++	int value = joystick_read_axis(0, axis);
++	if (value < 0)
++		return 0;
++	if (value > 65535)
++		return 255;
++	return value >> 8;
++}
++
++static bool button0_down(void) {
++	return joystick_read_buttons() & 1;
++}
++
++static bool button1_down(void) {
++	return joystick_read_buttons() & 4;
++}
++
++static uint16_t cocomax_address(void) {
++	// $ff90 is a GIME register on the CoCo 3.  The documented hardware
++	// modification moves the pack below $ff80, conventionally to $ff60.
++	if (xroar.machine && xroar.machine->config &&
++	    strcmp(xroar.machine->config->architecture, "coco3") == 0) {
++		return 0xff60;
++	}
++	return 0xff90;
++}
++
++static uint8_t cocomax_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D) {
++	struct cocomax *cm = (struct cocomax *)c;
++
++	// The bus calls a cart before decode and again for SCS.  A read starts an
++	// A/D conversion, so only the first call is a real device access.
++	if (P2 || R2 || (A & 0xfff8) != cocomax_address())
++		return D;
++
++	uint8_t result = cm->a2d_result;
++	switch (A & 7) {
++	case 0:
++		cm->a2d_result = axis8(1);
++		break;
++	case 1:
++		cm->a2d_result = axis8(0);
++		break;
++	case 2:
++		cm->a2d_result = button0_down() ? 0x00 : 0xff;
++		break;
++	case 3:
++		cm->a2d_result = button1_down() ? 0x00 : 0xff;
++		break;
++	default:
++		break;
++	}
++	return result;
++}
++
++static void cocomax_reset(struct cart *c, bool hard) {
++	struct cocomax *cm = (struct cocomax *)c;
++	cart_rom_reset(c, hard);
++	if (hard)
++		cm->a2d_result = 0;
++}
++
++static void xpad_latch(struct xpad *xp) {
++	int y = joystick_read_axis(0, 1);
++	if (y < 0)
++		y = 0;
++	if (y > 65535)
++		y = 65535;
++	xp->x = axis8(0);
++	xp->y = (uint8_t)((y * 192) >> 16);
++	// X-Pad status: bit 0 pen down, bit 1 pen in proximity.  XRoar's
++	// joystick is always on the virtual tablet, so neither margin bit is set.
++	xp->status = 0x02 | (button0_down() ? 0x01 : 0x00);
++}
++
++static uint8_t xpad_read(struct cart *c, uint16_t A, bool P2, bool R2, uint8_t D) {
++	struct xpad *xp = (struct xpad *)c;
++
++	if (P2 || R2 || A < 0xff60 || A > 0xff62)
++		return D;
++
++	// The hardware latches the matching Y and status values when X is read.
++	switch (A) {
++	case 0xff60:
++		xpad_latch(xp);
++		return xp->x;
++	case 0xff61:
++		return xp->y;
++	default:
++		return xp->status;
++	}
++}
++
++static void xpad_reset(struct cart *c, bool hard) {
++	struct xpad *xp = (struct xpad *)c;
++	cart_rom_reset(c, hard);
++	if (hard)
++		xpad_latch(xp);
++}
+diff --git a/src/part.c b/src/part.c
+index 0cadffc..65692ad 100644
+--- a/src/part.c
++++ b/src/part.c
+@@ -53,6 +53,7 @@ extern const struct machine_partdb_entry coco3_part;
+ extern const struct machine_partdb_entry mc10_part;
+ 
+ extern const struct cart_partdb_entry cart_rom_part;
++extern const struct cart_partdb_entry cocomax_part;
+ extern const struct cart_partdb_entry deltados_part;
+ extern const struct cart_partdb_entry dragondos_part;
+ extern const struct cart_partdb_entry gmc_part;
+@@ -64,6 +65,7 @@ extern const struct cart_partdb_entry nx32_part;
+ extern const struct cart_partdb_entry orch90_part;
+ extern const struct cart_partdb_entry race_part;
+ extern const struct cart_partdb_entry rsdos_part;
++extern const struct cart_partdb_entry xpad_part;
+ 
+ extern const struct partdb_entry ram_part;
+ 
+@@ -114,11 +116,13 @@ const struct partdb_entry *partdb[] = {
+ 
+ #ifdef WANT_CART_ARCH_DRAGON
+ 	(const struct partdb_entry *)&cart_rom_part,
++	(const struct partdb_entry *)&cocomax_part,
+ 	(const struct partdb_entry *)&deltados_part,
+ 	(const struct partdb_entry *)&dragondos_part,
+ 	(const struct partdb_entry *)&gmc_part,
+ 	(const struct partdb_entry *)&orch90_part,
+ 	(const struct partdb_entry *)&rsdos_part,
++	(const struct partdb_entry *)&xpad_part,
+ 	(const struct partdb_entry *)&idecart_part,
+ #ifndef HAVE_WASM
+ #ifdef WANT_EXPERIMENTAL
+diff --git a/src/xroar.c b/src/xroar.c
+index 8e1d6f6..369028d 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -779,6 +779,14 @@ static char const * const default_config[] = {
+ #endif
+ 
+ #ifdef WANT_CART_ARCH_DRAGON
++	// CoCo Max Hi-Res Input Module
++	"cart cocomax",
++	"cart-desc 'CoCo Max Hi-Res Input Module'",
++	"cart-type cocomax",
++	// X-Pad Graphic Tablet
++	"cart xpad",
++	"cart-desc 'X-Pad GT-116'",
++	"cart-type xpad",
+ 	// DragonDOS
+ 	"cart dragondos",
+ 	"cart-desc DragonDOS",

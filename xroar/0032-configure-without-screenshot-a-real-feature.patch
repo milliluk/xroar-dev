@@ -1,11 +1,11 @@
-From 6e8b3f410a7783d8c6d427390b1e1e7565835adb Mon Sep 17 00:00:00 2001
+From 284c9a890f4c3b3a28112b0056b1955e477c8438 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:32 -0400
-Subject: [PATCH 32/44] configure: --without-screenshot, a real feature
+Subject: [PATCH 32/49] configure: --without-screenshot, a real feature
 
 ---
  configure.ac     |  7 +++++--
- src/coco3.c      |  7 +++++++
+ src/debug.c      |  7 +++++++
  src/screenshot.c |  3 +++
  src/vo.h         |  4 ++++
  src/xroar.c      | 16 +++++++++++++++-
@@ -43,11 +43,11 @@ index b174bdb..98ae23c 100644
  AM_COND_IF([SCREENSHOT], [AC_DEFINE([SCREENSHOT], 1, [Screenshots supported])])
  
  AM_CONDITIONAL([AO_NULL], [test "x$enable_ao_null" != "xno"])
-diff --git a/src/coco3.c b/src/coco3.c
-index 8bb5726..ae6554e 100644
---- a/src/coco3.c
-+++ b/src/coco3.c
-@@ -1197,6 +1197,7 @@ static void coco3_emushot(void *sptr, const char *arg) {
+diff --git a/src/debug.c b/src/debug.c
+index 309754f..3cf92d5 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -436,6 +436,7 @@ void emuext_shot(const char *arg) {
  	char path[512];
  	snprintf(path, sizeof(path), "%s/%s", dir, base);
  
@@ -55,7 +55,7 @@ index 8bb5726..ae6554e 100644
  	// The headless render instance is normally attached at init when a
  	// screenshot trap is present (see xroar.c).  With -emuext we attach it
  	// there too, so by here vo_interface->renderer exists and holds a real
-@@ -1213,6 +1214,12 @@ static void coco3_emushot(void *sptr, const char *arg) {
+@@ -452,6 +453,12 @@ void emuext_shot(const char *arg) {
  	LOG_MOD_DEBUG(1, "emu", "SHOT %u (%s) -> %s%s\n", shot_count,
  	              defer ? "next" : "now", path,
  	              had_index ? "" : " (no {##}: each shot overwrites)");
@@ -66,8 +66,8 @@ index 8bb5726..ae6554e 100644
 +	(void)had_index;
 +#endif
  	shot_count++;
- 	(void)mcc3;
  }
+ 
 diff --git a/src/screenshot.c b/src/screenshot.c
 index 9ddab3d..8f9cf1f 100644
 --- a/src/screenshot.c
@@ -111,10 +111,10 @@ index 6101935..587a3e3 100644
  
  // Refresh the display by calling draw().  Useful while single-stepping, where
 diff --git a/src/xroar.c b/src/xroar.c
-index f677d52..0a45531 100644
+index 38efa02..c1e6cb8 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -999,9 +999,11 @@ static struct {
+@@ -1006,9 +1006,11 @@ static struct {
   * Returns the UI interface to the caller (probably main()).
   */
  
@@ -126,7 +126,7 @@ index f677d52..0a45531 100644
  
  struct ui_interface *xroar_init(int argc, char **argv) {
  	int argn = 1, ret;
-@@ -1332,7 +1334,7 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+@@ -1339,7 +1341,7 @@ struct ui_interface *xroar_init(int argc, char **argv) {
  	}
  	xroar.vo_interface = xroar.ui_interface->vo_interface;
  
@@ -135,7 +135,7 @@ index f677d52..0a45531 100644
  	// If any trap will take a screenshot, make sure there is a renderer for
  	// it to capture.  A headless (null UI) build hands back a vo_interface
  	// with no renderer, so the machine's scanlines would be discarded and
-@@ -1685,7 +1687,9 @@ void xroar_shutdown(void) {
+@@ -1692,7 +1694,9 @@ void xroar_shutdown(void) {
  	if (shutting_down)
  		return;
  	shutting_down = 1;
@@ -145,7 +145,7 @@ index f677d52..0a45531 100644
  	disable_all_traps();
  	profile_dump();
  	save_config();
-@@ -3781,6 +3785,7 @@ static void handle_trap_watch(void *sptr, bool RnW, uint32_t A, uint8_t D) {
+@@ -3789,6 +3793,7 @@ static void handle_trap_watch(void *sptr, bool RnW, uint32_t A, uint8_t D) {
  	handle_trap(trap);
  }
  
@@ -153,7 +153,7 @@ index f677d52..0a45531 100644
  // Build a screenshot filename for the Nth trigger by inserting the number
  // before the file extension: "shot.png" + 4 -> "shot4.png".  No extension ->
  // number appended.  Caller frees.
-@@ -3796,6 +3801,7 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
+@@ -3804,6 +3809,7 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
  	}
  	return out;
  }
@@ -161,7 +161,7 @@ index f677d52..0a45531 100644
  
  // Per-instruction hooks (the -trap-history ring, the xpcrange= edge
  // detector) cannot afford the part-tree walk trap_current_pc() and
-@@ -4142,6 +4148,7 @@ static void handle_trap(void *sptr) {
+@@ -4150,6 +4156,7 @@ static void handle_trap(void *sptr) {
  			}
  		}
  	}
@@ -169,7 +169,7 @@ index f677d52..0a45531 100644
  	if (trap->screenshot) {
  		// Classify the range once, on the first fire, and remember it: xroar
  		// frees a bounded range as soon as it is exhausted, after which a
-@@ -4182,6 +4189,7 @@ static void handle_trap(void *sptr) {
+@@ -4190,6 +4197,7 @@ static void handle_trap(void *sptr) {
  			++trap->screenshot_count;
  		}
  	}
@@ -177,7 +177,7 @@ index f677d52..0a45531 100644
  	if (trap->audio_start) {
  		int rate = (xroar.ao_interface && xroar.ao_interface->sound_interface)
  		    ? xroar.ao_interface->sound_interface->framerate : 44100;
-@@ -4443,6 +4451,7 @@ static struct xconfig_enum ao_format_list[] = {
+@@ -4451,6 +4459,7 @@ static struct xconfig_enum ao_format_list[] = {
  	{ XC_ENUM_END() }
  };
  
@@ -185,7 +185,7 @@ index f677d52..0a45531 100644
  // -trap-screenshot-when next|now.  next (default) defers the capture to the
  // first frame fully rendered after the trap; now grabs the buffer as-is.
  static struct xconfig_enum screenshot_when_list[] = {
-@@ -4450,6 +4459,7 @@ static struct xconfig_enum screenshot_when_list[] = {
+@@ -4458,6 +4467,7 @@ static struct xconfig_enum screenshot_when_list[] = {
  	{ XC_ENUM_INT("now",  1, "frame buffer as-is at the trap instant") },
  	{ XC_ENUM_END() }
  };
@@ -193,7 +193,7 @@ index f677d52..0a45531 100644
  
  /* Configuration directives */
  
-@@ -4662,8 +4672,10 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4666,8 +4676,10 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
  	{ XC_SET_STRING("trap-byte", &private_cfg.debug.trap_def.byte_path) },
  	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
@@ -204,7 +204,7 @@ index f677d52..0a45531 100644
  	{ XC_SET_STRING("trap-audio-start", &private_cfg.debug.trap_def.audio_start) },
  	{ XC_SET_INT1("trap-audio-stop", &private_cfg.debug.trap_def.audio_stop) },
  	{ XC_SET_INT1("trap-audio-toggle", &private_cfg.debug.trap_def.audio_toggle) },
-@@ -4930,8 +4942,10 @@ static void helptext(void) {
+@@ -4934,8 +4946,10 @@ static void helptext(void) {
  "    -trap-ratelimit-on  back to real time from this trap\n"
  "    -trap-ram FILE      write flat physical RAM at trap (see -export-ram)\n"
  "    -export-ram FILE    dump flat physical RAM of -load snapshot, then exit\n"

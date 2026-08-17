@@ -1,0 +1,1084 @@
+From 4ea0e85c43a8a00243df1a5978ea9682a5a55c0b Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 10 Aug 2026 21:42:40 -0400
+Subject: [PATCH 47/49] protect: -protect-mode, physical code/data policy
+ checks
+
+The audit map (patch 37) records what a run DID; this enforces what it MAY
+do.  One byte per flat physical address carries a policy -- "this byte is
+code" -- and the CPU core's per-cycle access class, the same composition
+the audit map stores, is checked against it in the CoCo 3 memory path.
+Four checks, one flag each, -protect-mode for all four:
+
+  -protect-mode-stack  an S-relative write lands on code
+  -protect-mode-write  any other write lands on code
+  -protect-mode-read   a data read lands on code
+  -protect-mode-data   an instruction fetch lands on anything else
+
+A violation reports the access -- physical address and symbol, registers,
+access class, the flight-recorder ring when -trap-history armed one --
+dumps flat RAM to -protect-dump (default protect-crash.ram), and exits 70,
+distinct from EXIT_FAILURE so a harness can tell "the program under test
+went wild" from "xroar was misconfigured".  The point is a failure at the
+FIRST wrong access, with the machine state that caused it, instead of a
+corrupted screen thirty seconds later.
+
+An explicit per-check flag wins over -protect-mode from either side of it,
+the rule -headless established for the options it implies.
+
+The code/data map is inferred, never tagged in source: gensym format 2
+classifies every emitted byte from the assembler LISTING -- an
+instruction's bytes are code, an fcb table's are not, even when the table
+sits between two routines -- and writes M C ranges that -symbols feeds to
+the policy map.  Symbols cannot carry the distinction (a label is just an
+address) and sections cannot either (a table inside a code section is
+still data); the listing is the one build output that says it per byte.
+
+Checks are dormant until the first instruction fetch from mapped code.
+The CoCo 3 boot copies BASIC into RAM and runs it from physical addresses
+no user map describes; arming at power-on faults on the ROM's own
+housekeeping before the program under test exists.  First fetch of mapped
+code is the moment it exists.  -trap-protect-on / -trap-protect-off
+rescope explicitly when that default is wrong -- including the program
+that calls back into BASIC, which should expect to need them (or
+-no-protect-mode-data).
+
+Wired exactly where the audit map is wired -- coco3.c, both MMU branches,
+read and write -- because that is the one place the physical address from
+the GIME's own decode and the access class from the core meet.  Fatal when
+armed on any other machine, or with no M records loaded: a protect run
+that silently protects nothing is worse than one that refuses to start.
+
+Self-modifying code trips -protect-mode-write by design; -protect-allow
+LO-HI exempts the patched bytes, with @names resolving there like any
+other address.  Code the build cannot see (copied to RAM at runtime) needs
+the same, or its own M range.
+
+The stack check as first written fired only when an S-derived write landed
+on CODE, which is the rarest of the ways a stack goes wrong.  A program
+that points S into an fcb table and pushes, and a program whose stack
+simply grows past the bottom of the space reserved for it, both ran to
+completion and exited 0 with -protect-mode-stack armed.  Two additions
+close that, and they are deliberately separate, because the two failures
+land in different kinds of memory:
+
+  M D records.  gensym already classified every listing line as
+  instruction, data directive or unknown, and emitted only the code ranges;
+  it now emits the data-directive ranges too, and an S-derived write onto
+  one is a fault.  The class is INITIALIZED data by construction: rmb and
+  the other reservations emit no bytes into an lwasm listing, so the
+  classifier never sees them and no M D range can cover them.  That is what
+  keeps a program's own stack, buffers and scratch -- all of which live in
+  rmb space -- out of the data class, and it is the whole reason this does
+  not false-positive.  An ordinary write to declared data (`sta Scratch`
+  where `Scratch fcb 0`) is normal 6809 and still must not fault, so only
+  the S-derived write consults the data class; -protect-mode-write is
+  unchanged and still means code only.  symfile takes C and D and still
+  rejects any other class loudly; a format-2 file from before this, with
+  only C records, loads unchanged.
+
+  -protect-stack-floor ADDR.  A physical floor, with @names resolving as
+  they do for -protect-allow.  It catches what M D cannot see: a stack
+  growing down through the rmb space below it, where by the property above
+  there is deliberately nothing to hit.  No build output states how far
+  down a stack may go, so this is the one number that has to be given
+  rather than inferred, and it is unset by default.
+
+The report names which of the three fired -- "stack hit code", "stack hit
+data", "stack below floor (0xNNNNN)" -- because that is most of the
+diagnosis and the verdict itself is a single bit.
+
+One hazard, stated rather than hidden: AUDIT_STACK_S is *any* S-derived
+address, including the classic 6809 trick of using pshs/puls or S-relative
+indexing as a fast data pointer.  A program that deliberately pushes into
+an initialized data area will now fault, correctly by the rule and wrongly
+by intent.  -protect-allow LO-HI is the escape hatch, and protect.h says so
+at the point where someone hitting it will look.
+
+One more thing the first version got wrong, and it is the option that
+advertised the behaviour: -trap-protect-on could not defer arming past
+boot, which is the only thing anyone would reach for it to do.  Arming is
+automatic at the first instruction fetch from mapped code, and the only
+thing that cleared that automatic arming was protect_set_active(), which
+runs when the trap FIRES.  By then the program's own entry has already
+fetched mapped code and the checks have been live for millions of cycles,
+so the option re-armed what was already armed and nothing was ever
+scoped.  A run that says "check nothing until @ToolEntry" got checks from
+the first instruction, and the only evidence was a fault the user thought
+they had excluded.
+
+The presence of the option now turns the automatic arming off while the
+command line is being applied (protect_defer_arming(), called from the
+trap scan beside protect_arm()), so the trap really is where the checks
+begin.  -trap-protect-off alone still does NOT defer: that pairing means
+"arm as usual, stop checking here", and treating it the same way would
+leave a run with no checks at all.
+
+That scan runs BEFORE protect_arm(), and the ordering is not incidental.
+protect_arm() logs the line an operator reads to confirm the flag took
+effect -- "armed (checks 0x..): N code ranges, ... dormant until first
+code fetch" -- and it composes that line from protect_auto.  Deferring
+after it therefore left a run that really did defer announcing that it
+would arm at the first code fetch: right behaviour, wrong evidence, and
+the evidence is the only part anyone can see.  A log line that
+contradicts what the emulator is doing is worse than either being wrong
+on its own, because it sends the reader to debug the wrong half.
+
+Same rule applied to the floor in that line: an unset floor prints
+"none", not "0x00000", which reads as a floor at address zero.
+---
+ src/Makefile.am |   1 +
+ src/coco3.c     |  45 +++++--
+ src/protect.c   | 322 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/protect.h   | 204 ++++++++++++++++++++++++++++++
+ src/symfile.c   |  52 ++++++--
+ src/xroar.c     | 116 +++++++++++++++++
+ src/xroar.h     |   4 +
+ 7 files changed, 726 insertions(+), 18 deletions(-)
+ create mode 100644 src/protect.c
+ create mode 100644 src/protect.h
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 805740d..d08a836 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -21,6 +21,7 @@ xroar_SOURCES = \
+ 	audiorec.c audiorec.h \
+ 	auto_kbd.c auto_kbd.h \
+ 	audit.c audit.h \
++	protect.c protect.h \
+ 	symtab.c symtab.h \
+ 	ay891x.c ay891x.h \
+ 	becker.c becker.h \
+diff --git a/src/coco3.c b/src/coco3.c
+index 9eb800f..92b2005 100644
+--- a/src/coco3.c
++++ b/src/coco3.c
+@@ -37,6 +37,7 @@
+ 
+ #include "ao.h"
+ #include "audit.h"
++#include "protect.h"
+ #include "breakpoint.h"
+ #include "cart.h"
+ #include "crc32.h"
+@@ -1353,6 +1354,14 @@ static void coco3_instruction_posthook(void *sptr) {
+ 	mcc3->single_step = 0;
+ }
+ 
++// A protect verdict is a crash; assemble the instruction context the report
++// wants and go.  Cold: reached at most once per process.
++static void coco3_protect_fault(struct coco3 *mcc3, unsigned phys, uint8_t bits, uint8_t check) {
++	unsigned pc = mcc3->CPU->reg_pc;
++	unsigned phys_pc = tcc1014_logical_to_physical(mcc3->GIME, pc) & 0x7ffff;
++	protect_fault(mcc3->CPU, pc, phys_pc, phys, bits, check);
++}
++
+ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 	if (mcc3->cart) {
+ 		mcc3->CPU->D = mcc3->cart->read(mcc3->cart, A, 0, 0, mcc3->CPU->D);
+@@ -1417,8 +1426,13 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[1])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
+-			if (audit_map)
+-				audit_mark(mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 1));
++			if (audit_map || protect_map) {
++				uint8_t bits = audit_bits_mc6809(mcc3->CPU, 1);
++				audit_mark(mcc3->GIME->Z, bits);
++				uint8_t bad = protect_verdict(mcc3->GIME->Z, bits);
++				if (bad)
++					coco3_protect_fault(mcc3, mcc3->GIME->Z, bits, bad);
++			}
+ 		} else {
+ 			// Otherwise, translate
+ 			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
+@@ -1428,8 +1442,13 @@ static void read_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[1])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 1, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
+-			if (audit_map)
+-				audit_mark((bank << 19) | mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 1));
++			if (audit_map || protect_map) {
++				uint8_t bits = audit_bits_mc6809(mcc3->CPU, 1);
++				audit_mark((bank << 19) | mcc3->GIME->Z, bits);
++				uint8_t bad = protect_verdict((bank << 19) | mcc3->GIME->Z, bits);
++				if (bad)
++					coco3_protect_fault(mcc3, (bank << 19) | mcc3->GIME->Z, bits, bad);
++			}
+ 		}
+ 	}
+ }
+@@ -1504,8 +1523,13 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[0])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
+-			if (audit_map)
+-				audit_mark(mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 0));
++			if (audit_map || protect_map) {
++				uint8_t bits = audit_bits_mc6809(mcc3->CPU, 0);
++				audit_mark(mcc3->GIME->Z, bits);
++				uint8_t bad = protect_verdict(mcc3->GIME->Z, bits);
++				if (bad)
++					coco3_protect_fault(mcc3, mcc3->GIME->Z, bits, bad);
++			}
+ 		} else {
+ 			// Otherwise, translate
+ 			unsigned bank = mcc3->dat.mmu_bank[(A >> 13) | mcc3->dat.task] >> 6;
+@@ -1515,8 +1539,13 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+ 			if (mcc3->pwatchpoint_set.list[0])
+ 				bp_check_watchpoints(&mcc3->pwatchpoint_set, 0, (bank << 19) | mcc3->GIME->Z, mcc3->CPU->D);
+ #endif
+-			if (audit_map)
+-				audit_mark((bank << 19) | mcc3->GIME->Z, audit_bits_mc6809(mcc3->CPU, 0));
++			if (audit_map || protect_map) {
++				uint8_t bits = audit_bits_mc6809(mcc3->CPU, 0);
++				audit_mark((bank << 19) | mcc3->GIME->Z, bits);
++				uint8_t bad = protect_verdict((bank << 19) | mcc3->GIME->Z, bits);
++				if (bad)
++					coco3_protect_fault(mcc3, (bank << 19) | mcc3->GIME->Z, bits, bad);
++			}
+ 		}
+ 	}
+ }
+diff --git a/src/protect.c b/src/protect.c
+new file mode 100644
+index 0000000..eb97c38
+--- /dev/null
++++ b/src/protect.c
+@@ -0,0 +1,322 @@
++/** \file
++ *
++ *  \brief Protected-memory mode: physical code/data policy checks.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ */
++
++#include "top-config.h"
++
++#include <errno.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "xalloc.h"
++
++#include "logging.h"
++#include "machine.h"
++#include "mc6809/mc6809.h"
++#include "protect.h"
++#include "symfile.h"
++#include "xroar.h"
++
++uint8_t *protect_map = NULL;
++uint8_t protect_checks = 0;
++_Bool protect_live = 0;
++_Bool protect_auto = 1;
++uint32_t protect_stack_floor = 0;
++extern inline uint8_t protect_verdict(unsigned phys, uint8_t bits);
++
++// Tri-state command-line flags: -1 unstated, else 0/1.  Resolved at arm time
++// so the flags compose order-independently, the way -headless's implied
++// options do.
++static int opt_mode = -1;
++static int opt_stack = -1, opt_write = -1, opt_read = -1, opt_data = -1;
++static char *dump_path = NULL;
++
++struct protect_range {
++	uint32_t lo, hi;   // inclusive
++};
++
++static struct protect_range *code_ranges = NULL;
++static size_t n_code_ranges = 0, code_ranges_alloc = 0;
++static struct protect_range *data_ranges = NULL;
++static size_t n_data_ranges = 0, data_ranges_alloc = 0;
++static struct protect_range *allow_ranges = NULL;
++static size_t n_allow_ranges = 0, allow_ranges_alloc = 0;
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++static void protect_fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
++
++static void protect_fatal(const char *fmt, ...) {
++	va_list ap;
++	fputs("xroar: -protect-mode: ", stderr);
++	va_start(ap, fmt);
++	vfprintf(stderr, fmt, ap);
++	va_end(ap);
++	fputc('\n', stderr);
++	exit(EXIT_FAILURE);
++}
++
++void protect_opt_mode(_Bool v) { opt_mode = v; }
++void protect_opt_stack(_Bool v) { opt_stack = v; }
++void protect_opt_write(_Bool v) { opt_write = v; }
++void protect_opt_read(_Bool v) { opt_read = v; }
++void protect_opt_data(_Bool v) { opt_data = v; }
++
++void protect_opt_dump(const char *path) {
++	free(dump_path);
++	dump_path = xstrdup(path);
++}
++
++void protect_opt_stack_floor(uint32_t phys) { protect_stack_floor = phys; }
++
++static void range_add(struct protect_range **list, size_t *n, size_t *alloc,
++                      uint32_t lo, uint32_t hi) {
++	if (*n == *alloc) {
++		*alloc = *alloc ? *alloc * 2 : 64;
++		*list = xrealloc(*list, *alloc * sizeof(**list));
++	}
++	(*list)[(*n)].lo = lo;
++	(*list)[(*n)].hi = hi;
++	(*n)++;
++}
++
++void protect_class_range(uint32_t lo, uint32_t hi) {
++	range_add(&code_ranges, &n_code_ranges, &code_ranges_alloc, lo, hi);
++}
++
++void protect_data_range(uint32_t lo, uint32_t hi) {
++	range_add(&data_ranges, &n_data_ranges, &data_ranges_alloc, lo, hi);
++}
++
++void protect_allow_range(uint32_t lo, uint32_t hi) {
++	range_add(&allow_ranges, &n_allow_ranges, &allow_ranges_alloc, lo, hi);
++}
++
++static void paint(const struct protect_range *list, size_t n, uint8_t bit) {
++	for (size_t i = 0; i < n; i++) {
++		uint32_t lo = list[i].lo;
++		uint32_t hi = list[i].hi;
++		if (lo >= PROTECT_SPAN)
++			continue;
++		if (hi >= PROTECT_SPAN)
++			hi = PROTECT_SPAN - 1;
++		for (uint32_t a = lo; a <= hi; a++)
++			protect_map[a] |= bit;
++	}
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++void protect_arm(void) {
++	int def = (opt_mode > 0);
++	uint8_t checks = 0;
++	if (opt_stack >= 0 ? opt_stack : def)
++		checks |= PROTECT_CHECK_STACK;
++	if (opt_write >= 0 ? opt_write : def)
++		checks |= PROTECT_CHECK_WRITE;
++	if (opt_read >= 0 ? opt_read : def)
++		checks |= PROTECT_CHECK_READ;
++	if (opt_data >= 0 ? opt_data : def)
++		checks |= PROTECT_CHECK_DATA;
++
++	if (!checks) {
++		protect_checks = 0;
++		if (protect_map) {
++			free(protect_map);
++			protect_map = NULL;
++		}
++		return;
++	}
++
++	// The checks ride on the per-cycle access classification the machine
++	// composes for the audit map, and only the CoCo 3's memory path builds
++	// it.  Running "protected" on a machine that classifies nothing would
++	// protect nothing, silently, which is the one outcome worse than
++	// refusing to start.
++	if (!xroar.machine_config ||
++	    0 != strcmp(xroar.machine_config->architecture, "coco3")) {
++		protect_fatal("only wired for the CoCo 3 memory path "
++		              "(machine is %s)",
++		              xroar.machine_config
++		              ? xroar.machine_config->architecture : "unset");
++	}
++
++	// No map, no mode.  The map rides in with -symbols (M records, gensym
++	// format 2); a symbol file without them is from the format 1
++	// generator and cannot say what is code.
++	if (!n_code_ranges) {
++		protect_fatal("no code map loaded: pass -symbols FILE where "
++		              "FILE carries M records (gensym format 2; "
++		              "regenerate with tools/gensym.py)");
++	}
++
++	// A floor with no stack check is another way to protect nothing, and
++	// the mistake is invisible from the output: the run just passes.
++	if (protect_stack_floor && !(checks & PROTECT_CHECK_STACK)) {
++		LOG_MOD_WARN("protect", "-protect-stack-floor 0x%05X set but the "
++		             "stack check is not armed; the floor does nothing\n",
++		             protect_stack_floor);
++	}
++
++	if (!protect_map) {
++		protect_map = xzalloc(PROTECT_SPAN);
++		paint(code_ranges, n_code_ranges, PROTECT_CODE);
++		paint(data_ranges, n_data_ranges, PROTECT_DATA);
++		paint(allow_ranges, n_allow_ranges, PROTECT_ALLOW);
++	}
++	protect_checks = checks;
++	// This line is the only evidence an operator has that the flags took
++	// effect, so it states the resolved state and never a raw default: an
++	// unset floor says so rather than printing 0x00000, which reads as a
++	// floor at address zero.
++	char floor_desc[32];
++	if (protect_stack_floor)
++		snprintf(floor_desc, sizeof(floor_desc), "0x%05X", protect_stack_floor);
++	else
++		snprintf(floor_desc, sizeof(floor_desc), "none");
++	LOG_MOD_DEBUG(1, "protect", "armed (checks 0x%x): %zu code ranges, "
++	              "%zu data ranges, %zu allow ranges, stack floor %s, %s\n",
++	              checks, n_code_ranges, n_data_ranges, n_allow_ranges,
++	              floor_desc,
++	              protect_live ? "live" :
++	              (protect_auto ? "dormant until first code fetch"
++	                            : "dormant until -trap-protect-on"));
++}
++
++void protect_defer_arming(void) {
++	protect_auto = 0;
++}
++
++void protect_set_active(_Bool active) {
++	protect_auto = 0;
++	if (!protect_map) {
++		LOG_MOD_WARN("protect", "-trap-protect-%s with no -protect-mode; ignored\n",
++		             active ? "on" : "off");
++		return;
++	}
++	if (protect_live == active)
++		return;
++	protect_live = active;
++	LOG_MOD_DEBUG(1, "protect", "checks %s\n", active ? "live" : "dormant");
++}
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++// The stack check has three ways to fire -- code, initialized data, below the
++// floor -- and "which" is most of the diagnosis, so recover it from the map at
++// fault time rather than widen the verdict.  Cold: once per process, so a
++// static buffer for the floor's number is fine.
++static const char *stack_case(unsigned fault_phys) {
++	static char buf[64];
++	uint8_t cls = (protect_map && fault_phys < PROTECT_SPAN)
++	              ? protect_map[fault_phys] : 0;
++	if (cls & PROTECT_CODE)
++		return "stack hit code (S-relative write)";
++	if (cls & PROTECT_DATA)
++		return "stack hit data (S-relative write into initialized data)";
++	snprintf(buf, sizeof(buf), "stack below floor (0x%05X)", protect_stack_floor);
++	return buf;
++}
++
++static const char *check_name(uint8_t check, unsigned fault_phys) {
++	switch (check) {
++	case PROTECT_CHECK_STACK: return stack_case(fault_phys);
++	case PROTECT_CHECK_WRITE: return "write to code";
++	case PROTECT_CHECK_READ: return "data read from code";
++	case PROTECT_CHECK_DATA: return "execute from non-code";
++	default: return "?";
++	}
++}
++
++void protect_fault(struct MC6809 *cpu, unsigned pc, unsigned phys_pc,
++                   unsigned fault_phys, uint8_t bits, uint8_t check) {
++	const char *where = symfile_whereis(fault_phys, 0);
++	fprintf(stderr, "xroar: protect: %s: phys 0x%05X%s%s%s, value 0x%02X\n",
++	        check_name(check, fault_phys), fault_phys,
++	        where ? " (" : "", where ? where : "", where ? ")" : "",
++	        cpu->D);
++
++	// reg_pc has consumed the instruction's bytes by the time any of its
++	// cycles reach RAM, so it points at (or just short of) the NEXT
++	// instruction; say so rather than let it read as the faulting one.
++	// The flight recorder's last line below is the faulting instruction.
++	const char *pc_where = symfile_whereis(phys_pc, 0);
++	const char *pc_line = symfile_line(phys_pc);
++	fprintf(stderr, "xroar: protect:   pc 0x%04X phys 0x%05X%s%s%s%s%s (past the faulting instruction)\n",
++	        pc, phys_pc,
++	        pc_where ? " (" : "", pc_where ? pc_where : "", pc_where ? ")" : "",
++	        pc_line ? " " : "", pc_line ? pc_line : "");
++
++	fprintf(stderr, "xroar: protect:   cc=%02X a=%02X b=%02X dp=%02X "
++	        "x=%04X y=%04X u=%04X s=%04X irq_depth=%u\n",
++	        cpu->reg_cc, MC6809_REG_A(cpu), MC6809_REG_B(cpu), cpu->reg_dp,
++	        cpu->reg_x, cpu->reg_y, cpu->reg_u, cpu->reg_s, cpu->irq_depth);
++
++	fprintf(stderr, "xroar: protect:   access:%s%s%s%s%s%s%s\n",
++	        (bits & AUDIT_EXEC) ? " exec" : "",
++	        (bits & AUDIT_OPCODE) ? " opcode" : "",
++	        (bits & AUDIT_READ) ? " read" : "",
++	        (bits & AUDIT_WRITE) ? " write" : "",
++	        (bits & AUDIT_STACK_S) ? " stack-s" : "",
++	        (bits & AUDIT_STACK_U) ? " stack-u" : "",
++	        (bits & AUDIT_PUSHPULL) ? " pushpull" : "");
++
++	// The ring, if -trap-history armed one: last N instructions, the
++	// faulting one last.  Backtrace, when built, hangs off the same spot.
++	xroar_trap_history_dump();
++
++	const char *path = dump_path ? dump_path : "protect-crash.ram";
++	if (xroar.machine && xroar.machine->dump_ram) {
++		FILE *fd = fopen(path, "wb");
++		if (!fd) {
++			fprintf(stderr, "xroar: protect:   ram dump: %s: %s\n",
++			        path, strerror(errno));
++		} else {
++			xroar.machine->dump_ram(xroar.machine, fd);
++			long len = ftell(fd);
++			fclose(fd);
++			fprintf(stderr, "xroar: protect:   ram dump: %s (%ld bytes)\n",
++			        path, len);
++		}
++	}
++
++	fprintf(stderr, "xroar: protect: exiting %d\n", PROTECT_EXIT_STATUS);
++	fflush(NULL);
++	// exit(), not abort: xroar_shutdown() is an atexit handler, so the
++	// audit map and any recording mid-write still land on disk.
++	exit(PROTECT_EXIT_STATUS);
++}
++
++void protect_shutdown(void) {
++	free(protect_map);
++	protect_map = NULL;
++	protect_checks = 0;
++	protect_stack_floor = 0;
++	free(code_ranges);
++	code_ranges = NULL;
++	n_code_ranges = code_ranges_alloc = 0;
++	free(data_ranges);
++	data_ranges = NULL;
++	n_data_ranges = data_ranges_alloc = 0;
++	free(allow_ranges);
++	allow_ranges = NULL;
++	n_allow_ranges = allow_ranges_alloc = 0;
++	free(dump_path);
++	dump_path = NULL;
++}
+diff --git a/src/protect.h b/src/protect.h
+new file mode 100644
+index 0000000..e55538c
+--- /dev/null
++++ b/src/protect.h
+@@ -0,0 +1,204 @@
++/** \file
++ *
++ *  \brief Protected-memory mode: physical code/data policy checks.
++ *
++ *  \copyright Copyright 2026 xroar-dev harness
++ *
++ *  \licenseblock This file is part of XRoar, a Dragon/Tandy CoCo emulator.
++ *
++ *  XRoar is free software; you can redistribute it and/or modify it under the
++ *  terms of the GNU General Public License as published by the Free Software
++ *  Foundation, either version 3 of the License, or (at your option) any later
++ *  version.
++ *
++ *  See COPYING.GPL for redistribution conditions.
++ *
++ *  \endlicenseblock
++ *
++ *  The audit map records what a run DID; this map states what a run MAY do,
++ *  and stops it the moment it does anything else.  One byte per flat physical
++ *  RAM address carries the policy ("this byte is code"), the CPU core's
++ *  per-cycle access class says what the machine is doing to it, and the four
++ *  checks are the products that mean a program has gone wrong:
++ *
++ *    stack   an S-derived write lands somewhere a stack must never be: on
++ *            code, on initialized data, or below -protect-stack-floor
++ *    write   any other write lands on code -- a wild store or buffer overrun
++ *    read    a data read lands on code -- a wild pointer, off-by-one table
++ *            walk, or a return address consumed as data
++ *    data    an instruction fetch lands on anything NOT code -- the PC has
++ *            jumped into data or free RAM
++ *
++ *  A violation is a crash, on purpose: report, RAM dump, exit 70.  The point
++ *  is a failure at the first wrong access, with the machine state that caused
++ *  it, instead of a corrupted screen thirty seconds later.
++ *
++ *  The policy comes from the symbol file's M records ("M C LO HI" for code,
++ *  "M D LO HI" for initialized data; gensym format 2), which classify every
++ *  emitted byte from the assembler LISTING -- an instruction's bytes are
++ *  code, an fcb table's are data, even when that table sits between two
++ *  routines.  Nothing is tagged in source.
++ *
++ *  D means INITIALIZED data and only that.  An `rmb` reservation emits no
++ *  bytes into a listing, so the classifier never sees one and no M D range
++ *  covers it: a program's own stack, buffers and scratch variables all live
++ *  in rmb space and are therefore outside the data class.  That is exactly
++ *  what makes the stack-vs-data check usable -- a stack is *supposed* to sit
++ *  in unclassified RAM, so only a stack that has wandered onto bytes the
++ *  build actually emitted trips it.
++ *
++ *  The one hazard, stated plainly rather than hidden: the stack check keys on
++ *  AUDIT_STACK_S, which is *any* S-derived address, and the 6809 invites
++ *  using S as a fast data pointer -- pshs/puls to move a block, or S-relative
++ *  indexing to walk one.  A program that deliberately pushes into an
++ *  initialized data area, or points S below the floor to reach something,
++ *  WILL fault here, correctly by the rule and wrongly by intent.
++ *  -protect-allow LO-HI is the escape hatch for that region.
++ *
++ *  Checks are DORMANT until the first instruction fetch from a byte the map
++ *  calls code.  The CoCo 3 boot copies BASIC into RAM and runs it from
++ *  physical addresses no user map describes; arming at power-on would fault
++ *  on the ROM's own housekeeping before the program under test ever ran.
++ *  First fetch of mapped code is the moment the program exists.
++ *
++ *  -trap-protect-on scopes that tighter, and doing so takes TWO steps, not
++ *  one: the option arms the checks when its trap fires, and the mere PRESENCE
++ *  of the option turns the automatic arming off (protect_defer_arming(),
++ *  called while the command line is being applied).  Without that second
++ *  step the option could not defer anything at all -- the first fetch of
++ *  mapped code has already armed the checks, usually inside the program's own
++ *  entry, long before any trap fires -- so it only ever re-armed what was
++ *  already live.  -trap-protect-off alone deliberately does NOT defer: that
++ *  combination means "arm as usual, stop checking here", and deferring would
++ *  leave the checks off for the entire run.
++ */
++
++#ifndef XROAR_PROTECT_H_
++#define XROAR_PROTECT_H_
++
++#include <stdint.h>
++
++// The per-cycle access classification is the audit map's legend; one
++// classification, two consumers.
++#include "audit.h"
++
++struct MC6809;
++
++// Same flat physical span as the audit map, for the same reasons.
++#define PROTECT_SPAN AUDIT_SPAN
++
++// Per-byte policy bits.
++#define PROTECT_CODE  (0x01)  // instructions, per the symbol file's M C records
++#define PROTECT_ALLOW (0x02)  // -protect-allow: no check applies here
++#define PROTECT_DATA  (0x04)  // initialized data, per the M D records
++
++// The four checks, as a mask.  Each is also its own verdict value, which is
++// why they are distinct bits rather than an enum.
++#define PROTECT_CHECK_STACK (0x01)  // -protect-mode-stack
++#define PROTECT_CHECK_WRITE (0x02)  // -protect-mode-write
++#define PROTECT_CHECK_READ  (0x04)  // -protect-mode-read
++#define PROTECT_CHECK_DATA  (0x08)  // -protect-mode-data
++
++// Exit status of a protect fault.  Distinct from EXIT_FAILURE so a harness
++// can tell "the program under test violated policy" from "xroar was
++// misconfigured", which exit 1 already means.
++#define PROTECT_EXIT_STATUS (70)
++
++// The live map, or NULL when protect mode is off.  Exposed, like audit_map,
++// so the per-cycle check is an inlined test rather than a call.
++extern uint8_t *protect_map;
++extern uint8_t protect_checks;   // armed PROTECT_CHECK_* mask
++extern _Bool protect_live;       // 0 while dormant (see header comment)
++extern _Bool protect_auto;       // arm on first code fetch; see the header comment
++
++// -protect-stack-floor: the lowest physical address an S-derived write may
++// touch.  0 is "unset" and is also the identity, since nothing is below it,
++// which is why the per-cycle test needs no second variable to consult.
++extern uint32_t protect_stack_floor;
++
++// Classify one RAM cycle against the policy.  bits is the AUDIT_* composition
++// the machine already builds for the audit map.  Returns the PROTECT_CHECK_*
++// that failed, or 0.  Runs on every RAM cycle, so it stays a handful of tests
++// against one map byte.
++//
++// The three write/read rules are deliberately asymmetric:
++//
++//   An S-derived write is the stack check, and faults on code, on initialized
++//   data, or below the floor.  A stack belongs in rmb space, which is in no M
++//   range at all, so all three mean it is somewhere it should not be.
++//
++//   Any other write is the write check, and faults ONLY on code.  Writing to
++//   declared data is what a program does all day -- `sta Scratch` where
++//   `Scratch fcb 0` is ordinary 6809 -- and must never fault.
++//
++//   A read is the read check, and likewise faults only on code.
++inline uint8_t protect_verdict(unsigned phys, uint8_t bits) {
++	if (!protect_map || phys >= PROTECT_SPAN)
++		return 0;
++	uint8_t cls = protect_map[phys];
++	if (!protect_live) {
++		if (protect_auto && (bits & AUDIT_EXEC) && (cls & PROTECT_CODE))
++			protect_live = 1;
++		return 0;
++	}
++	if (cls & PROTECT_ALLOW)
++		return 0;
++	if (bits & AUDIT_EXEC)
++		return (cls & PROTECT_CODE) ? 0 : (protect_checks & PROTECT_CHECK_DATA);
++	if (bits & AUDIT_WRITE) {
++		if (bits & AUDIT_STACK_S)
++			return ((cls & (PROTECT_CODE | PROTECT_DATA)) ||
++			        phys < protect_stack_floor)
++			       ? (protect_checks & PROTECT_CHECK_STACK) : 0;
++		return (cls & PROTECT_CODE)
++		       ? (protect_checks & PROTECT_CHECK_WRITE) : 0;
++	}
++	if (bits & AUDIT_READ)
++		return (cls & PROTECT_CODE)
++		       ? (protect_checks & PROTECT_CHECK_READ) : 0;
++	return 0;
++}
++
++// Command-line state.  The four check flags are tri-state: explicitly given
++// wins over -protect-mode's default from either side of it, the same rule
++// -headless follows for the options it implies.
++void protect_opt_mode(_Bool v);
++void protect_opt_stack(_Bool v);
++void protect_opt_write(_Bool v);
++void protect_opt_read(_Bool v);
++void protect_opt_data(_Bool v);
++void protect_opt_dump(const char *path);
++void protect_opt_stack_floor(uint32_t phys);
++
++// Policy sources.  Code and data ranges arrive from the symbol file's M C and
++// M D records as -symbols parses them; allow ranges from -protect-allow,
++// already resolved to physical numbers by the option layer.  All inclusive.
++void protect_class_range(uint32_t lo, uint32_t hi);
++void protect_data_range(uint32_t lo, uint32_t hi);
++void protect_allow_range(uint32_t lo, uint32_t hi);
++
++// Arm at machine connect.  Fatal if checks are wanted but no code map was
++// loaded, or the machine cannot classify cycles for us: a protect run that
++// silently protects nothing is worse than one that refuses to start.
++void protect_arm(void);
++
++// -trap-protect-on/-off.  Sets protect_live and disables automatic arming,
++// so a trap that turns the checks off stays off.
++void protect_set_active(_Bool active);
++
++// Turn the automatic arming off NOW, at command-line time.  Called when any
++// trap carries -trap-protect-on, which is the only way that option can mean
++// "arm here" rather than "re-arm what the first code fetch already armed".
++void protect_defer_arming(void);
++
++// Report, dump RAM, exit(PROTECT_EXIT_STATUS).  pc/phys_pc describe the
++// instruction in flight (reg_pc points just past its fetched bytes; the
++// flight recorder's last line names it exactly).  value is the byte on the
++// bus for the faulting cycle.
++void protect_fault(struct MC6809 *cpu, unsigned pc, unsigned phys_pc,
++                   unsigned fault_phys, uint8_t bits, uint8_t check)
++	__attribute__((noreturn));
++
++void protect_shutdown(void);
++
++#endif
+diff --git a/src/symfile.c b/src/symfile.c
+index 5bd9935..52e23f8 100644
+--- a/src/symfile.c
++++ b/src/symfile.c
+@@ -33,6 +33,7 @@
+ #include "xalloc.h"
+ 
+ #include "logging.h"
++#include "protect.h"
+ #include "symfile.h"
+ 
+ // Record classes, in the order a bare name prefers them.  A program symbol
+@@ -263,7 +264,7 @@ void symfile_load(const char *spec) {
+ 
+ 	char row[1024];
+ 	unsigned lineno = 0;
+-	size_t got_s = 0, got_d = 0, got_e = 0, got_l = 0;
++	size_t got_s = 0, got_d = 0, got_e = 0, got_l = 0, got_m = 0;
+ 	char *file_build = NULL;
+ 
+ 	while (fgets(row, sizeof(row), f)) {
+@@ -281,12 +282,15 @@ void symfile_load(const char *spec) {
+ 		const char *cls = field[0];
+ 
+ 		if (0 == strcmp(cls, "!gensym")) {
+-			// One generator version is supported at a time.  A file
+-			// from a newer generator may spell a class differently,
+-			// and reading it optimistically is how a symbol file
+-			// starts producing plausible wrong addresses.
+-			if (n < 2 || 0 != strcmp(field[1], "1"))
+-				symfile_fatal("%s: generator version '%s', this build reads 1",
++			// Known generator versions only.  A file from a newer
++			// generator may spell a class differently, and reading
++			// it optimistically is how a symbol file starts
++			// producing plausible wrong addresses.  2 is a strict
++			// superset of 1 (it adds the M class-map records), so
++			// both remain readable.
++			if (n < 2 || (0 != strcmp(field[1], "1") &&
++			              0 != strcmp(field[1], "2")))
++				symfile_fatal("%s: generator version '%s', this build reads 1-2",
+ 				             path, (n >= 2) ? field[1] : "");
+ 		} else if (0 == strcmp(cls, "!build")) {
+ 			if (n >= 2)
+@@ -332,6 +336,34 @@ void symfile_load(const char *spec) {
+ 			l->phys = parse_hex(field[1], "physical", path, lineno);
+ 			l->where = xstrdup(field[2]);
+ 			got_l++;
++		} else if (0 == strcmp(cls, "M")) {
++			// Format 2: class-map range, "M CLASS LO HI", physical
++			// and inclusive.  C is code, D is INITIALIZED data; the
++			// classification comes from the assembler listing, so
++			// an fcb table between two routines is correctly D and
++			// not C.  gensym format 2 emits both, and a file from
++			// the version that emitted only C records still loads.
++			// An rmb reservation emits no listing bytes, so it is
++			// in neither class -- which is what keeps a program's
++			// own stack and buffers out of D.  Protect mode is the
++			// consumer.  An unknown class is fatal rather than
++			// skipped: a class this build does not enforce is a
++			// policy silently not applied.
++			if (n < 4)
++				symfile_fatal("%s:%u: short M record", path, lineno);
++			if (0 != strcmp(field[1], "C") && 0 != strcmp(field[1], "D"))
++				symfile_fatal("%s:%u: unknown map class '%s' (C code, D data)",
++				             path, lineno, field[1]);
++			uint32_t lo = parse_hex(field[2], "lo", path, lineno);
++			uint32_t hi = parse_hex(field[3], "hi", path, lineno);
++			if (hi < lo)
++				symfile_fatal("%s:%u: M range ends before it starts",
++				             path, lineno);
++			if (field[1][0] == 'C')
++				protect_class_range(lo, hi);
++			else
++				protect_data_range(lo, hi);
++			got_m++;
+ 		} else {
+ 			symfile_fatal("%s:%u: unknown record class '%s'", path, lineno, cls);
+ 		}
+@@ -356,9 +388,9 @@ void symfile_load(const char *spec) {
+ 	}
+ 
+ 	loaded = 1;
+-	LOG_MOD_DEBUG(1, "symbols", "%s: %zu symbols, %zu dp, %zu equates, %zu lines"
+-	              " (build %s)\n", path, got_s, got_d, got_e, got_l,
+-	              build_id ? build_id : "unstated");
++	LOG_MOD_DEBUG(1, "symbols", "%s: %zu symbols, %zu dp, %zu equates, %zu lines, "
++	              "%zu map ranges (build %s)\n", path, got_s, got_d, got_e, got_l,
++	              got_m, build_id ? build_id : "unstated");
+ }
+ 
+ bool symfile_loaded(void) {
+diff --git a/src/xroar.c b/src/xroar.c
+index 369028d..34b4825 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -55,6 +55,7 @@
+ #include "ao.h"
+ #include "audit.h"
+ #include "auto_kbd.h"
++#include "protect.h"
+ #include "joystick_script.h"
+ #include "becker.h"
+ #include "cart.h"
+@@ -173,6 +174,8 @@ struct trap_def {
+ 	int audit_off;      // -trap-audit-off: stop recording
+ 	int audit_clear;    // -trap-audit-clear: zero the map
+ 	char *audit_write;  // -trap-audit-write FILE: write the map at this trap
++	int protect_on;     // -trap-protect-on: protect checks live from this trap
++	int protect_off;    // -trap-protect-off: protect checks dormant from this trap
+ 
+ 	// Internal
+ 	unsigned long counter;
+@@ -1827,6 +1830,15 @@ static void save_config(void) {
+  * resources.
+  */
+ 
++// The protect fault path (protect.c) prints the same flight-recorder dump a
++// trap fire prints, but the ring and its dump are static to this file; hand
++// out a wrapper that is a no-op in a build without traps.
++void xroar_trap_history_dump(void) {
++#ifdef WANT_TRAPS
++	trap_history_dump();
++#endif
++}
++
+ void xroar_shutdown(void) {
+ 	static bool shutting_down = 0;
+ 	if (shutting_down)
+@@ -1838,6 +1850,7 @@ void xroar_shutdown(void) {
+ 	disable_all_traps();
+ 	profile_dump();
+ 	audit_shutdown();
++	protect_shutdown();
+ 	symfile_shutdown();   // after profile_dump(): that is a consumer of it
+ 	save_config();
+ 	messenger_shutdown();
+@@ -2593,6 +2606,29 @@ void xroar_connect_machine(void) {
+ 	ui_update_state(xroar.msgr_client_id, ui_tag_picture, xroar.state.vo.picture, NULL);
+ 
+ 	enable_all_traps();
++
++#ifdef WANT_TRAPS
++	// A -trap-protect-on anywhere on the command line means the automatic
++	// arming must not happen: see protect.h.  Scanning the traps here, and
++	// not when one fires, is the whole point -- by fire time the first
++	// fetch of mapped code has long since armed the checks.
++	//
++	// BEFORE protect_arm(), not after, because protect_arm() prints the
++	// line an operator reads to confirm the flag took: deferring after it
++	// left a run that really did defer announcing "dormant until first
++	// code fetch".  The behaviour was right and the only evidence of it
++	// said otherwise, which is worse than either being wrong alone.
++	for (unsigned i = 0; i < num_trap_defs; ++i) {
++		if (trap_defs[i].protect_on) {
++			protect_defer_arming();
++			break;
++		}
++	}
++#endif
++
++	// Protect mode arms here for the same reason the traps enable here:
++	// this is the first moment the machine the checks describe exists.
++	protect_arm();
+ }
+ 
+ void xroar_configure_machine(struct machine_config *mc) {
+@@ -3211,6 +3247,45 @@ static unsigned long parse_num_ul(const char *s) {
+ 	return v;
+ }
+ 
++// -protect-allow LO-HI (or a single address): physical bytes exempt from
++// every protect check.  Symbols resolve like any other address; the first
++// '-' splits the range, and symbol offsets are spelt '+', so the grammar
++// stays unambiguous.  Deliberately physical-only: the map is physical, and
++// accepting a logical number here would exempt whatever the MMU happened to
++// map at parse time, which is nothing.
++static void set_protect_allow(const char *spec) {
++	char *copy = xstrdup(spec);
++	char *dash = strchr(copy, '-');
++	unsigned long lo, hi;
++	if (dash) {
++		*dash = 0;
++		lo = parse_num_ul(copy);
++		hi = parse_num_ul(dash + 1);
++	} else {
++		lo = hi = parse_num_ul(copy);
++	}
++	if (hi < lo || hi > 0x1fffff) {
++		fprintf(stderr, "xroar: -protect-allow %s: bad physical range\n", spec);
++		exit(EXIT_FAILURE);
++	}
++	protect_allow_range((uint32_t)lo, (uint32_t)hi);
++	free(copy);
++}
++
++// -protect-stack-floor ADDR: the lowest PHYSICAL address an S-derived write
++// may touch.  Physical and @name-resolving for the same reasons -protect-allow
++// is.  The data class catches a stack that has been pointed at something the
++// build emitted; this catches the commoner failure, a stack that has simply
++// grown too far down, through rmb space no M record can describe.
++static void set_protect_stack_floor(const char *spec) {
++	unsigned long v = parse_num_ul(spec);
++	if (v > 0x1fffff) {
++		fprintf(stderr, "xroar: -protect-stack-floor %s: bad physical address\n", spec);
++		exit(EXIT_FAILURE);
++	}
++	protect_opt_stack_floor((uint32_t)v);
++}
++
+ // Shared loader for -load-ram and -trap-load.
+ //
+ // Spec grammar:  FILE[,format=F][,addr=A][,max=N]
+@@ -4525,6 +4600,16 @@ static void handle_trap(void *sptr) {
+ 		LOG_MOD_DEBUG(2, "trap", "audit write: %s\n", trap->audit_write);
+ 		audit_write(trap->audit_write);
+ 	}
++	// Off before on, same as the audit pair: a trap carrying both means
++	// "rescope", and rescoping ends live.
++	if (trap->protect_off) {
++		LOG_MOD_DEBUG(2, "trap", "protect off\n");
++		protect_set_active(0);
++	}
++	if (trap->protect_on) {
++		LOG_MOD_DEBUG(2, "trap", "protect on\n");
++		protect_set_active(1);
++	}
+ 
+ 	// Cycle counter actions.  Print before reset so -trap-cycle-print-reset
+ 	// reports the elapsed count and then zeroes it.  The reset/print is
+@@ -4700,6 +4785,14 @@ static void set_trap(const char *cond) {
+ 			cur_trap_def->audit_write = private_cfg.debug.trap_def.audit_write;
+ 			private_cfg.debug.trap_def.audit_write = NULL;
+ 		}
++		if (private_cfg.debug.trap_def.protect_on) {
++			cur_trap_def->protect_on = 1;
++			private_cfg.debug.trap_def.protect_on = 0;
++		}
++		if (private_cfg.debug.trap_def.protect_off) {
++			cur_trap_def->protect_off = 1;
++			private_cfg.debug.trap_def.protect_off = 0;
++		}
+ 	}
+ 	if (cond) {
+ 		unsigned i = num_trap_defs++;
+@@ -5003,6 +5096,16 @@ static struct xconfig_option const xroar_options[] = {
+ 	// matters on the command line -- see symtab.h.
+ 	{ XC_CALL_STRING("symbols", &symfile_load) },
+ 	{ XC_CALL_STRING("symbols-query", &symfile_query) },
++	// Not inside WANT_TRAPS either: protect mode rides on the memory
++	// path's access classification, not on the trap engine.
++	{ XC_CALL_BOOL("protect-mode", &protect_opt_mode) },
++	{ XC_CALL_BOOL("protect-mode-stack", &protect_opt_stack) },
++	{ XC_CALL_BOOL("protect-mode-write", &protect_opt_write) },
++	{ XC_CALL_BOOL("protect-mode-read", &protect_opt_read) },
++	{ XC_CALL_BOOL("protect-mode-data", &protect_opt_data) },
++	{ XC_CALL_STRING("protect-allow", &set_protect_allow) },
++	{ XC_CALL_STRING("protect-stack-floor", &set_protect_stack_floor) },
++	{ XC_CALL_STRING("protect-dump", &protect_opt_dump) },
+ #ifdef WANT_TRAPS
+ 	{ XC_CALL_STRING("trap", &set_trap) },
+ 	{ XC_CALL_STRING("trap-range", &set_trap_count) },
+@@ -5018,6 +5121,8 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT1("trap-audit-off", &private_cfg.debug.trap_def.audit_off) },
+ 	{ XC_SET_INT1("trap-audit-clear", &private_cfg.debug.trap_def.audit_clear) },
+ 	{ XC_SET_STRING("trap-audit-write", &private_cfg.debug.trap_def.audit_write) },
++	{ XC_SET_INT1("trap-protect-on", &private_cfg.debug.trap_def.protect_on) },
++	{ XC_SET_INT1("trap-protect-off", &private_cfg.debug.trap_def.protect_off) },
+ 	{ XC_SET_STRING("trap-ram", &private_cfg.debug.trap_def.ram) },
+ 	{ XC_SET_STRING("trap-byte", &private_cfg.debug.trap_def.byte_path) },
+ 	{ XC_SET_STRING("export-ram", &private_cfg.file.export_ram) },
+@@ -5310,6 +5415,17 @@ static void helptext(void) {
+ "    -trap-audit-off     stop recording from this trap\n"
+ "    -trap-audit-clear   zero the audit map at this trap\n"
+ "    -trap-audit-write FILE  write the audit map at this trap\n"
++"  -protect-mode         all four protect checks; a violation reports, dumps RAM, exits 70\n"
++"  -protect-mode-stack   check: S-derived write into code, data or below the floor (overrides -protect-mode)\n"
++"  -protect-mode-write   check: any other write into code\n"
++"  -protect-mode-read    check: data read from code\n"
++"  -protect-mode-data    check: instruction fetch from non-code\n"
++"  -protect-allow RANGE  physical LO-HI exempt from protect checks (@names ok)\n"
++"  -protect-stack-floor ADDR  physical address the stack may not grow below (@names ok)\n"
++"  -protect-dump FILE    protect fault RAM dump path (default protect-crash.ram)\n"
++"    -trap-protect-on    arm protect checks at this trap, NOT at the first mapped\n"
++"                          code fetch (which is the default without this)\n"
++"    -trap-protect-off   protect checks dormant from this trap\n"
+ "    -export-ram FILE    dump flat physical RAM of -load snapshot, then exit\n"
+ #ifdef SCREENSHOT
+ "    -trap-screenshot FILE  write PNG of rendered frame at trap\n"
+diff --git a/src/xroar.h b/src/xroar.h
+index 1af71f1..210c672 100644
+--- a/src/xroar.h
++++ b/src/xroar.h
+@@ -262,6 +262,10 @@ void xroar_init_finish(void);
+ /// Cleanly shut down before program exit.
+ void xroar_shutdown(void);
+ 
++/// Dump the -trap-history flight-recorder ring (no-op without WANT_TRAPS).
++/// For the protect fault path, which reports from outside xroar.c.
++void xroar_trap_history_dump(void);
++
+ #ifdef AUTOSAVE_PREFIX
+ /// Save configuration to known location.
+ void xroar_save_config_file(void);

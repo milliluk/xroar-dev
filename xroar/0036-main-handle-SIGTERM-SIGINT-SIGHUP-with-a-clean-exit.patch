@@ -1,7 +1,7 @@
-From 6f4692121e335723fd36973e6b5972ce3893eef8 Mon Sep 17 00:00:00 2001
+From 8dd50973366520cebaa7bb6d84f6691de96708b2 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:40 -0400
-Subject: [PATCH 36/44] main: handle SIGTERM/SIGINT/SIGHUP with a clean exit
+Subject: [PATCH 36/49] main: handle SIGTERM/SIGINT/SIGHUP with a clean exit
 
 ---
  src/main_unix.c | 24 ++++++++++++++++++++++++

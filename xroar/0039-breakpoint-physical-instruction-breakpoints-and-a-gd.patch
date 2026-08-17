@@ -1,19 +1,28 @@
-From 2c270672d68285b91c8219b1d35112cee2d8179f Mon Sep 17 00:00:00 2001
+From 91e5d3570a69ef96c1b714f664945cf8313a51b7 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:47 -0400
-Subject: [PATCH 39/44] breakpoint: physical instruction breakpoints, and a gdb
+Subject: [PATCH 39/49] breakpoint: physical instruction breakpoints, and a gdb
 
+The stop reply here first said 'T' only on a GIME machine and fell back
+to a bare S%02x everywhere else.  That shape made the GIME branch the
+only place to hang additional stop-reply fields, so every later
+machine-independent field would silently vanish for the Dragon family.
+Restructured: every machine sends a T packet (with no pairs when there
+is no MMU -- valid RSP, and clients accept it), the MMU pairs are added
+only when a GIME exists, and the physical PC is computed for every
+machine, degrading to the logical PC on a flat machine exactly as
+trap_fast_phys() does fork-wide.
 ---
  src/breakpoint.c    |   1 +
- src/coco3.c         |  64 ++++++++++++++++++++----
- src/dragon/dragon.c |  55 ++++++++++++++++++---
+ src/coco3.c         |  64 +++++++++++++++++++----
+ src/dragon/dragon.c |  55 +++++++++++++++++---
  src/dragon/dragon.h |   1 +
- src/gdb.c           | 115 +++++++++++++++++++++++++++++++++++++++++++-
+ src/gdb.c           | 122 ++++++++++++++++++++++++++++++++++++++++++--
  src/machine.c       |  20 ++++++++
- src/machine.h       |  14 ++++++
- src/mc10.c          |  56 ++++++++++++++++++---
+ src/machine.h       |  14 +++++
+ src/mc10.c          |  56 +++++++++++++++++---
  src/xroar.c         |  20 ++++----
- 9 files changed, 310 insertions(+), 36 deletions(-)
+ 9 files changed, 315 insertions(+), 38 deletions(-)
 
 diff --git a/src/breakpoint.c b/src/breakpoint.c
 index 5596a25..23d17ca 100644
@@ -28,11 +37,11 @@ index 5596a25..23d17ca 100644
  #ifndef BP_DEBUG
  #define BP_DEBUG(...) LOG_DEBUG(__VA_ARGS__)
 diff --git a/src/coco3.c b/src/coco3.c
-index 2097189..a597573 100644
+index 038be78..9eb800f 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
-@@ -67,6 +67,14 @@
- #include "screenshot.h"
+@@ -66,6 +66,14 @@
+ #include "vo.h"
  #include "xroar.h"
  
 +struct coco3;
@@ -46,7 +55,7 @@ index 2097189..a597573 100644
  #ifndef M_PI
  # define M_PI 3.14159265358979323846
  #endif
-@@ -179,6 +187,7 @@ struct coco3 {
+@@ -172,6 +180,7 @@ struct coco3 {
  	struct bp_breakpoint_set breakpoint_set;
  	struct bp_watchpoint_set watchpoint_set;
  	struct bp_watchpoint_set pwatchpoint_set;  // physical-address watchpoints
@@ -54,7 +63,7 @@ index 2097189..a597573 100644
  
  	struct tape_interface *tape_interface;
  	DELEGATE_T1(void, float) tape_update_audio;
-@@ -363,16 +372,14 @@ static void coco3_add_instruction_hook(struct machine *m,
+@@ -356,16 +365,14 @@ static void coco3_add_instruction_hook(struct machine *m,
  				 DELEGATE_T1(void, uint32) handler) {
  	struct coco3 *mcc3 = (struct coco3 *)m;
  	bp_instr_hook_add(&mcc3->breakpoint_set, handler);
@@ -73,7 +82,7 @@ index 2097189..a597573 100644
  }
  
  static void coco3_add_breakpoint(struct machine *m, uint32_t A,
-@@ -396,12 +403,51 @@ static void coco3_remove_pwatchpoint(struct machine *m, int RnW,
+@@ -389,12 +396,51 @@ static void coco3_remove_pwatchpoint(struct machine *m, int RnW,
  static void coco3_add_watchpoint(struct machine *m, bool RnW,
  				 uint32_t Astart, uint32_t Aend,
  				 DELEGATE_T3(void, bool, uint32, uint8) handler);
@@ -125,7 +134,7 @@ index 2097189..a597573 100644
  static void coco3_remove_watchpoint(struct machine *m, int RnW,
  				    int32_t Astart, uint32_t Aend,
  				    DELEGATE_T3(void, bool, uint32, uint8) handler);
-@@ -505,6 +551,8 @@ static struct part *coco3_allocate(void) {
+@@ -498,6 +544,8 @@ static struct part *coco3_allocate(void) {
  	m->debug.remove_instruction_hook = coco3_remove_instruction_hook;
  	m->debug.remove_breakpoint = coco3_remove_breakpoint;
  	m->debug.add_watchpoint = coco3_add_watchpoint;
@@ -134,7 +143,7 @@ index 2097189..a597573 100644
  	m->debug.add_pwatchpoint = coco3_add_pwatchpoint;
  	m->debug.remove_pwatchpoint = coco3_remove_pwatchpoint;
  	m->debug.remove_watchpoint = coco3_remove_watchpoint;
-@@ -1755,18 +1803,14 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+@@ -1576,18 +1624,14 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
  	if (!bp_breakpoint_add(&mcc3->breakpoint_set, A, handler)) {
  		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
  	}
@@ -156,10 +165,10 @@ index 2097189..a597573 100644
  
  static void coco3_add_watchpoint(struct machine *m, bool RnW,
 diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
-index 3b08c0b..1469020 100644
+index 222fbe4..c603dd4 100644
 --- a/src/dragon/dragon.c
 +++ b/src/dragon/dragon.c
-@@ -64,6 +64,14 @@
+@@ -65,6 +65,14 @@
  #include "xconfig.h"
  #include "xroar.h"
  
@@ -174,7 +183,7 @@ index 3b08c0b..1469020 100644
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
  #define DRAGON_SER_RAM      (2)
-@@ -236,16 +244,14 @@ static void dragon_add_instruction_hook(struct machine *m,
+@@ -237,16 +245,14 @@ static void dragon_add_instruction_hook(struct machine *m,
  				 DELEGATE_T1(void, uint32) handler) {
  	struct dragon *md = (struct dragon *)m;
  	bp_instr_hook_add(&md->breakpoint_set, handler);
@@ -193,7 +202,7 @@ index 3b08c0b..1469020 100644
  }
  
  static void dragon_add_breakpoint(struct machine *m, uint32_t A,
-@@ -261,6 +267,7 @@ static void dragon_add_pwatchpoint(struct machine *m, bool RnW,
+@@ -262,6 +268,7 @@ static void dragon_add_pwatchpoint(struct machine *m, bool RnW,
  static void dragon_remove_pwatchpoint(struct machine *m, int RnW,
  				    int32_t Astart, uint32_t Aend,
  				    DELEGATE_T3(void, bool, uint32, uint8) handler);
@@ -201,7 +210,7 @@ index 3b08c0b..1469020 100644
  static void dragon_remove_watchpoint(struct machine *m, int RnW,
  				     int32_t Astart, uint32_t Aend,
  				     DELEGATE_T3(void, bool, uint32, uint8) handler);
-@@ -326,6 +333,8 @@ void dragon_allocate_common(struct dragon *md) {
+@@ -335,6 +342,8 @@ void dragon_allocate_common(struct dragon *md) {
  	m->debug.remove_instruction_hook = dragon_remove_instruction_hook;
  	m->debug.remove_breakpoint = dragon_remove_breakpoint;
  	m->debug.add_watchpoint = dragon_add_watchpoint;
@@ -210,7 +219,7 @@ index 3b08c0b..1469020 100644
  	m->debug.add_pwatchpoint = dragon_add_pwatchpoint;
  	m->debug.remove_pwatchpoint = dragon_remove_pwatchpoint;
  	m->debug.remove_watchpoint = dragon_remove_watchpoint;
-@@ -1364,16 +1373,46 @@ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
+@@ -1511,16 +1520,46 @@ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
  	if (!bp_breakpoint_add(&md->breakpoint_set, A, handler)) {
  		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
  	}
@@ -262,7 +271,7 @@ index 3b08c0b..1469020 100644
  	}
  }
 diff --git a/src/dragon/dragon.h b/src/dragon/dragon.h
-index 26b2bd8..604ed16 100644
+index 8851d6b..ac0e66c 100644
 --- a/src/dragon/dragon.h
 +++ b/src/dragon/dragon.h
 @@ -95,6 +95,7 @@ struct dragon {
@@ -274,10 +283,10 @@ index 26b2bd8..604ed16 100644
  	struct tape_interface *tape_interface;
  	DELEGATE_T1(void, float) tape_update_audio;
 diff --git a/src/gdb.c b/src/gdb.c
-index 368af48..04a7671 100644
+index 1432866..29ad8d4 100644
 --- a/src/gdb.c
 +++ b/src/gdb.c
-@@ -74,6 +74,34 @@
+@@ -76,6 +76,34 @@
   *      Qxroar.key:SCAN,S          | press (S!=0)/release (S=0) raw matrix key
   *                                     by DSCAN scancode (PIA path)
   *      Qxroar.type:HEX            | queue hex-encoded text to auto_kbd typer
@@ -303,44 +312,51 @@ index 368af48..04a7671 100644
 + * zero-padded a logical address to five digits would otherwise silently get a
 + * physical breakpoint.
 + *
-+ * On a GIME machine the stop reply is a 'T' packet carrying the physical
-+ * context of the stop as extra name:value pairs -- xpc, block, task and
-+ * paddr, the same values the corresponding qxroar queries return -- so a
-+ * client does not need a query round trip per stop to find out where it is.
-+ * Unrecognised pairs are ignorable by protocol.  Machines with no GIME reply
-+ * 'S' exactly as before.
++ * The stop reply is a 'T' packet on every machine.  On a GIME machine it
++ * carries the physical context of the stop as extra name:value pairs -- xpc,
++ * block, task and paddr, the same values the corresponding qxroar queries
++ * return -- so a client does not need a query round trip per stop to find out
++ * where it is.  A machine with no GIME sends the same packet without the MMU
++ * pairs.  Unrecognised pairs are ignorable by protocol.
  
   * The four derived values above are as far as this should go. Anything that is
   * simply a chip register -- SAM, PIA, the GIME's own $FF9x -- belongs in
-@@ -862,8 +890,26 @@ static int send_char(struct gdb_interface_private *gip, char c) {
+@@ -869,10 +897,31 @@ static int send_char(struct gdb_interface_private *gip, char c) {
  
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
-+// The stop reply.  On a GIME machine it is a 'T' packet carrying the physical
-+// context of the stop -- the same four values qxroar.xpc / .block / .task /
-+// .paddr answer, computed here at the moment of the stop.  A logical PC alone
-+// does not say where a stop happened on this machine: the same $6xxx can be
-+// any of eleven banks.  Sending it with the stop saves the client a query
-+// round trip per stop, and more importantly makes the answer atomic with the
-+// stop rather than "whatever is mapped by the time you ask".  Machines with
-+// no MMU have nothing to add and reply 'S' as before.
++// The stop reply.  A 'T' packet on every machine.  On a GIME machine it
++// carries the physical context of the stop -- the same four values qxroar.xpc
++// / .block / .task / .paddr answer, computed here at the moment of the stop.
++// A logical PC alone does not say where a stop happened on that machine: the
++// same $6xxx can be any of eleven banks.  Sending it with the stop saves the
++// client a query round trip per stop, and more importantly makes the answer
++// atomic with the stop rather than "whatever is mapped by the time you ask".
++// A machine with no MMU sends the same packet without the MMU pairs -- 'T'
++// rather than 'S', so a machine-independent field added to this reply reaches
++// every machine instead of riding the GIME branch.
  static void send_last_signal(struct gdb_interface_private *gip) {
 -	char tmpbuf[4];
+-	snprintf(tmpbuf, sizeof(tmpbuf), "S%02x", gip->last_signal);
+-	send_packet(gip, tmpbuf, 3);
 +	char tmpbuf[64];
++	uint16_t pc = mc6809_get_pc(gip->cpu);
++	// With no MMU the physical PC is the logical PC -- the same degrade
++	// trap_fast_phys() applies everywhere else in this fork.
++	unsigned xpc = pc;
++	int n = snprintf(tmpbuf, sizeof(tmpbuf), "T%02x", gip->last_signal);
 +	if (gip->gime) {
-+		uint16_t pc = mc6809_get_pc(gip->cpu);
-+		unsigned xpc = tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff;
-+		snprintf(tmpbuf, sizeof(tmpbuf),
-+			 "T%02xxpc:%05x;block:%02x;task:%02x;paddr:%05x;",
-+			 gip->last_signal, xpc, (xpc >> 13) & 0xff,
-+			 tcc1014_get_task(gip->gime), gip->gime->Z & 0x7ffff);
-+		send_packet_string(gip, tmpbuf);
-+		return;
++		xpc = tcc1014_logical_to_physical(gip->gime, pc) & 0x7ffff;
++		n += snprintf(tmpbuf + n, sizeof(tmpbuf) - (size_t)n,
++			      "xpc:%05x;block:%02x;task:%02x;paddr:%05x;",
++			      xpc, (xpc >> 13) & 0xff,
++			      tcc1014_get_task(gip->gime), gip->gime->Z & 0x7ffff);
 +	}
- 	snprintf(tmpbuf, sizeof(tmpbuf), "S%02x", gip->last_signal);
- 	send_packet(gip, tmpbuf, 3);
++	send_packet_string(gip, tmpbuf);
  }
-@@ -1167,6 +1213,73 @@ static void general_set(struct gdb_interface_private *gip, char *args) {
+ 
+ static void send_general_registers(struct gdb_interface_private *gip) {
+@@ -1175,6 +1224,73 @@ static void general_set(struct gdb_interface_private *gip, char *args) {
  			send_packet_string(gip, "E00");
  			return;
  		}
@@ -476,7 +492,7 @@ index 9bab82c..5cac70b 100644
  #endif
  
 diff --git a/src/mc10.c b/src/mc10.c
-index b9d3ae9..2485bf5 100644
+index 07abaa1..d3564e7 100644
 --- a/src/mc10.c
 +++ b/src/mc10.c
 @@ -58,6 +58,14 @@
@@ -538,7 +554,7 @@ index b9d3ae9..2485bf5 100644
  	m->debug.add_pwatchpoint = mc10_add_pwatchpoint;
  	m->debug.remove_pwatchpoint = mc10_remove_pwatchpoint;
  	m->debug.remove_watchpoint = mc10_remove_watchpoint;
-@@ -915,16 +925,46 @@ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
+@@ -929,16 +939,46 @@ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
  	if (!bp_breakpoint_add(&mp->breakpoint_set, A, handler)) {
  		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
  	}
@@ -590,10 +606,10 @@ index b9d3ae9..2485bf5 100644
  	}
  }
 diff --git a/src/xroar.c b/src/xroar.c
-index f41ccbf..dbe0d77 100644
+index 64918b4..d8ec9b5 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -4493,15 +4493,17 @@ static void set_trap(const char *cond) {
+@@ -4501,15 +4501,17 @@ static void set_trap(const char *cond) {
  		cur_trap_def->trace = -1;
  		cur_trap_def->no_trace = -1;
  		cur_trap_def->match_value = -1;

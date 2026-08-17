@@ -35,12 +35,29 @@ what AGENTS.md tells everything to prefer:
     S NAME IMAGE LOGICAL PHYSICAL
     D NAME OFFSET LOGICAL PHYSICAL          direct-page variable
     E NAME VALUE                            equate from defs.asm
+    M C PHYSLO PHYSHI                       code bytes, inclusive (version 2)
+    M D PHYSLO PHYSHI                       initialized data bytes (version 2)
 
 and, in the .lines file:
 
     L PHYSICAL FILE:LINE
 
 Addresses are bare hex, no prefix, uppercase. Physical is 5 digits.
+
+Version 2 adds the M records, classified from the LISTING rather than from
+symbols or sections: M C is every byte an instruction mnemonic emitted, M D
+every byte a data directive emitted, so an fcb table between two routines is
+correctly D and not C. xroar's -protect-mode is the consumer. Symbols cannot
+carry this distinction -- a label is just an address -- which is why it is a
+new record and a version bump rather than a convention on S records.
+
+M D means INITIALIZED data and nothing else. An `rmb` reservation emits no
+bytes into an lwasm listing, so the classifier never sees one and no M D range
+can cover it; a program's own stack, buffers and scratch all live in rmb space
+and stay outside the class. That is deliberate and load-bearing: it is what
+lets -protect-mode-stack fault on a stack that has wandered onto declared data
+without faulting on every program whose stack sits in reserved space, which is
+all of them.
 """
 
 import argparse
@@ -51,7 +68,7 @@ import re
 import subprocess
 import sys
 
-GENSYM_VERSION = 1
+GENSYM_VERSION = 2
 
 # Which project this is generating for, and which map file holds the resident
 # image's direct-page records. Both are environment-overridable so the tool is
@@ -532,6 +549,212 @@ def collect_equates(root, warn):
     return values, numeric
 
 
+# What a listing line's mnemonic can be.  Instructions become M C ranges, data
+# directives M D ranges; anything else -- macro call sites, mostly --
+# classifies nothing and is tallied so silence cannot hide it.
+#
+# The two sets below are GENERATED from the vendored lwasm's own instruction
+# table by tools/gen_mnemonics.py, and were typed by hand until that tool
+# existed.  The hand-written version was missing 55 mnemonics -- every
+# Q-register form, sbcd/sbcr, the E/F/W negates and shifts, all four tfr
+# variants, the whole 6800-compatibility block -- and each one was a hole in
+# the code map and a false -protect-mode-data fault waiting to happen.  A
+# 6309 instruction table is not a thing to keep in your head.
+#
+# CRITICAL PROPERTY, and the reason M D is safe to enforce a stack check
+# against: `rmb` and the other pure reservations emit NO bytes into an lwasm
+# listing.  A reservation has no emit column, so the loop below never sees one
+# (nb == 0 lines are skipped before the mnemonic is even read) and no M D range
+# can cover reserved space.  A program's own stack, buffers and scratch live
+# there, so they are outside the data class by construction -- which is what
+# keeps -protect-mode-stack from faulting on every ordinary push.  `rmb` is
+# still named below because it IS a data directive and the set doubles as the
+# mnemonic vocabulary; if an assembler ever did emit fill bytes for it, those
+# bytes would join the data class and every stack in reserved space would fault
+# at once, so that is the thing to check first if this suddenly cries wolf.
+
+# --- BEGIN GENERATED MNEMONICS (tools/gen_mnemonics.py) ---
+# Generated from lwtools-4.25.tar.gz's lwasm/instab.c. DO NOT HAND-EDIT:
+# re-run `python3 tools/gen_mnemonics.py` instead. 277 instructions,
+# 84 data directives; `os9` is counted as an instruction because it
+# emits SWI2 and a call number.
+
+INSTRUCTIONS = frozenset("""
+    aba abx adca adcb adcd adcr adda addb
+    addd adde addf addr addw aim anda andb
+    andcc andd andr asl asla aslb asld asr
+    asra asrb asrd asrq band bcc bcs beor
+    beq bge bgt bhi bhs biand bieor bior
+    bita bitb bitd bitmd ble blo bls blt
+    bmi bne bor bpl bra break brn bsr
+    bvc bvs cba clc clf cli clif clr
+    clra clrb clrd clre clrf clrq clrw clv
+    cmpa cmpb cmpd cmpe cmpf cmpr cmps cmpu
+    cmpw cmpx cmpy com coma comb comd come
+    comf comq comw copy cpx cwai daa dec
+    deca decb decd dece decf decw des dex
+    dey divd divq eim eora eorb eord eorr
+    exg exp expand hcf imp implode inc inca
+    incb incd ince incf incw ins inx iny
+    jmp jsr lbcc lbcs lbeq lbge lbgt lbhi
+    lbhs lble lblo lbls lblt lbmi lbne lbpl
+    lbra lbrn lbsr lbvc lbvs lda ldb ldbt
+    ldd lde ldf ldmd ldq lds ldu ldw
+    ldx ldy leas leau leax leay log lsl
+    lsla lslb lsld lsle lslf lslq lsr lsra
+    lsrb lsrd lsrq lsrw mul muld neg nega
+    negb negd nege negf negq negw nop oim
+    ora orb orcc ord orr os9 pshs pshsw
+    pshu pshuw puls pulsw pulu puluw reset rhf
+    rol rola rolb rold rolw ror rora rorb
+    rord rorw rti rts sba sbca sbcb sbcd
+    sbcr sec sef sei seif sev sex sexw
+    sta stb stbt std ste stf stq sts
+    stu stw stx sty suba subb subd sube
+    subf subr subw swi swi2 swi3 sync tab
+    tap tba tfm tfr tfrm tfrp tfrr tfrs
+    tim tpa tst tsta tstb tstd tste tstf
+    tstq tstw tsx txs wai
+""".split())
+
+DATA_DIRECTIVES = frozenset("""
+    align bsz dephase dtb dts else emod end
+    endc endif endm ends endsect endsection endstruct equ
+    error exit exitm export extdep extern external fcb
+    fcc fcn fcs fcz fdb fdbs fill fqb
+    fzb if ifc ifdef ifeq ifge ifgt ifle
+    iflt ifnc ifndef ifne ifopt ifp1 ifp2 ifpragma
+    ifstr import incl include includebin includestr lib macr
+    macro mod msg nam opt org pag page
+    phase pragma reorg rmb rmd rmq rmw sect
+    section set setdp setstr spc struct ttl use
+    warning zmb zmd zmq
+""".split())
+# --- END GENERATED MNEMONICS ---
+
+
+def collect_class_ranges(objdir, images, warn):
+    """(code, data), each [(phys_lo, phys_hi)] inclusive and merged.
+
+    code is every byte an instruction emitted; data every byte a data
+    directive emitted. Classified from the LISTING, the one build output
+    that says per byte which emitted it. Sections cannot say this (an fcb
+    table inside a code section is still data) and symbols cannot either (a
+    label is just an address). Continuation lines -- a long fcc or fdb
+    spilling its bytes across several listing rows -- carry no source text,
+    so they inherit the class of the line that started them.
+
+    Reserved space (`rmb`) is in NEITHER list: it emits no listing bytes, so
+    nothing here ever sees it. See DATA_DIRECTIVES above -- that absence is
+    what makes the data class safe for -protect-mode-stack to enforce.
+
+    Relocation is collect_lines()'s rule exactly: a linked bank's listing
+    counts from the section base, an address below org is outside the image.
+    """
+    spans = []
+    data_spans = []
+    unknown_spans = []   # (name, phys_lo, phys_hi): lines no class claimed
+    for image, (org, base, _size, _bin, _ext) in sorted(images.items()):
+        lst = os.path.join(objdir, image + ".lst")
+        if not os.path.exists(lst):
+            continue
+        bases = section_bases(os.path.join(objdir, image + ".map")) if ".link." in image else {}
+        section = None
+        last_class = None
+        last_name = None
+        for line in open(lst, errors="replace"):
+            sd = SECT_DIR.search(line)
+            if sd:
+                section = sd.group(2) if sd.group(1).lower() == "section" else None
+            me = LST_EMIT.match(line)
+            if not me:
+                last_class = None
+                continue
+            nb = len(me.group(2).replace(" ", "")) // 2
+            if nb == 0:
+                last_class = None
+                continue
+            ml = LST_LINE.search(line)
+            if ml:
+                src = line[ml.end():]
+                # The cycle-count column an `opt c` build inserts: "(4)",
+                # "(5+?)".  Positional, so it lands where a naive read
+                # expects the source to start.
+                mcyc = re.match(r"\s*\([0-9+*?]+\)", src)
+                if mcyc:
+                    src = src[mcyc.end():]
+                toks = [t.rstrip(":").lower() for t in src.split()[:3]]
+                # A macro expansion line carries the body's own line number
+                # as one more bare-decimal column; it is never a mnemonic
+                # or a label, so drop it before looking for either.
+                if toks and toks[0].isdigit():
+                    toks = toks[1:]
+                # The mnemonic is the first token unless the first token is
+                # a label, and a label is whatever precedes a token we DO
+                # know.  Column position would also say which is which, but
+                # it moves with the listing options and this does not.
+                mnem = None
+                if toks and (toks[0] in INSTRUCTIONS or toks[0] in DATA_DIRECTIVES):
+                    mnem = toks[0]
+                elif len(toks) > 1 and (toks[1] in INSTRUCTIONS or toks[1] in DATA_DIRECTIVES):
+                    mnem = toks[1]
+                if mnem in INSTRUCTIONS:
+                    last_class = "C"
+                elif mnem in DATA_DIRECTIVES:
+                    last_class = "D"
+                else:
+                    last_class = "?"
+                    last_name = toks[0] if toks else "?"
+            if last_class in ("C", "D", "?"):
+                addr = int(me.group(1), 16) + bases.get(section, 0)
+                if addr < org:
+                    continue
+                p = base + (addr - org)
+                if last_class == "C":
+                    spans.append((p, p + nb - 1))
+                elif last_class == "D":
+                    data_spans.append((p, p + nb - 1))
+                else:
+                    unknown_spans.append((last_name, p, p + nb - 1))
+
+    def merge(raw):
+        raw.sort()
+        out = []
+        for lo, hi in raw:
+            if out and lo <= out[-1][1] + 1:
+                if hi > out[-1][1]:
+                    out[-1] = (out[-1][0], hi)
+            else:
+                out.append((lo, hi))
+        return out
+
+    merged = merge(spans)
+    merged_data = merge(data_spans)
+    # A macro CALL SITE lists the same bytes its expansion lists, so most
+    # unknown-mnemonic lines are covered by a range the expansion classified
+    # and are fine.  Only bytes NO listing line classified are worth a
+    # warning: executing those trips -protect-mode-data.  Coverage is tested
+    # against both classes -- a macro that expands to fcb is classified, just
+    # not as code.
+    both = merge([s for s in spans] + [s for s in data_spans])
+
+    def covered(lo, hi):
+        import bisect
+        i = bisect.bisect_right([m[0] for m in both], lo) - 1
+        return i >= 0 and both[i][1] >= hi
+    uncovered = {}
+    for name, lo, hi in unknown_spans:
+        if not covered(lo, hi):
+            uncovered[name] = uncovered.get(name, 0) + (hi - lo + 1)
+    if uncovered:
+        top = ", ".join("%s(%d)" % kv for kv in sorted(uncovered.items())[:8])
+        warn("unclassified emitters left %d byte(s) in no class "
+             "(executing them trips -protect-mode-data; a stack landing on "
+             "them does NOT trip -protect-mode-stack): %s"
+             % (sum(uncovered.values()), top))
+    return merged, merged_data
+
+
 def collect_lines(objdir, images):
     """[(physical, 'file:line')] from every listing, section-relocated once.
 
@@ -617,6 +840,7 @@ def main():
         equ_values.setdefault(name, value)
     equs = sorted(equ_values.items())
     lines = collect_lines(objdir, images)
+    code_ranges, data_ranges = collect_class_ranges(objdir, images, warn)
 
     with open(out_path, "w") as f:
         f.write("!gensym %d\n" % GENSYM_VERSION)
@@ -630,6 +854,10 @@ def main():
             f.write("D %s %02X %04X %05X\n" % (name, off, logical, phys))
         for name, value in equs:
             f.write("E %s %X\n" % (name, value))
+        for lo, hi in code_ranges:
+            f.write("M C %05X %05X\n" % (lo, hi))
+        for lo, hi in data_ranges:
+            f.write("M D %05X %05X\n" % (lo, hi))
 
     with open(lines_path, "w") as f:
         for phys, where in sorted(set(lines)):
@@ -640,9 +868,14 @@ def main():
         for name, image, _l, _p in syms:
             dupes.setdefault(name, set()).add(image)
         ambiguous = sum(1 for v in dupes.values() if len(v) > 1)
+        code_bytes = sum(hi - lo + 1 for lo, hi in code_ranges)
+        data_bytes = sum(hi - lo + 1 for lo, hi in data_ranges)
         print("gensym: %d symbols (%d names defined in more than one image), "
-              "%d dp vars, %d equates, %d source lines, %d images"
-              % (len(syms), ambiguous, len(dps), len(equs), len(set(lines)), len(images)))
+              "%d dp vars, %d equates, %d source lines, %d images, "
+              "%d code ranges (%d bytes), %d data ranges (%d bytes)"
+              % (len(syms), ambiguous, len(dps), len(equs), len(set(lines)),
+                 len(images), len(code_ranges), code_bytes,
+                 len(data_ranges), data_bytes))
         print("        %s" % out_path)
         print("        %s" % lines_path)
         for w in warnings:

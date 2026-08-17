@@ -1,0 +1,98 @@
+From 17436fbbc2542fb4c26bc860c5959031ce11dd18 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Mon, 3 Aug 2026 12:41:39 -0400
+Subject: [PATCH 35/49] emuext: sanitise LOG output -- raw memory can
+
+$10 $3E is not a real instruction, so the byte pair turns up in ordinary data,
+and a runaway PC can execute it.  The "format string" is then arbitrary memory,
+which may contain live ANSI escape sequences; unfiltered, those went straight
+to a real terminal and could corrupt it on an otherwise clean exit.  Escape
+everything that is not printable ASCII (keeping \n and \t) on the way to
+stderr, and leave the gdb console mirror raw -- it is a text widget, not a
+terminal.
+
+This lands in the shared emuext_log() in debug.c, so it covers the Dragon
+family and the CoCo 3 from one place.  Also correct two comments that named
+coco3.c (and mc10.c, which is an MC6803 and never reaches this code) as the
+only emuext wiring site.
+---
+ src/debug.c                | 31 ++++++++++++++++++++++++++++---
+ src/debug.h                |  4 +++-
+ src/mc6809/mc6809_common.c |  6 ++++--
+ 3 files changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/src/debug.c b/src/debug.c
+index 3cf92d5..39603c1 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -347,10 +347,35 @@ void emuext_break(struct machine *m, struct gdb_interface *gdb, unsigned pc) {
+ }
+ 
+ // lwasm emuext LOG ($103E).  The core has already formatted the text; emit it
+-// verbatim to stderr and, with -emuext and a client attached, mirror it to the
+-// gdb console.
++// to stderr (sanitised -- see below) and, with -emuext and a client attached,
++// mirror the RAW text to the gdb console.
++//
++// This fires whenever the CPU executes the byte pair $10 $3E, regardless of
++// -emuext: that pair is not a real instruction, so it can appear in perfectly
++// innocent data, and self-modifying-code bugs can walk the PC into raw data
++// and hit it by accident (this has happened to us: a signed-index bug that let
++// a driver overwrite its own code with raster bytes, some of which decoded as
++// $10 $3E). The "format string" in that case is arbitrary memory, not real log
++// text, and can contain anything -- including live ANSI escape sequences,
++// which previously went straight to stderr unfiltered and could leave a real
++// terminal in a corrupted state on an otherwise completely normal exit. Escape
++// anything that isn't printable ASCII (keeping \n and \t, since real
++// multi-line debug text uses them) so garbage is visible as garbage instead of
++// executing as terminal control codes. The unsanitised text still reaches
++// gdb's console (a text widget, not a terminal, so this class of corruption
++// can't happen there).
++//
++// One copy, for every machine.  This function is the reason emuext_log() is
++// shared rather than written per machine: a second copy is one that gets fixed
++// here and forgotten there, and "forgotten" means a corrupted terminal.
+ void emuext_log(struct gdb_interface *gdb, const char *s) {
+-	fprintf(stderr, "%s", s);
++	for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
++		if (*p == '\n' || *p == '\t' || (*p >= 0x20 && *p < 0x7f)) {
++			fputc(*p, stderr);
++		} else {
++			fprintf(stderr, "\\x%02x", *p);
++		}
++	}
+ 	fflush(stderr);
+ #ifdef WANT_GDB_TARGET
+ 	if (xroar.cfg.debug.emuext && gdb && gdb_connected(gdb)) {
+diff --git a/src/debug.h b/src/debug.h
+index 14381e6..8410b5f 100644
+--- a/src/debug.h
++++ b/src/debug.h
+@@ -62,7 +62,9 @@ struct debug_cpu {
+ 	DELEGATE_T0(unsigned) get_pc;
+ 	// lwasm emulator-extension opcodes (pragma emuext).  Called by the CPU
+ 	// core when it decodes BREAK ($113E) or LOG ($103E).  The machine wires
+-	// these to route to gdb / stderr; see coco3.c, mc10.c.
++	// these to route to gdb / stderr; see coco3.c and dragon/dragon.c, which
++	// between them cover every machine driven by the 6809 core.  NOT mc10.c:
++	// the MC-10 is an MC6803 and never reaches this code.
+ 	_Bool emuext;                               // -emuext: consume + act
+ 	DELEGATE_T0(void) instruction_break;        // BREAK
+ 	DELEGATE_T1(void, charcp) instruction_log;  // LOG, arg = formatted text
+diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
+index 6a964ab..dbeb3a9 100644
+--- a/src/mc6809/mc6809_common.c
++++ b/src/mc6809/mc6809_common.c
+@@ -260,8 +260,10 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 			else if (0 == strcmp(name, "pc"))  snprintf(piece, sizeof(piece), "%04x", REG_PC);
+ 			else if (0 == strcmp(name, "cycles")) snprintf(piece, sizeof(piece), "%u", (unsigned)event_current_tick);
+ 			else if (cpu->debug.cpu.state_read.func) {
+-				// xpc/paddr/block/task -- machine-specific, routed via a
+-				// named state delegate wired in coco3.c.
++				// xpc/paddr/block/task -- machine-specific, routed
++				// via a named state delegate wired per machine.  A
++				// name the machine cannot answer comes back as -1
++				// and is echoed below, never guessed at.
+ 				int32_t sv = DELEGATE_CALL(cpu->debug.cpu.state_read, name);
+ 				if (sv < 0)
+ 					snprintf(piece, sizeof(piece), "${%s}", name);  // unknown: echo back

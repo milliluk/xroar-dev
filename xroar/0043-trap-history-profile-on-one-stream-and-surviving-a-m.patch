@@ -1,7 +1,7 @@
-From 4f0e0a2ca5b10fe050768b4d4d200cb32524d4c4 Mon Sep 17 00:00:00 2001
+From 4da0efad3bede13c2eae5ffdcd51369c5fec0ea6 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:42:12 -0400
-Subject: [PATCH 43/44] trap: history/profile on one stream, and surviving a 
+Subject: [PATCH 43/49] trap: history/profile on one stream, and surviving a
  machine
 
 ---
@@ -9,10 +9,10 @@ Subject: [PATCH 43/44] trap: history/profile on one stream, and surviving a
  1 file changed, 28 insertions(+), 9 deletions(-)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index 55beaac..ac57dd3 100644
+index d8609df..96c4b7b 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -216,6 +216,7 @@ static unsigned long *trap_history_ring = NULL;
+@@ -223,6 +223,7 @@ static unsigned long *trap_history_ring = NULL;
  static unsigned trap_history_pos = 0;
  static unsigned long trap_history_seen = 0;
  static bool trap_history_installed = 0;
@@ -20,7 +20,7 @@ index 55beaac..ac57dd3 100644
  static void trap_history_record(void *, uint32_t A);
  static void trap_history_dump(void);
  static void trap_xpcrange_check(void *, uint32_t A);
-@@ -245,6 +246,7 @@ static char *profile_out_path = NULL;         // -profile-out FILE (default stde
+@@ -252,6 +253,7 @@ static char *profile_out_path = NULL;         // -profile-out FILE (default stde
  static uint32_t *profile_hist_hits = NULL;    // [PROFILE_PADDR_SPAN] hits
  static unsigned long long *profile_hist_cyc = NULL; // [PROFILE_PADDR_SPAN] cycles
  static bool profile_installed = 0;
@@ -28,7 +28,7 @@ index 55beaac..ac57dd3 100644
  static int profile_prev_range = -1;           // range inside on the last fetch
  static long profile_prev_pc = -1;             // physical PC of the last fetch
  static uint32_t profile_prev_tick = 0;        // event_current_tick at last fetch
-@@ -3867,22 +3869,32 @@ static void enable_all_traps(void) {
+@@ -3875,22 +3877,32 @@ static void enable_all_traps(void) {
  	// once per machine connect.  Ring memory is allocated on first install
  	// and kept; contents survive a reconnect, which is what a flight
  	// recorder should do.
@@ -63,7 +63,7 @@ index 55beaac..ac57dd3 100644
  	}
  	for (unsigned i = 0; i < num_trap_defs; ++i) {
  		enable_trap(&trap_defs[i], 1);
-@@ -4006,6 +4018,10 @@ static void trap_history_record(void *sptr, uint32_t A) {
+@@ -4014,6 +4026,10 @@ static void trap_history_record(void *sptr, uint32_t A) {
  // fetch is already recorded; write=/read= hooks fire mid-instruction, after
  // the fetch that performed the access was recorded.  Read backwards from
  // the end to walk the arrival path.
@@ -74,7 +74,7 @@ index 55beaac..ac57dd3 100644
  static void trap_history_dump(void) {
  	if (!trap_history_installed || !trap_history_seen)
  		return;
-@@ -4013,7 +4029,7 @@ static void trap_history_dump(void) {
+@@ -4021,7 +4037,7 @@ static void trap_history_dump(void) {
  	             ? (unsigned)trap_history_seen : (unsigned)trap_history_size;
  	unsigned start = (trap_history_pos + (unsigned)trap_history_size - n)
  	                 % (unsigned)trap_history_size;
@@ -83,7 +83,7 @@ index 55beaac..ac57dd3 100644
  	if (symfile_loaded()) {
  		// With names, the ring is a call trace and belongs one per line;
  		// the packed hex columns below are what it has to be without
-@@ -4037,7 +4053,7 @@ static void trap_history_dump(void) {
+@@ -4045,7 +4061,7 @@ static void trap_history_dump(void) {
  				snprintf(key, sizeof(key), "%.*s",
  				         (int)strcspn(where, "+ "), where);
  			_Bool same = where && prev[0] && 0 == strcmp(prev, key);
@@ -92,7 +92,7 @@ index 55beaac..ac57dd3 100644
  			        same ? "\"" : (where ? where : "-"),
  			        (src && !same) ? "  " : "", (src && !same) ? src : "");
  			memcpy(prev, key, sizeof(prev));
-@@ -4047,10 +4063,10 @@ static void trap_history_dump(void) {
+@@ -4055,10 +4071,10 @@ static void trap_history_dump(void) {
  	for (unsigned i = 0; i < n; ++i) {
  		unsigned long v = trap_history_ring[(start + i) % (unsigned)trap_history_size];
  		if ((i % 8) == 0)
@@ -106,7 +106,7 @@ index 55beaac..ac57dd3 100644
  	}
  }
  
-@@ -4146,11 +4162,14 @@ static int profile_range_cmp(const void *a, const void *b) {
+@@ -4154,11 +4170,14 @@ static int profile_range_cmp(const void *a, const void *b) {
  static void profile_dump(void) {
  	if (!profile_active())
  		return;

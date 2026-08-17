@@ -1,18 +1,31 @@
-From 4cb83662771534d94ac6909e85810e760cd1d050 Mon Sep 17 00:00:00 2001
+From d8883c41cbdfc19ed53c4e143ee3af5c131bcb18 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:43 -0400
-Subject: [PATCH 09/44] flat-physical-ram: ram_load/peek/poke_flat (orig 01-ram
+Subject: [PATCH 09/49] flat-physical-ram: ram_load/peek/poke_flat (orig 01-ram
 
+Amended when MC-10 coverage went from partial to full.  The flat access
+worked on one struct ram, and the MC-10 keeps two: internal "RAM0" (2K
+banks) and expansion "RAM1" (4K banks, bank 0 added last and legitimately
+absent in some configurations).  Their organisations differ, so they can
+never merge into one part, and renaming them -- the fix everyone reaches
+for first -- was only ever cosmetic (and a snapshot-format break).  The
+real fix is to span: struct flat_ram + flat_ram_resolve/load/poke/peek
+treat a machine's RAM as an ordered pair, "RAM" alone on every other
+machine, RAM0's banks at [0, size0) and RAM1's above them on the MC-10.
+Absent banks stay honest holes (-1 / short write), exactly as within a
+single part.  flat_ram_peek is a header inline, the ram_a8 idiom, because
+the backtrace calls it once per instruction and picking the part must
+stay one or two compares, never a part lookup.
 ---
- src/ram.c | 37 +++++++++++++++++++++++++++++++++++++
- src/ram.h | 15 +++++++++++++++
- 2 files changed, 52 insertions(+)
+ src/ram.c | 83 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/ram.h | 54 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 137 insertions(+)
 
 diff --git a/src/ram.c b/src/ram.c
-index 6973691..9d563c6 100644
+index 6973691..0cc6c5f 100644
 --- a/src/ram.c
 +++ b/src/ram.c
-@@ -305,6 +305,43 @@ void ram_clear(struct ram *ram, int method) {
+@@ -305,6 +305,88 @@ void ram_clear(struct ram *ram, int method) {
  	}
  }
  
@@ -53,14 +66,67 @@ index 6973691..9d563c6 100644
 +	return 1;
 +}
 +
++// Resolve a machine's flat RAM as an ordered pair of parts.  See ram.h for
++// the address-space rules.
++
++_Bool flat_ram_resolve(struct flat_ram *fr, struct part *machine) {
++	*fr = (struct flat_ram){0};
++	if (!machine)
++		return 0;
++	struct ram *r0 = (struct ram *)part_component_by_id_is_a(machine, "RAM", "ram");
++	if (!r0) {
++		r0 = (struct ram *)part_component_by_id_is_a(machine, "RAM0", "ram");
++		if (!r0)
++			return 0;
++		fr->ram1 = (struct ram *)part_component_by_id_is_a(machine, "RAM1", "ram");
++	}
++	fr->ram0 = r0;
++	fr->size0 = (size_t)r0->nbanks * r0->bank_nelems;
++	return 1;
++}
++
++size_t flat_ram_load(const struct flat_ram *fr, size_t offset, const uint8_t *src, size_t len) {
++	size_t written = 0;
++	if (offset < fr->size0) {
++		size_t n = fr->size0 - offset;
++		if (n > len)
++			n = len;
++		written = ram_load_flat(fr->ram0, offset, src, n);
++		if (written < n)
++			return written;  // stopped in a hole: stay stopped
++		src += written;
++		len -= written;
++		offset += written;
++	}
++	if (!len || !fr->ram1)
++		return written;
++	return written + ram_load_flat(fr->ram1, offset - fr->size0, src, len);
++}
++
++_Bool flat_ram_poke(const struct flat_ram *fr, size_t offset, uint8_t value) {
++	if (offset < fr->size0)
++		return ram_poke_flat(fr->ram0, offset, value);
++	if (fr->ram1)
++		return ram_poke_flat(fr->ram1, offset - fr->size0, value);
++	return 0;
++}
++
  // Read data from serialisation handle into RAM bank only if that bank is
  // present.
  
+@@ -349,6 +431,7 @@ void ram_ser_read(struct ram *ram, struct ser_handle *sh) {
+ 	}
+ }
+ 
++extern inline int flat_ram_peek(const struct flat_ram *fr, size_t offset);
+ extern inline uint8_t *ram_a8(struct ram *ram, unsigned bank, unsigned row, unsigned col);
+ extern inline uint16_t *ram_a16(struct ram *ram, unsigned bank, unsigned row, unsigned col);
+ extern inline void ram_d8(struct ram *ram, bool RnW, unsigned bank,
 diff --git a/src/ram.h b/src/ram.h
-index 683e4c2..9202ac5 100644
+index 683e4c2..2092367 100644
 --- a/src/ram.h
 +++ b/src/ram.h
-@@ -99,6 +99,21 @@ void ram_add_bank(struct ram *ram, unsigned bank);
+@@ -99,6 +99,60 @@ void ram_add_bank(struct ram *ram, unsigned bank);
  
  void ram_clear(struct ram *ram, int method);
  
@@ -78,6 +144,45 @@ index 683e4c2..9202ac5 100644
 +// returns false if the offset is out of range.
 +int ram_peek_flat(struct ram *ram, size_t offset);
 +_Bool ram_poke_flat(struct ram *ram, size_t offset, uint8_t value);
++
++// A machine's flat physical RAM.  Every machine but the MC-10 keeps one RAM
++// part, id "RAM", and the flat offset is just that part's bank-major offset.
++// The MC-10 keeps two parts with DIFFERENT organisations -- internal "RAM0"
++// (2K banks) and expansion "RAM1" (4K banks, bank 0 added last and absent in
++// some configurations) -- which therefore can never merge into one part.
++// This spans the pair as one address space: RAM0's banks at [0, size0),
++// RAM1's at [size0, size0 + size1), sizeN = nbanks * bank_nelems.  Absent
++// banks stay honest holes, exactly as within a single part: peek answers -1,
++// load stops short.
++
++struct flat_ram {
++	struct ram *ram0;  // "RAM", or the MC-10's "RAM0"; NULL if unresolved
++	struct ram *ram1;  // the MC-10's "RAM1"; NULL everywhere else
++	size_t size0;      // flat span of ram0: nbanks * bank_nelems
++};
++
++// Resolve a machine's flat RAM ("RAM", else "RAM0" plus optional "RAM1").
++// Fills *fr and returns true; zeroes *fr and returns false if the machine
++// has no RAM part at all.
++
++_Bool flat_ram_resolve(struct flat_ram *fr, struct part *machine);
++
++// The pair-spanning forms of ram_load_flat / ram_poke_flat above.
++
++size_t flat_ram_load(const struct flat_ram *fr, size_t offset, const uint8_t *src, size_t len);
++_Bool flat_ram_poke(const struct flat_ram *fr, size_t offset, uint8_t value);
++
++// Peek is inline (same idiom as ram_a8 below): the backtrace calls it once
++// per instruction, so picking the part must stay one or two compares, never
++// a part lookup.
++
++inline int flat_ram_peek(const struct flat_ram *fr, size_t offset) {
++	if (offset < fr->size0)
++		return ram_peek_flat(fr->ram0, offset);
++	if (fr->ram1)
++		return ram_peek_flat(fr->ram1, offset - fr->size0);
++	return -1;
++}
 +
  // Read data from serialisation handle into RAM bank only if that bank is
  // present.

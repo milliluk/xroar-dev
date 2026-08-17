@@ -1,20 +1,52 @@
-From 46049bd227caf38cb512cb96eb07c3797b0f4c61 Mon Sep 17 00:00:00 2001
+From 8a58c8eeed107d3fea833d829c41ed9943c2063d Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:45 -0400
-Subject: [PATCH 10/44] emuext: guest->host LOG side-channel + named
+Subject: [PATCH 10/49] emuext: guest->host LOG side-channel + named
 
+Add the lwasm emulator-extension opcodes LOG ($103E) and BREAK ($113E) as a
+guest->host side channel: the 6809 core decodes them and routes them to the
+machine through four debug_cpu delegates.
+
+THE DELEGATES ARE OPTIONAL, AND THE CORE MUST BEHAVE WHEN THEY ARE ABSENT.
+The core decodes these opcodes unconditionally, for every machine it drives,
+whether or not -emuext was passed -- that is deliberate, so the behaviour is
+well defined rather than depending on a command-line flag.  But it means the
+decode path is reachable on a machine that implements none of this, by a wild
+PC walking over ordinary data.  (Not hypothetical: see patch 35.)  So the two
+action delegates go through DELEGATE_SAFE_CALL, state_read is .func-checked at
+its use, and debug_read -- which is called FIRST, to gather the text, before
+any of those -- is checked by mc6809_emuext_supported() before the handler
+does anything at all.  A machine that wired nothing takes its native
+illegal-opcode behaviour, which is what the hardware it models does.  Wiring
+debug_read is what opts a machine in.
+
+Implement it for both 6809 machine families.  coco3.c answers ${xpc}, ${paddr},
+${block} and ${task} from the GIME's MMU; dragon/dragon.c covers every
+Dragon-family machine -- Dragon 32/64, Dragon Professional, CoCo 1/2, Deluxe
+CoCo -- and answers only what a machine with no MMU can honestly answer,
+returning -1 for the rest so the LOG handler echoes ${paddr} back untouched
+instead of substituting a plausible-looking wrong number.  Not the MC-10:
+that is an MC6803 and never reaches this code.
+
+BREAK, LOG output and the side-effect-free read are identical work on any
+machine, so they are written once as emuext_break()/emuext_log()/emuext_read()
+in debug.c and the machines supply only state_read.  A second copy of the LOG
+output path in particular is a standing trap: it is the copy that gets fixed
+in one file and forgotten in the other.
 ---
  portalib/delegate.h        |   3 +
- src/coco3.c                |  97 +++++++++++++++++++++++
- src/debug.h                |  20 +++++
- src/gdb.c                  |  31 ++++++++
+ src/coco3.c                |  77 ++++++++++++++++
+ src/debug.c                |  48 ++++++++++
+ src/debug.h                |  49 +++++++++++
+ src/dragon/dragon.c        |  64 ++++++++++++++
+ src/gdb.c                  |  31 +++++++
  src/gdb.h                  |   4 +
  src/mc6809/hd6309.c        |   4 +
  src/mc6809/mc6809.c        |  12 ++-
- src/mc6809/mc6809_common.c | 155 +++++++++++++++++++++++++++++++++++++
+ src/mc6809/mc6809_common.c | 176 +++++++++++++++++++++++++++++++++++++
  src/xroar.c                |   3 +
  src/xroar.h                |   1 +
- 10 files changed, 328 insertions(+), 2 deletions(-)
+ 12 files changed, 470 insertions(+), 2 deletions(-)
 
 diff --git a/portalib/delegate.h b/portalib/delegate.h
 index 72fa91e..1e4dd90 100644
@@ -38,7 +70,7 @@ index 72fa91e..1e4dd90 100644
  
  #define DELEGATE_DEFAULT0(N) DELEGATE_AS0(N, DELEGATE_DEFAULT_F0(N), NULL)
 diff --git a/src/coco3.c b/src/coco3.c
-index 1e7c45f..f1fbe68 100644
+index 1e7c45f..3060f49 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
 @@ -362,6 +362,12 @@ static void coco3_initialise(struct part *p, void *options);
@@ -70,7 +102,7 @@ index 1e7c45f..f1fbe68 100644
  	// XXX until we serialise sound information
  	update_sound_mux_source(mcc3);
  	sound_set_mux_enabled(mcc3->snd, PIA_VALUE_CB2(mcc3->PIA1));
-@@ -931,6 +946,88 @@ static void coco3_signal(struct machine *m, int sig) {
+@@ -931,6 +946,68 @@ static void coco3_signal(struct machine *m, int sig) {
  	mcc3->CPU->running = 0;
  }
  
@@ -79,48 +111,28 @@ index 1e7c45f..f1fbe68 100644
 +	coco3_signal(m, MACHINE_SIGTRAP);
 +}
 +
-+// lwasm emuext BREAK ($113E).  With -emuext and a gdb client attached, halt
-+// into the debugger exactly as a hardware breakpoint would.  Otherwise (no
-+// -emuext, or no client) just note it at debug level and continue; BREAK has
-+// no operands, so continuing is safe.
++// lwasm emuext BREAK / LOG / debug read.  Bodies are shared with every other
++// machine that implements emuext; see debug.c.
 +static void coco3_emubreak(void *sptr) {
 +	struct coco3 *mcc3 = sptr;
-+#ifdef WANT_GDB_TARGET
-+	if (xroar.cfg.debug.emuext && mcc3->gdb_interface
-+	    && gdb_connected(mcc3->gdb_interface)) {
-+		coco3_signal(&mcc3->public, MACHINE_SIGTRAP);
-+		return;
-+	}
-+#endif
-+	unsigned pc = DELEGATE_CALL(mcc3->CPU->debug.cpu.get_pc);
-+	LOG_MOD_DEBUG(1, "emu", "BREAK at $%04x\n", pc);
++	emuext_break(&mcc3->public, EMUEXT_GDB(mcc3),
++	             DELEGATE_CALL(mcc3->CPU->debug.cpu.get_pc));
 +}
 +
-+// lwasm emuext LOG ($103E).  The core has already formatted the text; emit it
-+// verbatim to stderr and, with -emuext and a client attached, mirror it to the
-+// gdb console.
 +static void coco3_emulog(void *sptr, const char *s) {
 +	struct coco3 *mcc3 = sptr;
-+	(void)mcc3;
-+	fprintf(stderr, "%s", s);
-+	fflush(stderr);
-+#ifdef WANT_GDB_TARGET
-+	if (xroar.cfg.debug.emuext && mcc3->gdb_interface
-+	    && gdb_connected(mcc3->gdb_interface)) {
-+		gdb_console_output(mcc3->gdb_interface, s);
-+	}
-+#endif
++	emuext_log(EMUEXT_GDB(mcc3), s);
 +}
 +
-+// Side-effect-free read for the emuext LOG handler.  Uses the machine debug
-+// read path (same as gdb memory reads): no clock advance, no interrupt latch.
 +static uint8_t coco3_emuread(void *sptr, uint16_t A) {
 +	struct coco3 *mcc3 = sptr;
-+	return mcc3->public.read_byte(&mcc3->public, A, 0);
++	return emuext_read(&mcc3->public, A);
 +}
 +
 +// Named machine-state read for LOG ${name}: xpc, paddr, block, task -- the
 +// same values gdb's qxroar.* queries expose.  Returns -1 for an unknown name.
++// This is the one emuext delegate that CANNOT be shared: it answers for the
++// GIME's MMU, and a machine without one must answer differently or not at all.
 +static int32_t coco3_emustate(void *sptr, const char *name) {
 +	struct coco3 *mcc3 = sptr;
 +	uint16_t pc = mc6809_get_pc(mcc3->CPU);
@@ -159,11 +171,82 @@ index 1e7c45f..f1fbe68 100644
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
  static void coco3_ui_set_keymap(void *sptr, int tag, void *smsg) {
+diff --git a/src/debug.c b/src/debug.c
+index 832a862..23e377a 100644
+--- a/src/debug.c
++++ b/src/debug.c
+@@ -19,6 +19,7 @@
+ #include "top-config.h"
+ 
+ #include <assert.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -28,7 +29,10 @@
+ #include "slist.h"
+ 
+ #include "debug.h"
++#include "gdb.h"
+ #include "logging.h"
++#include "machine.h"
++#include "xroar.h"
+ 
+ // Some built-in composite types used in target descriptions
+ 
+@@ -316,3 +320,47 @@ int debug_set_register_composite(struct debug_target *target, int regno,
+ 		DELEGATE_CALL(dpart->set_register, reg_num, value);
+ 	return n;
+ }
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++// Shared emuext delegate bodies.  See debug.h for why these live here and not
++// in each machine.  The caller passes its own gdb_interface (EMUEXT_GDB) since
++// that member is private to the machine struct.
++
++// lwasm emuext BREAK ($113E).  With -emuext and a gdb client attached, halt
++// into the debugger exactly as a hardware breakpoint would.  Otherwise (no
++// -emuext, or no client) just note it at debug level and continue; BREAK has
++// no operands, so continuing is safe.
++void emuext_break(struct machine *m, struct gdb_interface *gdb, unsigned pc) {
++#ifdef WANT_GDB_TARGET
++	if (xroar.cfg.debug.emuext && gdb && gdb_connected(gdb)) {
++		m->signal(m, MACHINE_SIGTRAP);
++		return;
++	}
++#else
++	(void)gdb;
++#endif
++	(void)m;
++	LOG_MOD_DEBUG(1, "emu", "BREAK at $%04x\n", pc);
++}
++
++// lwasm emuext LOG ($103E).  The core has already formatted the text; emit it
++// verbatim to stderr and, with -emuext and a client attached, mirror it to the
++// gdb console.
++void emuext_log(struct gdb_interface *gdb, const char *s) {
++	fprintf(stderr, "%s", s);
++	fflush(stderr);
++#ifdef WANT_GDB_TARGET
++	if (xroar.cfg.debug.emuext && gdb && gdb_connected(gdb)) {
++		gdb_console_output(gdb, s);
++	}
++#else
++	(void)gdb;
++#endif
++}
++
++// Side-effect-free read for the emuext LOG handler.  Uses the machine debug
++// read path (same as gdb memory reads): no clock advance, no interrupt latch.
++uint8_t emuext_read(struct machine *m, uint16_t A) {
++	return m->read_byte(m, A, 0);
++}
 diff --git a/src/debug.h b/src/debug.h
-index 7fd2be9..1f82ab4 100644
+index 7fd2be9..1ffb2bf 100644
 --- a/src/debug.h
 +++ b/src/debug.h
-@@ -55,6 +55,26 @@ struct debug_cpu {
+@@ -55,6 +55,28 @@ struct debug_cpu {
  	// Get/set processor flags
  	DELEGATE_T1(bool, int) get_flag;
  	DELEGATE_T2(void, int, bool) set_flag;
@@ -177,19 +260,143 @@ index 7fd2be9..1f82ab4 100644
 +	// Side-effect-free memory read for the LOG handler.  Routes to the
 +	// machine's debug read_byte (no clock advance, no interrupt latching),
 +	// so formatting a LOG string does not desync cycle accounting or fire
-+	// spurious interrupts.  Wired in coco3.c / mc10.c; see mc6809_common.c.
++	// spurious interrupts.  Also doubles as the "this machine implements
++	// emuext at all" flag; see mc6809_emuext_supported() in mc6809_common.c.
 +	DELEGATE_T1(uint8, uint16) debug_read;
 +
 +	// Named machine-state read for LOG ${name} references that aren't plain
 +	// CPU registers: xpc, paddr, block, task (the same values the gdb
-+	// qxroar.* queries expose).  Returns the value, or -1 for an unknown
-+	// name.  Wired in coco3.c; the CPU-register names are handled directly
-+	// in the LOG handler and never reach this delegate.
++	// qxroar.* queries expose).  Returns the value, or -1 for a name this
++	// machine cannot answer -- which the LOG handler echoes back verbatim
++	// rather than substituting something plausible.  The CPU-register names
++	// are handled directly in the LOG handler and never reach this delegate.
 +	DELEGATE_T1(int32, charcp) state_read;
 +
  };
  
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+@@ -203,5 +225,32 @@ int debug_get_register_composite(struct debug_target *target, int regno,
+ int debug_set_register_composite(struct debug_target *target, int regno,
+ 				 unsigned nbytes, const uint8_t *buf);
+ 
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++// Shared emuext delegate bodies (debug.c).
++//
++// Three of the four emuext delegates do the same job on every machine: report
++// a BREAK, emit LOG text, read a byte without side effects.  Only state_read
++// is genuinely machine-specific (it answers for the MMU, if there is one), so
++// only state_read is written per machine.  Keeping one copy of the rest is
++// what stops a fix to any of them -- the LOG output sanitising in particular
++// -- from having to be remembered in two files.
++
++struct gdb_interface;
++struct machine;
++
++// The machine's gdb_interface member only exists in a WANT_GDB_TARGET build.
++// Both machine structs name it identically, so this keeps that #ifdef out of
++// every emuext call site.
++#ifdef WANT_GDB_TARGET
++#define EMUEXT_GDB(md) ((md)->gdb_interface)
++#else
++#define EMUEXT_GDB(md) ((struct gdb_interface *)0)
++#endif
++
++void emuext_break(struct machine *m, struct gdb_interface *gdb, unsigned pc);
++void emuext_log(struct gdb_interface *gdb, const char *s);
++uint8_t emuext_read(struct machine *m, uint16_t A);
++
+ #endif
+ 
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 170b376..7c8f36c 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -243,6 +243,12 @@ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ static void joystick_update(void *sptr);
+ static void update_sound_mux_source(void *sptr);
+ 
++// lwasm emuext opcode handlers (wired into the CPU's debug_cpu delegates)
++static void dragon_emubreak(void *sptr);
++static void dragon_emulog(void *sptr, const char *s);
++static uint8_t dragon_emuread(void *sptr, uint16_t A);
++static int32_t dragon_emustate(void *sptr, const char *name);
++
+ static void single_bit_feedback(void *sptr, bool level);
+ static void update_audio_from_tape(void *sptr, float value);
+ static void cart_firq(void *sptr, bool level);
+@@ -628,6 +634,18 @@ bool dragon_finish_common(struct dragon *md) {
+ 	}
+ #endif
+ 
++	// lwasm emulator extensions (pragma emuext).  The Dragon family runs the
++	// same 6809 core as the CoCo 3, which decodes LOG and BREAK for whatever
++	// machine it is driving -- so this is not optional decoration, it is the
++	// other half of a contract the core already entered into.  Wiring it here
++	// covers every machine built on dragon_finish_common(): Dragon 32/64,
++	// Dragon Professional, CoCo 1/2 and the Deluxe CoCo.
++	md->CPU->debug.cpu.emuext = xroar.cfg.debug.emuext;
++	md->CPU->debug.cpu.instruction_break = DELEGATE_AS0(void, dragon_emubreak, md);
++	md->CPU->debug.cpu.instruction_log = DELEGATE_AS1(void, charcp, dragon_emulog, md);
++	md->CPU->debug.cpu.debug_read = DELEGATE_AS1(uint8, uint16, dragon_emuread, md);
++	md->CPU->debug.cpu.state_read = DELEGATE_AS1(int32, charcp, dragon_emustate, md);
++
+ 	// XXX until we serialise sound information
+ 	update_sound_mux_source(md);
+ 	sound_set_mux_enabled(md->snd, PIA_VALUE_CB2(md->PIA1));
+@@ -883,6 +901,52 @@ static void dragon_signal(struct machine *m, int sig) {
+ 	md->CPU->running = 0;
+ }
+ 
++// lwasm emuext BREAK / LOG / debug read.  Bodies are shared with every other
++// machine that implements emuext; see debug.c.
++static void dragon_emubreak(void *sptr) {
++	struct dragon *md = sptr;
++	emuext_break(&md->public, EMUEXT_GDB(md),
++	             DELEGATE_CALL(md->CPU->debug.cpu.get_pc));
++}
++
++static void dragon_emulog(void *sptr, const char *s) {
++	struct dragon *md = sptr;
++	emuext_log(EMUEXT_GDB(md), s);
++}
++
++static uint8_t dragon_emuread(void *sptr, uint16_t A) {
++	struct dragon *md = sptr;
++	return emuext_read(&md->public, A);
++}
++
++// Named machine-state read for LOG ${name}.  The CoCo 3 answers these out of
++// the GIME's MMU; there is no MMU here, so most of them have no Dragon-family
++// meaning and are deliberately NOT approximated:
++//
++//   xpc    the extended (physical) PC.  With no translation, this genuinely
++//          IS the logical PC, so answer it.
++//   block  the 8K block the PC sits in.  Follows directly from the PC, but
++//          note it is a LOGICAL block here where the CoCo 3 reports a
++//          physical one -- callers comparing the two across machines are
++//          comparing different things.
++//   paddr  the last physical address the bus touched (the CoCo 3 reads the
++//          GIME's Z latch).  Nothing here latches that, and returning the PC
++//          instead would be a plausible-looking wrong answer -- the worst
++//          kind for a debug channel.  Unknown.
++//   task   the MMU task register.  There is no MMU.  Unknown.
++//
++// -1 means "this machine cannot answer that", and the LOG handler echoes the
++// ${name} back untouched so it reads as unanswered rather than as data.
++static int32_t dragon_emustate(void *sptr, const char *name) {
++	struct dragon *md = sptr;
++	uint16_t pc = mc6809_get_pc(md->CPU);
++	if (0 == strcmp(name, "xpc"))
++		return (int32_t)pc;
++	if (0 == strcmp(name, "block"))
++		return (int32_t)((pc >> 13) & 0xff);
++	return -1;
++}
++
+ // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+ 
+ static void dragon_ui_set_keymap(void *sptr, int tag, void *smsg) {
 diff --git a/src/gdb.c b/src/gdb.c
 index 78ce7d5..209fd2e 100644
 --- a/src/gdb.c
@@ -316,10 +523,10 @@ index acafec4..e136ee0 100644
  				push_irq_registers(cpu);
  				instruction_posthook(cpu);
 diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
-index ff4907a..296960d 100644
+index ff4907a..24c6160 100644
 --- a/src/mc6809/mc6809_common.c
 +++ b/src/mc6809/mc6809_common.c
-@@ -87,6 +87,161 @@ static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
+@@ -87,6 +87,182 @@ static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
  #define peek_byte(c,a) ((void)fetch_byte_notrace(c,a))
  #define NVMA_CYCLE (peek_byte(cpu, 0xffff))
  
@@ -341,7 +548,28 @@ index ff4907a..296960d 100644
 + * to keep a disabled program running.
 + */
 +
++// Does this machine implement emuext at all?
++//
++// The three delegates that ACT on an emuext opcode are optional by
++// construction: instruction_log and instruction_break go through
++// DELEGATE_SAFE_CALL, and state_read is .func-checked at its use.  debug_read
++// is different only because it is called to GATHER the text, before any of
++// that -- but it is no more mandatory, and a machine that never wired it has
++// no emuext support to offer.
++//
++// This matters because the opcodes are decoded unconditionally, for every
++// machine, whether or not -emuext was passed (see the comment above).  Without
++// this check the first debug_read on such a machine is a call through a null
++// pointer, reachable by a wild PC walking over ordinary data -- an emulator
++// crash where the hardware being modelled would simply take its illegal-opcode
++// behaviour.  Bail out, touch nothing, and let the decoder do exactly that.
++static _Bool mc6809_emuext_supported(struct MC6809 *cpu) {
++	return cpu->debug.cpu.debug_read.func != NULL;
++}
++
 +static void mc6809_emuext_log(struct MC6809 *cpu) {
++	if (!mc6809_emuext_supported(cpu))
++		return;                  // no emuext here: native illegal opcode
 +	uint16_t p = REG_PC;             // cursor over operands; REG_PC untouched
 +	uint16_t fmt = DELEGATE_CALL(cpu->debug_cpu.debug_read, p) << 8; p++;
 +	fmt |= DELEGATE_CALL(cpu->debug_cpu.debug_read, p); p++;

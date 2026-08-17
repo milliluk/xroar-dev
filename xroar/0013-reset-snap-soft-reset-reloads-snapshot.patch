@@ -1,7 +1,7 @@
-From 05431bd7b3db468c409423a97dd2dc95fe6266e8 Mon Sep 17 00:00:00 2001
+From 2d99a58d4af24b025290bf943a652ab33006ca3c Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:51 -0400
-Subject: [PATCH 13/44] reset-snap: soft reset reloads snapshot;
+Subject: [PATCH 13/49] reset-snap: soft reset reloads snapshot;
 
 ---
  src/xroar.c | 18 ++++++++++++++++++

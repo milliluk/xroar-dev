@@ -1,7 +1,7 @@
-From 75316fc06c39fa0db9e139b399f622c02d369b50 Mon Sep 17 00:00:00 2001
+From 7c3e3f7697f7182eee1d2b5341155573aa3a8d12 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:12 -0400
-Subject: [PATCH 22/44] breakpoint: add bp_add_range; defer trap-snap to
+Subject: [PATCH 22/49] breakpoint: add bp_add_range; defer trap-snap to
 
 ---
  src/breakpoint.c    | 29 +++++++++++++++++++++++++++++
@@ -88,10 +88,10 @@ index b0bbde1..a07c29b 100644
  // breakpoint already exists)
  bool bp_breakpoint_add(struct bp_breakpoint_set *bbs, uint32_t A,
 diff --git a/src/coco3.c b/src/coco3.c
-index bc58f06..5d76af3 100644
+index 4717272..ff254ea 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
-@@ -337,6 +337,22 @@ static void coco3_write_byte(struct machine *m, unsigned A, uint8_t D);
+@@ -336,6 +336,22 @@ static void coco3_write_byte(struct machine *m, unsigned A, uint8_t D);
  static void coco3_op_rts(struct machine *m);
  static void coco3_dump_ram(struct machine *m, FILE *fd);
  static int32_t coco3_get_symbol(struct machine *m, const char *label);
@@ -114,7 +114,7 @@ index bc58f06..5d76af3 100644
  static void coco3_add_breakpoint(struct machine *m, uint32_t A,
  				 DELEGATE_T2(void, bool, uint32) handler);
  static void coco3_remove_breakpoint(struct machine *m, int32_t A,
-@@ -442,6 +458,8 @@ static struct part *coco3_allocate(void) {
+@@ -441,6 +457,8 @@ static struct part *coco3_allocate(void) {
  	m->dump_ram = coco3_dump_ram;
  	m->debug.get_symbol = coco3_get_symbol;
  	m->debug.add_breakpoint = coco3_add_breakpoint;
@@ -123,7 +123,7 @@ index bc58f06..5d76af3 100644
  	m->debug.remove_breakpoint = coco3_remove_breakpoint;
  	m->debug.add_watchpoint = coco3_add_watchpoint;
  	m->debug.remove_watchpoint = coco3_remove_watchpoint;
-@@ -1571,7 +1589,7 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
+@@ -1463,7 +1481,7 @@ static void coco3_add_breakpoint(struct machine *m, uint32_t A,
  	if (!bp_breakpoint_add(&mcc3->breakpoint_set, A, handler)) {
  		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
  	}
@@ -132,7 +132,7 @@ index bc58f06..5d76af3 100644
  		mcc3->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mcc3->breakpoint_set);
  	}
  }
-@@ -1580,7 +1598,7 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+@@ -1472,7 +1490,7 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
  				    DELEGATE_T2(void, bool, uint32) handler) {
  	struct coco3 *mcc3 = (struct coco3 *)m;
  	bp_breakpoint_remove(&mcc3->breakpoint_set, A, handler);
@@ -142,7 +142,7 @@ index bc58f06..5d76af3 100644
  	}
  }
 diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
-index 9fed50f..4bd5fc3 100644
+index cc85e41..6a810b8 100644
 --- a/src/dragon/dragon.c
 +++ b/src/dragon/dragon.c
 @@ -232,6 +232,22 @@ static void dragon_write_byte(struct machine *m, unsigned A, uint8_t D);
@@ -168,7 +168,7 @@ index 9fed50f..4bd5fc3 100644
  static void dragon_add_breakpoint(struct machine *m, uint32_t A,
  				  DELEGATE_T2(void, bool, uint32) handler);
  static void dragon_remove_breakpoint(struct machine *m, int32_t A,
-@@ -300,6 +316,8 @@ void dragon_allocate_common(struct dragon *md) {
+@@ -307,6 +323,8 @@ void dragon_allocate_common(struct dragon *md) {
  	m->dump_ram = dragon_dump_ram;
  	m->debug.get_symbol = dragon_get_symbol;
  	m->debug.add_breakpoint = dragon_add_breakpoint;
@@ -177,7 +177,7 @@ index 9fed50f..4bd5fc3 100644
  	m->debug.remove_breakpoint = dragon_remove_breakpoint;
  	m->debug.add_watchpoint = dragon_add_watchpoint;
  	m->debug.remove_watchpoint = dragon_remove_watchpoint;
-@@ -1336,7 +1354,7 @@ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
+@@ -1440,7 +1458,7 @@ static void dragon_add_breakpoint(struct machine *m, uint32_t A,
  	if (!bp_breakpoint_add(&md->breakpoint_set, A, handler)) {
  		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
  	}
@@ -186,7 +186,7 @@ index 9fed50f..4bd5fc3 100644
  		md->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &md->breakpoint_set);
  	}
  }
-@@ -1345,7 +1363,7 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+@@ -1449,7 +1467,7 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
  				     DELEGATE_T2(void, bool, uint32) handler) {
  	struct dragon *md = (struct dragon *)m;
  	bp_breakpoint_remove(&md->breakpoint_set, A, handler);
@@ -220,7 +220,7 @@ index d9c4cfc..04299e0 100644
  #define machine_remove_watchpoint(m,rnw,as,ae,h) (m)->debug.remove_watchpoint((m), (rnw), (as), (ae), (h))
  
 diff --git a/src/mc10.c b/src/mc10.c
-index b66668e..c9c87cd 100644
+index 147ab0e..9117baa 100644
 --- a/src/mc10.c
 +++ b/src/mc10.c
 @@ -203,6 +203,22 @@ static void mc10_write_byte(struct machine *m, unsigned A, uint8_t D);
@@ -255,7 +255,7 @@ index b66668e..c9c87cd 100644
  	m->debug.remove_breakpoint = mc10_remove_breakpoint;
  	m->debug.add_watchpoint = mc10_add_watchpoint;
  	m->debug.remove_watchpoint = mc10_remove_watchpoint;
-@@ -888,7 +906,7 @@ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
+@@ -902,7 +920,7 @@ static void mc10_add_breakpoint(struct machine *m, uint32_t A,
  	if (!bp_breakpoint_add(&mp->breakpoint_set, A, handler)) {
  		LOG_MOD_WARN(p->partdb->name, "failed to add breakpoint @ 0x%04x\n", A);
  	}
@@ -264,7 +264,7 @@ index b66668e..c9c87cd 100644
  		mp->CPU->instruction_hook = DELEGATE_AS1(void, uint32, bp_instruction_hook, &mp->breakpoint_set);
  	}
  }
-@@ -897,7 +915,7 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+@@ -911,7 +929,7 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
  				    DELEGATE_T2(void, bool, uint32) handler) {
  	struct mc10 *mp = (struct mc10 *)m;
  	bp_breakpoint_remove(&mp->breakpoint_set, A, handler);
@@ -274,10 +274,10 @@ index b66668e..c9c87cd 100644
  	}
  }
 diff --git a/src/xroar.c b/src/xroar.c
-index 1f5b1d5..e45ef31 100644
+index 5502b82..d3f081f 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -3557,6 +3557,32 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
+@@ -3558,6 +3558,32 @@ static char *screenshot_numbered_name(const char *base, unsigned long n) {
  	return out;
  }
  
@@ -310,7 +310,7 @@ index 1f5b1d5..e45ef31 100644
  static void handle_trap(void *sptr) {
  	struct trap_def *trap = sptr;
  
-@@ -3576,8 +3602,18 @@ static void handle_trap(void *sptr) {
+@@ -3577,8 +3603,18 @@ static void handle_trap(void *sptr) {
  
  	// Break action
  	if (trap->snap) {

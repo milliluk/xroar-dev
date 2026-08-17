@@ -1,13 +1,13 @@
 # The patch series
 
-44 patches, applied in filename order. Each is self-contained and carries its
+49 patches, applied in filename order. Each is self-contained and carries its
 own rationale in the commit message. **Read the patch before changing what it
 touches**; the message usually explains a failure mode that is not obvious from
 the code.
 
 **One number, in one place.** The filename ordinal *is* the patch number and
 the `Subject:` line agrees with it: `0037-audit-...patch` is
-`[PATCH 37/44]`, and a cross-reference to "patch 37" means that file. There
+`[PATCH 37/49]`, and a cross-reference to "patch 37" means that file. There
 used to be a second, drifting number embedded in both, a leftover from
 patches dropped during a rebase, and it is gone. If you add a patch, keep
 this property: it is the difference between a reference you can follow and one
@@ -60,14 +60,14 @@ N-1, apply N, apply the fix, diff. `AGENT-NOTES.md` has the recipe.
 
 **The series is offset-exact, and worth keeping that way.** Every patch applies
 at its stated line numbers. `git apply`, which tolerates no drift at all,
-accepts all 44 from a pristine tarball. That was not true before: folding fixups
+accepts the whole series from a pristine tarball. That was not true before: folding fixups
 into earlier patches moved `src/xroar.c` by about sixty lines and left sixteen
 later patches applying at an offset, four of them with *fuzz*: `patch`
 discarding context lines to make a hunk fit. Both are silent, and fuzz is the
 one that can land a hunk in the wrong place.
 
 Regenerating is mechanical and is the same replay used for folding: apply the
-series into a git repo one patch per commit, then `git format-patch -44
+series into a git repo one patch per commit, then `git format-patch -49
 --numbered --no-signature`. Check the result by applying it to a fresh tarball
 and diffing that tree against one built with the old series; they must be
 identical.
@@ -80,7 +80,7 @@ identical.
 | 15 | Hi-res (Tandy/CoCoMax3) joystick adaptor + DAC wiring | The high-resolution pointer interface real paint software uses. Scripted pointer work needs the same path the guest expects. |
 | 29 | `-lp-file` serial hook address `$A2C1` → `$A2BF` | The old address was mid-instruction in some ROM revisions: hooking it wedged the machine after two bytes. |
 | 30 | `-lp-file` on the CoCo 3 at all | It never worked there; BASIC runs from RAM, so a ROM-mapping test can never identify the routine. |
-| 35 | Sanitise guest `LOG` output | Raw guest memory reaching a host terminal is a control-sequence injection waiting to happen. |
+| 35 | Sanitise guest `LOG` output | Raw guest memory reaching a host terminal is a control-sequence injection waiting to happen. `$10 $3E` is not a real instruction, so a runaway PC reaches this with arbitrary memory as the format string. One shared copy, in `debug.c`, for every machine. |
 
 ## Group 3: Physical addressing (the fork's spine)
 
@@ -96,16 +96,21 @@ make it real.
 | 24 | `emuext` physical-PC profiler |
 | 25 | `-trap-ram` writes flat physical RAM when a trap fires |
 | 31 | Physical `read=`/`write=` watchpoints via GIME Z |
-| 37 | Physical access-audit map with a CPU access log |
+| 37 | Physical access-audit map with a CPU access log; marks on the CoCo 3 and the Dragon family (logical address as physical, the flat-machine degrade) |
 | 38 | `xpc=` rebuilt on the range mechanism so it composes with the rest |
 | 39 | Physical instruction breakpoints, exposed to gdb |
 | 40 | gdb reports the address a watchpoint stop *actually* hit |
+| 47 | **`-protect-mode`**, physical code/data policy checks: exit 70 with a crash report, RAM dump and backtrace at the first wild access |
+| 48 | Shadow call stack: `-backtrace`, `-trap-backtrace`, and the symbolized backtrace protect faults print |
 
 ## Group 4: Driving the machine
 
 | # | What it does | Notes |
 |---|---|---|
 | 14 | **`-input-script`**, scripted keyboard and joystick | The core automation primitive. A text file of steps; drives the PIA matrix and the joystick axes the way hardware does, so every guest-side poll sees what it expects. |
+| 49 | **`-rat-mouse`**, the Diecom RAT quadrature mouse | A filter over one port's axis readings, not a joystick module: the port keeps whatever source it had, so a script, the host mouse or a real stick all drive one. The RAT has no position — the guest integrates detents — so `-rat-rate` must stay below the guest's sample rate, and absolute position does not survive the trip. Color Max Deluxe's RAT driver could not be exercised at all before this. |
+| 46 | **`-cart cocomax` / `-cart xpad`**, the CoCo Max Hi-Res Input Module and the X-Pad GT-116 | Both source from the right virtual joystick, its two buttons included, so an input script drives the pointer these programs expect. CoCo Max keeps the real A/D pipeline — every read returns the preceding conversion and starts the selected one — and moves from `$FF90-$FF97` to the documented hardware modification at `$FF60-$FF67` on a CoCo 3, where the normal address is a GIME register. X-Pad is a low-address device already, so it needs no modification; its X read atomically latches the matching Y and status. |
+| 45 | Scripted joystick ports are independent | The right and left ports kept one shared pair of axes, and `right`/`left` prefixed script commands were rejected outright, so a two-player test could not drive the ports apart. Unqualified commands still mean the right port. |
 | 42 | `-init-delay` holds the first scripted input, by any route | A headless run is otherwise perfectly repeatable, so a guest that seeds anything from a timer at first input gets the same value every time. `-init-delay-random` puts the variation back, and logs the value it drew so a run that finds something can be repeated. One deadline shared by the auto-typer and `-input-script`. |
 | 12 | Hide the host cursor over the display | Screenshots stop containing the operator's mouse pointer. |
 | 33 | `-zoom N` integer window scale at startup | Reproducible window size, so screenshot comparison is stable. |
@@ -118,14 +123,14 @@ make it real.
 
 | # | What it does |
 |---|---|
-| 10 | **`emuext`**, the guest→host `LOG` side-channel and named assertions. The running 6809 program can print, assert and request a screenshot. This is the guest talking, not the host guessing. |
+| 10 | **`emuext`**, the guest→host `LOG` side-channel and named assertions. The running 6809 program can print, assert and request a screenshot. This is the guest talking, not the host guessing. Wired for **both** 6809 machine families — CoCo 3 and the whole Dragon family, CoCo 1/2 included — and the core tolerates a machine that wires nothing, because it decodes the opcodes for every machine regardless of `-emuext`. |
 | 17 | Trap *actions*: `-trap-load`, snapshots, and the action framework the rest hangs off. Also the cycle counters: `-trap-cycle-reset` / `-trap-cycle-print` / `-trap-cycle-print-reset`, and `-trap-cycle-master` for master clock ticks |
 | 18 | `-trap-screenshot` |
 | 19 | `-audio-record[-format/-source]` |
 | 21 | `seconds=` / `cycle=` scheduled traps |
 | 22 | `bp_add_range`; defers `-trap-snap` to a safe point |
 | 27 | gdb GIME / flat-RAM / cycle queries. **Not** upstream's `-gdb-pseudo-regs`, and worth knowing why before extending either (see below) |
-| 28 | `-serial-out` captures bit-banger serial |
+| 28 | `-serial-out` captures bit-banger serial: the same PIA1-A bit 1 tap on the CoCo 3 and the CoCo 1/2 family; a Dragon (different serial hardware) warns loudly instead of silently ignoring it |
 | 41 | **`-symbols FILE`, then `@Name` wherever an address is accepted** |
 | 43 | History and profile on one stream, surviving a machine change |
 | 7 | gdb tolerates re-binding its port instead of dying |
@@ -156,9 +161,36 @@ machine interface for it. The `qxroar.` namespace is for what a register dump
 cannot express, and keeping that line clean is the whole reason the boundary is
 written down here.
 
-**Patch 40 is the quality-of-life one.** With a symbol file loaded you write
+**Patch 41 is the quality-of-life one.** With a symbol file loaded you write
 `-trap xpc=@MainLoop` instead of a number you re-derived by hand. Numbers move
 between builds; names do not.
+
+**Patches 47 and 48 are the crash-on-first-wrong-access pair.** The audit map
+records what a run did; `-protect-mode` enforces what it may do, from a
+code/data map gensym (format 2, `M C` and `M D` records) infers from the
+assembler listing — nothing is tagged in source. Four checks, one flag each
+(`-protect-mode-stack/-write/-read/-data`), `-protect-mode` for all four; a
+violation reports registers and symbol, dumps the flight recorder, the shadow
+call stack and flat RAM, and exits 70. Checks stay dormant until the first
+fetch of mapped code, because the CoCo 3 boot runs BASIC from RAM no user map
+describes. `-trap-protect-on` moves that start line to its own trap (and
+suppresses the automatic arming outright, or it could not defer anything),
+`-trap-protect-off` ends the checks at its trap, and `-protect-allow` exempts
+self-modifying bytes. The shadow call stack (48) also stands alone:
+`-trap xpc=@Routine -trap-backtrace` answers "who calls this" without a
+debugger attached.
+
+The stack check is the subtle one, and it took two goes. It first fired only
+on an S-derived write landing on *code*, so a stack pointed into an `fcb`
+table, or one that simply grew past the bottom of its reservation, ran to
+completion and exited 0. Both halves are now in 47. `M D` (initialized data)
+catches the first, and is safe precisely because `rmb` emits no listing bytes:
+reserved space is in no `M` range, so a stack living there — every stack —
+cannot trip it. `-protect-stack-floor ADDR` catches the second, because
+nothing in the build output says how far down a stack may go. The report names
+which of the three fired. The hazard is that `pshs`/`puls` used as a fast data
+pointer is an S-derived write like any other and will fault; `-protect-allow`
+is the exemption, and `src/protect.h` says so where someone will find it.
 
 ---
 
@@ -208,5 +240,8 @@ patch, do not `git add -A`;** add the sources you actually changed.
 5. Number it after the last patch. Verify the whole series still applies from a
    pristine tarball, with `git apply`, not just `patch`, so drift cannot hide.
 6. Build with `-Werror`.
+7. Add its row to this file, in the group it belongs to, and update the count at
+   the top. A patch that is in the series but not in `PATCHES.md` is a
+   cross-reference that leads nowhere: "patch 46" has to resolve here.
 
 **Never hand-edit a diff to do this.** See `AGENT-NOTES.md`.

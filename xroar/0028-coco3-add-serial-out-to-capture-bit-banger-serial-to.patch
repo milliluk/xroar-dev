@@ -1,18 +1,33 @@
-From 115af56bed730d70b9e6e88d9a33192a86d93390 Mon Sep 17 00:00:00 2001
+From 0c1384de5edcfccbe72b5b11e49f51cd693e5046 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:24 -0400
-Subject: [PATCH 28/44] coco3: add -serial-out to capture bit-banger serial to
+Subject: [PATCH 28/49] coco3: add -serial-out to capture bit-banger serial to
 
+Originally coco3-only: the option was global, but only coco3.c consumed
+it, so on a CoCo 1/2 -serial-out was accepted and captured nothing --
+the same PIA1-A bit 1 bit-banger, silently ignored.  The config moves to
+xroar.c/xroar.h as xroar_serial_out_file/_baud (it was always parsed
+there; "coco3_" in the name was just where the first tap happened to
+live), and the dragon family grows the identical tap: armed for the CoCo
+family only, since the Dragons' serial is different hardware on
+different lines -- there the option now warns loudly instead of arming.
+The CoCo ROM print hook keeps its bit-bang shortcut only while the tap
+is off, same rule as coco3_print_byte, so ROM output reaches the tap at
+signal level too.
 ---
- src/coco3.c         | 105 +++++++++++++++++++++++++++++++++++++++++++-
- src/gdb.c           |  32 ++++++++++++++
- src/mc6809/mc6809.c |  12 +++++
- src/mc6809/mc6809.h |   1 +
- src/xroar.c         |  15 +++++++
- 5 files changed, 164 insertions(+), 1 deletion(-)
+ src/coco3.c         | 99 ++++++++++++++++++++++++++++++++++++++++++++-
+ src/dragon/coco.c   |  7 +++-
+ src/dragon/dragon.c | 90 +++++++++++++++++++++++++++++++++++++++++
+ src/dragon/dragon.h | 18 +++++++++
+ src/gdb.c           | 32 +++++++++++++++
+ src/mc6809/mc6809.c | 12 ++++++
+ src/mc6809/mc6809.h |  1 +
+ src/xroar.c         | 18 +++++++++
+ src/xroar.h         |  5 +++
+ 9 files changed, 280 insertions(+), 2 deletions(-)
 
 diff --git a/src/coco3.c b/src/coco3.c
-index 5d76af3..55d5952 100644
+index ff254ea..ff8edc8 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
 @@ -23,6 +23,7 @@
@@ -31,20 +46,7 @@ index 5d76af3..55d5952 100644
  #include "gdb.h"
  #include "joystick.h"
  #include "keyboard.h"
-@@ -79,6 +81,12 @@
- // Measured peak-to-peak voltages: 0V, 1V, 1.6V, 2V.  Scaled here:
- static float rgb_intensity_map[4] = { 0.000, 0.460, 0.736, 0.920 };
- 
-+// -serial-out FILE: capture CoCo serial (bit-banger, PIA1-A bit 1) output to a
-+// file.  Set by the xroar.c option table.  -serial-out-baud sets the assumed
-+// bit rate (default 600, the CoCo single-speed rate).
-+char *coco3_serial_out_file = NULL;
-+int coco3_serial_out_baud = 600;
-+
- // The GIME appears to generate its composite output (used in NTSC machines
- // only) by switching between a set of 7 voltages at 3.58Mhz (presumably with
- // R/C net to smooth to almost-but-not-quite sine waves).  AFAICT there is no
-@@ -211,6 +219,18 @@ struct coco3 {
+@@ -210,6 +212,18 @@ struct coco3 {
  	uint32_t joystick_dac_start;
  	uint32_t joystick_dac_target;
  	event_ticks joystick_dac_transition_tick;
@@ -63,7 +65,7 @@ index 5d76af3..55d5952 100644
  };
  
  #define COCO3_SER_RAM           (2)
-@@ -398,6 +418,7 @@ static void pia0a_data_postwrite(void *sptr);
+@@ -397,6 +411,7 @@ static void pia0a_data_postwrite(void *sptr);
  
  #define pia1a_data_preread NULL
  static void pia1a_data_postwrite(void *sptr);
@@ -71,17 +73,17 @@ index 5d76af3..55d5952 100644
  static void pia1a_control_postwrite(void *sptr);
  #define pia1b_data_preread NULL
  static void pia1b_data_postwrite(void *sptr);
-@@ -794,6 +815,21 @@ static bool coco3_finish(struct part *p) {
+@@ -793,6 +808,21 @@ static bool coco3_finish(struct part *p) {
  
  	mcc3->dat.readable = 1;
  
 +	// -serial-out: open the capture file and arm the bit-banger tap.
-+	if (coco3_serial_out_file) {
-+		mcc3->serial_out.stream = fopen(coco3_serial_out_file, "ab");
++	if (xroar_serial_out_file) {
++		mcc3->serial_out.stream = fopen(xroar_serial_out_file, "ab");
 +		if (!mcc3->serial_out.stream) {
-+			LOG_MOD_WARN("coco3", "-serial-out: cannot open '%s'\n", coco3_serial_out_file);
++			LOG_MOD_WARN("coco3", "-serial-out: cannot open '%s'\n", xroar_serial_out_file);
 +		} else {
-+			int baud = coco3_serial_out_baud > 0 ? coco3_serial_out_baud : 600;
++			int baud = xroar_serial_out_baud > 0 ? xroar_serial_out_baud : 600;
 +			mcc3->serial_out.bit_ticks = (event_ticks)(EVENT_TICK_RATE / (unsigned)baud);
 +			mcc3->serial_out.bit = -1;
 +			mcc3->serial_out.line = (PIA_VALUE_A(mcc3->PIA1) >> 1) & 1;
@@ -93,7 +95,7 @@ index 5d76af3..55d5952 100644
  	tcc1014_notify_mode(mcc3->GIME);
  
  	return 1;
-@@ -817,6 +853,11 @@ static void coco3_free(struct part *p) {
+@@ -816,6 +846,11 @@ static void coco3_free(struct part *p) {
  	machine_remove_breakpoint_all(&mcc3->public, mcc3);
  	event_dequeue(&mcc3->hires_joystick_event[0]);
  	event_dequeue(&mcc3->hires_joystick_event[1]);
@@ -105,7 +107,7 @@ index 5d76af3..55d5952 100644
  	if (mcc3->printer_interface) {
  		printer_interface_free(mcc3->printer_interface);
  	}
-@@ -973,6 +1014,12 @@ static void coco3_reset(struct machine *m, bool hard) {
+@@ -972,6 +1007,12 @@ static void coco3_reset(struct machine *m, bool hard) {
  	printer_reset(mcc3->printer_interface);
  	machine_remove_breakpoint_all(m, mcc3);
  	machine_add_breakpoint_sym(m, "serial.printchr", DELEGATE_AS2(void, bool, uint32, coco3_print_byte, mcc3));
@@ -118,7 +120,7 @@ index 5d76af3..55d5952 100644
  }
  
  static enum machine_run_state coco3_run(struct machine *m, int ncycles) {
-@@ -1810,6 +1857,45 @@ static void pia0a_data_postwrite(void *sptr) {
+@@ -1702,6 +1743,45 @@ static void pia0a_data_postwrite(void *sptr) {
  	}
  }
  
@@ -164,7 +166,7 @@ index 5d76af3..55d5952 100644
  static void pia1a_data_postwrite(void *sptr) {
  	struct coco3 *mcc3 = sptr;
  	joystick_dac_write(mcc3);
-@@ -1818,6 +1904,19 @@ static void pia1a_data_postwrite(void *sptr) {
+@@ -1710,6 +1790,19 @@ static void pia1a_data_postwrite(void *sptr) {
  	// Tandy Hi-Res adaptor strobes on the DAC MSB
  	if (mcc3->hires_joystick == HIRES_RIGHT || mcc3->hires_joystick == HIRES_LEFT)
  		hires_joystick_update(mcc3);
@@ -184,7 +186,7 @@ index 5d76af3..55d5952 100644
  }
  
  static void pia1a_control_postwrite(void *sptr) {
-@@ -1892,7 +1991,11 @@ static void coco3_print_byte(void *sptr, bool RnW, uint32_t A) {
+@@ -1784,7 +1877,11 @@ static void coco3_print_byte(void *sptr, bool RnW, uint32_t A) {
  	int byte = MC6809_REG_A(mcc3->CPU);
  	printer_strobe(mcc3->printer_interface, 0, byte);
  	printer_strobe(mcc3->printer_interface, 1, byte);
@@ -197,11 +199,199 @@ index 5d76af3..55d5952 100644
  }
  
  /* Sound output can feed back into the single bit sound pin when it's
+diff --git a/src/dragon/coco.c b/src/dragon/coco.c
+index baf825c..90fe9a3 100644
+--- a/src/dragon/coco.c
++++ b/src/dragon/coco.c
+@@ -243,6 +243,7 @@ static void pia1a_data_postwrite_coco(void *sptr) {
+ 	struct dragon *md = sptr;
+ 	sound_set_dac_level(md->snd, (float)(PIA_VALUE_A(md->PIA1) & 0xfc) / 252.);
+ 	tape_update_output(md->tape_interface, md->PIA1->a.out_sink & 0xfc);
++	dragon_serial_out_edge(md);
+ }
+ 
+ static void pia1b_data_preread_coco64k(void *sptr) {
+@@ -273,5 +274,9 @@ static void coco_print_byte(void *sptr, bool RnW, uint32_t A) {
+ 	int byte = MC6809_REG_A(md->CPU);
+ 	printer_strobe(md->printer_interface, 0, byte);
+ 	printer_strobe(md->printer_interface, 1, byte);
+-	md->CPU->reg_pc = 0xa2df;
++	// Normally we shortcut past the ROM's slow bit-bang timing loop.  When
++	// capturing serial at the signal level, let the ROM actually bit-bang the
++	// byte out PIA1-A bit 1 so the -serial-out tap sees ROM output too.
++	if (!md->serial_out.stream)
++		md->CPU->reg_pc = 0xa2df;
+ }
+diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
+index 6a810b8..54c3fa3 100644
+--- a/src/dragon/dragon.c
++++ b/src/dragon/dragon.c
+@@ -262,6 +262,7 @@ static void dragon_remove_watchpoint(struct machine *m, int RnW,
+ static void joystick_update(void *sptr);
+ static void hires_joystick_update(struct dragon *md);
+ static void hires_joystick_fire(void *sptr);
++static void dragon_serial_sample(void *sptr);
+ static void update_sound_mux_source(void *sptr);
+ 
+ // lwasm emuext opcode handlers (wired into the CPU's debug_cpu delegates)
+@@ -695,6 +696,30 @@ bool dragon_finish_common(struct dragon *md) {
+ 
+ 	md->tape_update_audio = DELEGATE_AS1(void, float, update_audio_from_tape, md);
+ 
++	// -serial-out: open the capture file and arm the bit-banger tap.  The
++	// CoCo family (CoCo 1/2, Deluxe CoCo) bit-bangs serial on PIA1-A bit 1
++	// exactly as the CoCo 3 does.  The Dragons do not -- their serial went
++	// through other hardware -- so there the option warns instead of
++	// arming: accepting it silently is the failure mode this exists to
++	// avoid.
++	if (xroar_serial_out_file) {
++		if (md->is_dragon) {
++			LOG_MOD_WARN("dragon", "-serial-out: no PIA bit-banger serial on this machine; not capturing\n");
++		} else {
++			md->serial_out.stream = fopen(xroar_serial_out_file, "ab");
++			if (!md->serial_out.stream) {
++				LOG_MOD_WARN("coco", "-serial-out: cannot open '%s'\n", xroar_serial_out_file);
++			} else {
++				int baud = xroar_serial_out_baud > 0 ? xroar_serial_out_baud : 600;
++				md->serial_out.bit_ticks = (event_ticks)(EVENT_TICK_RATE / (unsigned)baud);
++				md->serial_out.bit = -1;
++				md->serial_out.line = (PIA_VALUE_A(md->PIA1) >> 1) & 1;
++				event_init(&md->serial_out.sample_event, MACHINE_EVENT_LIST,
++					   DELEGATE_AS0(void, dragon_serial_sample, md));
++			}
++		}
++	}
++
+ #ifdef WANT_GDB_TARGET
+ 	// GDB
+ 	if (xroar.cfg.debug.gdb) {
+@@ -744,6 +769,11 @@ void dragon_free_common(struct part *p) {
+ 	if (md->printer_interface) {
+ 		printer_interface_free(md->printer_interface);
+ 	}
++	if (md->serial_out.stream) {
++		event_dequeue(&md->serial_out.sample_event);
++		fclose(md->serial_out.stream);
++		md->serial_out.stream = NULL;
++	}
+ 	event_dequeue(&md->hires_joystick_event[0]);
+ 	event_dequeue(&md->hires_joystick_event[1]);
+ 	rombank_free(md->ext_charset);
+@@ -913,6 +943,12 @@ void dragon_reset(struct machine *m, bool hard) {
+ 	mc6847_reset(md->VDG);
+ 	tape_reset(md->tape_interface);
+ 	printer_reset(md->printer_interface);
++	// Drop any in-progress serial frame so a reset mid-byte emits nothing.
++	if (md->serial_out.stream) {
++		event_dequeue(&md->serial_out.sample_event);
++		md->serial_out.bit = -1;
++		md->serial_out.data = 0;
++	}
+ }
+ 
+ static enum machine_run_state dragon_run(struct machine *m, int ncycles) {
+@@ -1625,6 +1661,60 @@ static void pia1a_data_postwrite(void *sptr) {
+ 	printer_strobe(md->printer_interface, PIA_VALUE_A(md->PIA1) & 0x02, PIA_VALUE_B(md->PIA0));
+ }
+ 
++// -serial-out: sample the serial line at bit centres.  Same decoder as the
++// CoCo 3's in coco3.c: a start edge first schedules a check at the start-bit
++// centre (0.5 bit after the edge) to reject glitches, the 8 data bits are
++// sampled at one-bit intervals relative to the mark level captured at the
++// start edge (mark==1, space==0, LSB first), and a final sample checks the
++// stop bit, dropping the frame on a framing error.
++
++static void dragon_serial_sample(void *sptr) {
++	struct dragon *md = sptr;
++	int b = md->serial_out.bit;
++	_Bool is_mark = (md->serial_out.line == md->serial_out.idle);
++	if (b == -2) {
++		// Start-bit centre: reject a glitch that already returned to mark.
++		if (is_mark) {
++			md->serial_out.bit = -1;
++			return;
++		}
++		md->serial_out.bit = 0;
++		event_queue_dt(&md->serial_out.sample_event, md->serial_out.bit_ticks);
++		return;
++	}
++	if (b < 0)
++		return;
++	if (b < 8) {
++		if (is_mark)
++			md->serial_out.data |= (1 << b);
++		md->serial_out.bit = b + 1;
++		event_queue_dt(&md->serial_out.sample_event, md->serial_out.bit_ticks);
++	} else {
++		if (is_mark && md->serial_out.stream) {
++			putc(md->serial_out.data, md->serial_out.stream);
++			fflush(md->serial_out.stream);
++		}
++		md->serial_out.bit = -1;
++		md->serial_out.data = 0;
++	}
++}
++
++void dragon_serial_out_edge(struct dragon *md) {
++	if (!md->serial_out.stream)
++		return;
++	uint8_t newline = (PIA_VALUE_A(md->PIA1) >> 1) & 1;
++	if (md->serial_out.bit == -1 && newline != md->serial_out.line) {
++		// Possible start edge: capture the mark level and validate at the
++		// start-bit centre before committing to a frame.
++		md->serial_out.idle = md->serial_out.line;
++		md->serial_out.data = 0;
++		md->serial_out.bit = -2;
++		event_queue_dt(&md->serial_out.sample_event,
++		               md->serial_out.bit_ticks / 2);
++	}
++	md->serial_out.line = newline;
++}
++
+ static void pia1a_control_postwrite(void *sptr) {
+ 	struct dragon *md = sptr;
+ 	tape_set_motor(md->tape_interface, PIA_VALUE_CA2(md->PIA1));
+diff --git a/src/dragon/dragon.h b/src/dragon/dragon.h
+index d31eeea..5989b52 100644
+--- a/src/dragon/dragon.h
++++ b/src/dragon/dragon.h
+@@ -131,6 +131,20 @@ struct dragon {
+ 	_Bool hires_joystick_ca;   // last seen strobe level
+ 	struct event hires_joystick_event[2];  // per-axis monostable
+ 
++	// -serial-out: signal-level tap on the serial bit-banger (PIA1-A bit
++	// 1), same decode as the CoCo 3's in coco3.c.  CoCo family only:
++	// dragon_finish_common() never arms it on a Dragon, whose serial goes
++	// through different hardware entirely.
++	struct {
++		FILE *stream;            // capture file, or NULL if disabled
++		struct event sample_event;
++		event_ticks bit_ticks;   // master ticks per serial bit
++		uint8_t line;            // last seen TxD level (PIA1-A bit 1)
++		uint8_t idle;            // mark level captured at the start edge
++		uint8_t data;            // byte being assembled (LSB first)
++		int bit;                 // -2 start check; -1 idle; 0..7 data; 8 stop
++	} serial_out;
++
+ 	struct {
+ 		int sam_variant;
+ 		bool immunity;
+@@ -194,6 +208,10 @@ void dragon_free_common(struct part *p);
+ // Exits rather than returning when the check fails; see dragon.c.
+ void dragon_require_rom(struct rombank *bank, int slot, _Bool has, const char *name);
+ 
++// -serial-out edge detect, called from the CoCo variant of the PIA1 A-side
++// data postwrite (coco.c); a no-op unless the tap is armed.
++void dragon_serial_out_edge(struct dragon *md);
++
+ bool dragon_has_interface(struct part *p, const char *ifname);
+ void dragon_attach_interface(struct part *p, const char *ifname, void *intf);
+ 
 diff --git a/src/gdb.c b/src/gdb.c
-index faad5ce..368af48 100644
+index 4d98b0d..1432866 100644
 --- a/src/gdb.c
 +++ b/src/gdb.c
-@@ -232,6 +232,7 @@ static int get_register_hex(struct gdb_interface_private *gip, int regno,
+@@ -235,6 +235,7 @@ static int get_register_hex(struct gdb_interface_private *gip, int regno,
  			    size_t dsize, char *dest);
  static int hexdigit(char c);
  static int hex8(char *s);
@@ -209,7 +399,7 @@ index faad5ce..368af48 100644
  
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
-@@ -975,6 +976,29 @@ error:
+@@ -982,6 +983,29 @@ error:
  
  // General query handler ('q' packets)
  
@@ -239,7 +429,7 @@ index faad5ce..368af48 100644
  static void general_query(struct gdb_interface_private *gip, char *args) {
  	if (0 == strncmp(args, "Rcmd", 4)) {
  		// This query uses comma instead of colon as separator.
-@@ -1469,3 +1493,11 @@ static int hex8(char *s) {
+@@ -1477,3 +1501,11 @@ static int hex8(char *s) {
  		return -1;
  	return (n1 << 4) | n0;
  }
@@ -287,10 +477,24 @@ index 6a13e4e..7f89955 100644
  
  #endif
 diff --git a/src/xroar.c b/src/xroar.c
-index d0b9164..b56cfa7 100644
+index 68e0b5a..579f254 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -4319,6 +4319,15 @@ static struct xconfig_enum screenshot_when_list[] = {
+@@ -112,6 +112,13 @@ struct xroar xroar = {
+ uint64_t xroar_cpu_cycles = 0;
+ uint64_t xroar_master_cycles = 0;
+ 
++// -serial-out FILE: capture bit-banger serial (PIA1-A bit 1) output to a
++// file.  Consumed by every machine with that line: the CoCo 3 (coco3.c) and
++// the CoCo 1/2 family (dragon/dragon.c).  -serial-out-baud sets the assumed
++// bit rate (default 600, the CoCo single-speed rate).
++char *xroar_serial_out_file = NULL;
++int xroar_serial_out_baud = 600;
++
+ #ifdef WANT_TRAPS
+ 
+ // Traps
+@@ -4320,6 +4327,11 @@ static struct xconfig_enum screenshot_when_list[] = {
  
  /* Configuration directives */
  
@@ -299,23 +503,19 @@ index d0b9164..b56cfa7 100644
 +	int v_int;
 +} dummy_value;
 +
-+// -serial-out capture config, defined in coco3.c.
-+extern char *coco3_serial_out_file;
-+extern int coco3_serial_out_baud;
-+
  static struct xconfig_option const xroar_options[] = {
  	/* Machines: */
  	{ XC_CALL_STRING("default-machine", &set_default_machine) },
-@@ -4487,6 +4496,8 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4488,6 +4500,8 @@ static struct xconfig_option const xroar_options[] = {
  	/* Printing: */
  	{ XC_SET_STRING_NE("lp-file", &private_cfg.printer.file) },
  	{ XC_SET_STRING("lp-pipe", &private_cfg.printer.pipe) },
-+	{ XC_SET_STRING_NE("serial-out", &coco3_serial_out_file) },
-+	{ XC_SET_INT("serial-out-baud", &coco3_serial_out_baud) },
++	{ XC_SET_STRING_NE("serial-out", &xroar_serial_out_file) },
++	{ XC_SET_INT("serial-out-baud", &xroar_serial_out_baud) },
  
  	/* Emulator actions: */
  	{ XC_SET_BOOL("ratelimit", &private_cfg.debug.ratelimit) },
-@@ -4679,6 +4690,8 @@ static void helptext(void) {
+@@ -4680,6 +4694,8 @@ static void helptext(void) {
  #ifdef HAVE_POPEN
  "  -lp-pipe COMMAND      pipe Dragon printer output to COMMAND\n"
  #endif
@@ -324,12 +524,28 @@ index d0b9164..b56cfa7 100644
  "\n"
  
  " Files:\n"
-@@ -4987,6 +5000,8 @@ static void config_print_all(FILE *f, bool all) {
+@@ -4988,6 +5004,8 @@ static void config_print_all(FILE *f, bool all) {
  	fputs("# Printing\n", f);
  	xroar_cfg_print_string(f, all, "lp-file", private_cfg.printer.file, NULL);
  	xroar_cfg_print_string(f, all, "lp-pipe", private_cfg.printer.pipe, NULL);
-+	xroar_cfg_print_string(f, all, "serial-out", coco3_serial_out_file, NULL);
-+	xroar_cfg_print_int(f, all, "serial-out-baud", coco3_serial_out_baud, 600);
++	xroar_cfg_print_string(f, all, "serial-out", xroar_serial_out_file, NULL);
++	xroar_cfg_print_int(f, all, "serial-out-baud", xroar_serial_out_baud, 600);
  	fputs("\n", f);
  
  	fputs("# Debugging\n", f);
+diff --git a/src/xroar.h b/src/xroar.h
+index eafc5bc..ff35d6e 100644
+--- a/src/xroar.h
++++ b/src/xroar.h
+@@ -197,6 +197,11 @@ extern uint64_t xroar_cpu_cycles;
+ // -trap-cycle-print when -trap-cycle-master is set.
+ extern uint64_t xroar_master_cycles;
+ 
++// -serial-out capture configuration; see the taps in coco3.c and
++// dragon/dragon.c.
++extern char *xroar_serial_out_file;
++extern int xroar_serial_out_baud;
++
+ #define UI_EVENT_LIST xroar.ui_events
+ #define MACHINE_EVENT_LIST xroar.machine_events
+ 

@@ -1,7 +1,7 @@
-From 2db9e72e6ed1d1ac1f6338ac2bc0dd74d2dc1e97 Mon Sep 17 00:00:00 2001
+From 511fb752b5beb4094be9c1597efa5940bf8dde5f Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:37 -0400
-Subject: [PATCH 34/44] trap/load: never assume hex; only 0x, loud errors on
+Subject: [PATCH 34/49] trap/load: never assume hex; only 0x, loud errors on
 
 ---
  doc/xroar.texi |   7 +++-
@@ -27,10 +27,10 @@ index 1e6442d..6ec3a1b 100644
  @tab Perform trap's actions only on @var{m}th-@var{n}th trigger.
  @item @ @ @ @option{-trap-snap @var{file}}
 diff --git a/src/xroar.c b/src/xroar.c
-index 068908a..557a25b 100644
+index 043a4b8..0ee1f90 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -3033,11 +3033,30 @@ static void add_load(const char *arg) {
+@@ -3040,11 +3040,30 @@ static void add_load(const char *arg) {
  	}
  }
  
@@ -65,7 +65,7 @@ index 068908a..557a25b 100644
  }
  
  // Shared loader for -load-ram and -trap-load.
-@@ -3432,34 +3451,42 @@ static void handle_seconds_trigger(void *sptr) {
+@@ -3440,34 +3459,42 @@ static void handle_seconds_trigger(void *sptr) {
  	event_queue(&trg->event);
  }
  
@@ -132,7 +132,7 @@ index 068908a..557a25b 100644
  }
  
  // Classify a condition's value: a single address or LO-HI range.  Both sides
-@@ -3476,8 +3503,9 @@ static int trap_addr_space_range(const char *cond, const char *val) {
+@@ -3484,8 +3511,9 @@ static int trap_addr_space_range(const char *cond, const char *val) {
  	int b = trap_addr_space(dash + 1);
  	free(lo);
  	if (a >= 0 && b >= 0 && a != b) {
@@ -144,7 +144,7 @@ index 068908a..557a25b 100644
  		exit(EXIT_FAILURE);
  	}
  	return (a >= 0) ? a : b;
-@@ -3592,9 +3620,10 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3600,9 +3628,10 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  		unsigned long a = -1UL, b = -1UL;
  		parse_range_ul(val, &a, &b);
  
@@ -158,7 +158,7 @@ index 068908a..557a25b 100644
  		int addr_phys = trap_addr_space_range(trap->cond, val);
  		if (addr_phys == 1 && 0 == c_strcasecmp(key, "pc")) {
  			key = "xpc";
-@@ -4935,8 +4964,10 @@ static void helptext(void) {
+@@ -4939,8 +4968,10 @@ static void helptext(void) {
  "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
  "  -q, -quiet            equivalent to -verbose 0\n"
  #ifdef WANT_TRAPS

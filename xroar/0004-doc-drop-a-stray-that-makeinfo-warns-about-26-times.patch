@@ -1,7 +1,7 @@
-From c9f8cd8ef8f14dc03612b1f6fa20d16985144d00 Mon Sep 17 00:00:00 2001
+From 756f7950122ee9221864d2a1f00d8005a554587d Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:33 -0400
-Subject: [PATCH 04/44] doc: drop a stray @ that makeinfo warns about 26 times
+Subject: [PATCH 04/49] doc: drop a stray @ that makeinfo warns about 26 times
 
 doc/xroar.texi has 26 @item lines ending in a bare '@':
 

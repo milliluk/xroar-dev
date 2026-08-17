@@ -1,7 +1,7 @@
-From 4ef8c40da47fce15dc29e895de0160b97a00074b Mon Sep 17 00:00:00 2001
+From 70df7e60fb68a79e16e23f8452c8d27fae0d5e33 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:42:27 -0400
-Subject: [PATCH 44/44] headless: -headless, one flag for an automation run
+Subject: [PATCH 44/49] headless: -headless, one flag for an automation run
 
 An automation run wants no window, no audio device, no wall-clock throttle
 and no emulated floppy seek latency. That was four things to remember, and
@@ -29,7 +29,7 @@ UI compiled in is not evidence of how this particular run is meant to go.
  1 file changed, 64 insertions(+), 4 deletions(-)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index ac57dd3..0e89bec 100644
+index 96c4b7b..d788075 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -97,6 +97,16 @@
@@ -49,7 +49,7 @@ index ac57dd3..0e89bec 100644
  // Global emulator state
  
  struct xroar xroar = {
-@@ -349,6 +359,18 @@ struct private_cfg {
+@@ -356,6 +366,18 @@ struct private_cfg {
  	// User interface
  	char *ui_module;
  
@@ -68,7 +68,7 @@ index ac57dd3..0e89bec 100644
  	// Video
  	struct {
  		bool fullscreen;
-@@ -450,6 +472,7 @@ static struct private_cfg private_cfg = {
+@@ -457,6 +479,7 @@ static struct private_cfg private_cfg = {
  	.debug.trap_def.no_trace = -1,
  #endif
  	.debug.ratelimit = 1,
@@ -76,7 +76,7 @@ index ac57dd3..0e89bec 100644
  };
  
  static struct ui_cfg xroar_ui_cfg = {
-@@ -1247,6 +1270,25 @@ struct ui_interface *xroar_init(int argc, char **argv) {
+@@ -1254,6 +1277,25 @@ struct ui_interface *xroar_init(int argc, char **argv) {
  
  	// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
@@ -102,9 +102,9 @@ index ac57dd3..0e89bec 100644
  	// Help text
  
  #ifndef HAVE_WASM
-@@ -4722,6 +4764,20 @@ static union {
- extern char *coco3_serial_out_file;
- extern int coco3_serial_out_baud;
+@@ -4726,6 +4768,20 @@ static union {
+ 	int v_int;
+ } dummy_value;
  
 +// These two go through a callback purely to record that the command line said
 +// something, so -headless can supply a default without ever overruling one.
@@ -123,7 +123,7 @@ index ac57dd3..0e89bec 100644
  static struct xconfig_option const xroar_options[] = {
  	/* Machines: */
  	{ XC_CALL_STRING("default-machine", &set_default_machine) },
-@@ -4807,7 +4863,7 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4811,7 +4867,7 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_BOOL("disk-write-back", &xroar.cfg.disk.write_back) },
  	{ XC_SET_BOOL("disk-auto-os9", &xroar.cfg.disk.auto_os9) },
  	{ XC_SET_BOOL("disk-auto-sd", &xroar.cfg.disk.auto_sd) },
@@ -132,7 +132,7 @@ index ac57dd3..0e89bec 100644
  
  	/* Firmware ROM images: */
  	{ XC_SET_STRING_NE("rompath", &xroar.cfg.file.rompath) },
-@@ -4819,6 +4875,7 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4823,6 +4879,7 @@ static struct xconfig_option const xroar_options[] = {
  
  	/* User interface: */
  	{ XC_SET_STRING("ui", &private_cfg.ui_module) },
@@ -140,8 +140,8 @@ index ac57dd3..0e89bec 100644
  	/* Deliberately undocumented: */
  	{ XC_SET_STRING("filereq", &xroar_ui_cfg.filereq) },
  
-@@ -4895,7 +4952,7 @@ static struct xconfig_option const xroar_options[] = {
- 	{ XC_SET_INT("serial-out-baud", &coco3_serial_out_baud) },
+@@ -4899,7 +4956,7 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_INT("serial-out-baud", &xroar_serial_out_baud) },
  
  	/* Emulator actions: */
 -	{ XC_SET_BOOL("ratelimit", &private_cfg.debug.ratelimit) },
@@ -149,7 +149,7 @@ index ac57dd3..0e89bec 100644
  	{ XC_SET_STRING_LIST("type", &private_cfg.kbd.type_list) },
  	{ XC_SET_DOUBLE("init-delay", &xroar.cfg.kbd.init_delay) },
  	{ XC_SET_BOOL("init-delay-random", &xroar.cfg.kbd.init_delay_random) },
-@@ -5067,7 +5124,7 @@ static void helptext(void) {
+@@ -5071,7 +5128,7 @@ static void helptext(void) {
  "  -no-disk-write-back   don't default to enabling write-back for disk images\n"
  "  -no-disk-auto-os9     don't try to detect headerless OS-9 JVC disk images\n"
  "  -no-disk-auto-sd      don't assume single density for 10 sec/track disks\n"
@@ -158,7 +158,7 @@ index ac57dd3..0e89bec 100644
  "\n"
  
  " Hard disks:\n"
-@@ -5133,6 +5190,8 @@ static void helptext(void) {
+@@ -5137,6 +5194,8 @@ static void helptext(void) {
  
  " User interface:\n"
  "  -ui MODULE            user-interface module (-ui help for list)\n"
@@ -167,7 +167,7 @@ index ac57dd3..0e89bec 100644
  "\n"
  
  " Video:\n"
-@@ -5182,7 +5241,7 @@ static void helptext(void) {
+@@ -5186,7 +5245,7 @@ static void helptext(void) {
  "  -gdb-pseudo-regs      enable pseudo-registers (e.g. SAM, PIA) for GDB\n"
  #endif
  "  -emuext               enable lwasm emuext opcodes (BREAK, LOG)\n"
@@ -176,7 +176,7 @@ index ac57dd3..0e89bec 100644
  #ifdef TRACE
  "  -trace                start with trace mode on\n"
  "  -trace-timing         print timings in trace mode\n"
-@@ -5370,6 +5429,7 @@ static void config_print_all(FILE *f, bool all) {
+@@ -5374,6 +5433,7 @@ static void config_print_all(FILE *f, bool all) {
  	xroar_cfg_print_bool(f, all, "disk-write-back", xroar.cfg.disk.write_back, 1);
  	xroar_cfg_print_bool(f, all, "disk-auto-os9", xroar.cfg.disk.auto_os9, 1);
  	xroar_cfg_print_bool(f, all, "disk-auto-sd", xroar.cfg.disk.auto_sd, 1);

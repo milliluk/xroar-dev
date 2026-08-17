@@ -1,7 +1,7 @@
-From e145e598a2093e4801e997771f8736bb0e40f60e Mon Sep 17 00:00:00 2001
+From 061143528cc7859439ac5487fb3a7dc06b3faa5f Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:49 -0400
-Subject: [PATCH 12/44] sdl: hide the host cursor over the emulated display
+Subject: [PATCH 12/49] sdl: hide the host cursor over the emulated display
 
 ---
  src/sdl2/common.c | 11 ++++++++++-

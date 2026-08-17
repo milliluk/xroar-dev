@@ -29,9 +29,12 @@ mostly LLM-speak optimized for LLMs.
 | Guest talks to host | `emuext` opcodes: the running program can log, assert, request a screenshot |
 | Physical, not logical, addressing | GIME MMU translation everywhere it matters (see below) |
 | Symbols instead of numbers | `-symbols FILE`, then `@Name` anywhere an address is accepted |
+| Crash at the first wrong access | `-protect-mode`: code/data policy inferred from the build; report + RAM dump + exit 70 |
+| A real call stack | `-backtrace` shadow call stack; `-trap-backtrace` dumps it, and every protect fault prints one |
+| Odd input hardware | `-rat-mouse`, the Diecom RAT quadrature mouse, driven by any port source |
 | Determinism | `-disk-fast`, `-trap-ratelimit-off`, clean signal handling |
 
-[PATCHES.md](PATCHES.md) explains all 44 patches and what each one buys you.
+[PATCHES.md](PATCHES.md) explains all 49 patches and what each one buys you.
 
 ## An important consideration for MMU systems
 
@@ -113,6 +116,69 @@ before anyone should touch it, skip them rather than staring past them:
 
 acts only from the 4th trigger and turns on an instruction trace for 200
 instructions from that point.
+
+### Crash at the first wild access, not thirty seconds later
+
+The watchpoint recipe above needs you to already suspect a region. Protected
+memory mode needs nothing but the symbol file: the assembler listing says
+which bytes are instructions and which are initialized data (gensym format 2's
+`M C` and `M D` records — nothing is tagged in source), and the run dies the
+moment the program treats code as data or data as code.
+
+```bash
+bin/xroar-dev -machine coco3 -load-fd0 test.dsk -symbols out.sym \
+    -protect-mode -trap-history 64
+```
+
+Four checks, each its own flag when you want fewer: `-protect-mode-stack`
+(an S-derived write landing where no stack belongs), `-protect-mode-write`
+(any other write into code), `-protect-mode-read` (data read from code, the
+classic wild pointer), `-protect-mode-data` (instruction fetch from non-code —
+the PC jumped into the weeds). A named flag wins over `-protect-mode` from
+either side, so `-protect-mode -no-protect-mode-read` is "everything but
+reads".
+
+The stack check has three ways to fire and the report says which. An S-derived
+write onto **code** ("stack hit code") or onto **initialized data** ("stack hit
+data") is one; the second needs no configuration, because `rmb` reservations
+emit no listing bytes and so are in no `M D` range — a stack living in reserved
+space, which is every stack, cannot trip it. The third is
+`-protect-stack-floor ADDR` (physical, `@names` accepted): a stack that has
+simply grown too far down, through reserved space nothing can classify, is
+caught by the one number the build output cannot supply. Beware the classic
+6809 trick of using `pshs`/`puls` or S-relative indexing as a fast data
+pointer: that is an S-derived write too, and it will fault. `-protect-allow
+LO-HI` over the region is the escape hatch.
+
+A violation prints the faulting access with symbol and `file:line`, the
+registers, the flight-recorder ring, a symbolized call-stack backtrace, dumps
+flat RAM (`-protect-dump FILE`, default `protect-crash.ram`), and exits 70 —
+distinct from exit 1 so a harness can tell "the program went wild" from
+"xroar was misconfigured". Checks stay dormant until the first fetch of
+mapped code, so the BASIC boot cannot false-trip them. `-trap-protect-on`
+moves that start line — the checks then begin at *its* trap and nowhere
+earlier, so `-trap 'xpc=@ToolEntry' -trap-protect-on` really does ignore
+everything before `ToolEntry` — while `-trap-protect-off` stops them at its
+trap, and `-protect-allow LO-HI` exempts bytes a program patches on purpose. Self-modifying code will trip `-protect-mode-write`
+by design — that is what the exemption is for.
+
+### Who calls this routine?
+
+```bash
+bin/xroar-dev -machine coco3 -load-fd0 test.dsk -symbols out.sym \
+    -trap 'xpc=@DrawBrush' -trap-backtrace -trap-timeout 1
+```
+
+```
+backtrace: 3 frame(s), innermost first:
+backtrace: #0  in  0x74015 (DrawBrush (RESIDENT)) <- 0x74011 (ToolDown+4 (RESIDENT)) main.asm:412 s=3EFC
+backtrace: #1  in  0x74011 (ToolDown (RESIDENT)) <- 0x7400C (MainLoop+12 (RESIDENT)) s=3EFE
+```
+
+The shadow call stack watches JSR/BSR/LBSR and interrupt entries as they
+happen and unwinds by S, so it needs no frame pointers and survives `puls pc`
+and LEAS tricks. It arms itself under `-protect-mode` or any
+`-trap-backtrace`; `-backtrace` arms it alone, `-no-backtrace` keeps it off.
 
 ### See where the time actually goes
 
@@ -212,7 +278,7 @@ Because it makes the fork *legible and extensible to a model*.
 - The **upstream tarball is pristine**. There is never a question about what is
   ours and what is XRoar's. The answer is "every patch in `xroar/`".
 - **Adding a capability means adding a patch**, which is the same shape as
-  every existing one. A model that has read `PATCHES.md` can write patch 45
+  every existing one. A model that has read `PATCHES.md` can write patch 50
   without understanding the whole tree.
 - Rebasing onto a new XRoar release is a defined, mechanical job: re-apply the
   series, fix what conflicts, regenerate. Not a merge no one can review.
@@ -228,7 +294,7 @@ is the host half, four dependency-free Python scripts:
 
 | Tool | Pairs with | What it does |
 |---|---|---|
-| `gensym.py` | patch 41 | Builds the `.sym` / `.lines` pair from `lwasm` output, so you can write `@MainLoop` instead of an address that moves every build |
+| `gensym.py` | patches 41, 47 | Builds the `.sym` / `.lines` pair from `lwasm` output — `@MainLoop` instead of an address that moves every build, plus the code/data map `-protect-mode` enforces |
 | `symread.py` | n/a | Reads that pair from Python: name → physical, and back |
 | `auditreport.py` | patch 37 | Turns the binary access-audit map into "these routines were never executed" |
 | `decb.py` | n/a | Creates and manipulates RS-DOS disk images |
@@ -247,6 +313,8 @@ variables configure them for yours. See `tools/README.md`.
 | `.github/` | CI: every build path above, on every push |
 | `BUILD.md` | Build instructions, all platforms |
 | `PATCHES.md` | Every patch, what it does, and what it buys an agent |
+| `CHANGELOG.md` | The shape of the history, high level |
+| `MACHINE-COVERAGE.md` | Which machines each feature works on, and what is coco3-only on purpose |
 | `AGENT-NOTES.md` | Rules and traps, written for whoever automates this next |
 | `6809-NOTES.md` | 6809/6309 and lwasm traps: the things the datasheet states plainly and everyone gets wrong anyway |
 | `COPYING` | GPL-3.0, for XRoar itself |
@@ -261,7 +329,9 @@ whatever the individual patches say.
 lwtools is GPL-3.0; its own copy of the text ships inside the tarball as
 `lwtools-4.25/GPL3`.
 
-Every patch in this series and the scripts in `tools/` are MIT (`LICENSE.MIT`).
+Every patch in this series (`xroar/`, `lwasm/patches/`) and the scripts in
+`tools/` are MIT (`LICENSE.MIT`). That file is the license text and nothing
+else, so GitHub can recognise it; this paragraph is what it applies to.
 
 This fork is unaffiliated with upstream XRoar and lwtools. Please report bugs
 here unless you have reproduced them on stock XRoar or lwtools first.

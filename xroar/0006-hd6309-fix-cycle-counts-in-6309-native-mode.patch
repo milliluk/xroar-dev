@@ -1,7 +1,7 @@
-From 5c6b61cde46e3447e5fbeb78baa521478bf8ab04 Mon Sep 17 00:00:00 2001
+From ea58b3256bd217a7bc48033fd88d66386bcd461a Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:37 -0400
-Subject: [PATCH 06/44] hd6309: fix cycle counts in 6309 native mode
+Subject: [PATCH 06/49] hd6309: fix cycle counts in 6309 native mode
 
 ---
  src/mc6809/hd6309.c | 12 ++++++------

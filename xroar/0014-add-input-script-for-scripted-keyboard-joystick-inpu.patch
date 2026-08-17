@@ -1,7 +1,7 @@
-From b281aea6b2d6678a2af1b38e641c6fe6585f58b9 Mon Sep 17 00:00:00 2001
+From ca8563bdb1626830e9abef67c21ef05721f1577f Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:53 -0400
-Subject: [PATCH 14/44] add -input-script for scripted keyboard/joystick input
+Subject: [PATCH 14/49] add -input-script for scripted keyboard/joystick input
 
 ---
  src/Makefile.am |  1 +

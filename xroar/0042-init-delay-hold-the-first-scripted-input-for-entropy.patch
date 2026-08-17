@@ -1,13 +1,17 @@
-From 704f94ff0f653861bea0325676d151d992b6872e Mon Sep 17 00:00:00 2001
+From 675f31c647fd6392a669afc3ba0bedfdfb59f9a4 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:42:09 -0400
-Subject: [PATCH 42/44] -init-delay: hold the first scripted input, for entropy
+Subject: [PATCH 42/49] -init-delay: hold the first scripted input, for entropy
 
+audit.h also carries audit_bits_mc6809(), the audit-bit composition the
+CoCo 3 originally kept privately in coco3.c: it reads only shared 6809
+core state (mem_class, irq_depth), so it lives with the AUDIT_* legend
+it composes and both 6809 machine families call it.
 ---
  src/audiorec.c        | 215 +++++++++++++++
  src/audiorec.h        |  67 +++++
  src/audit.c           | 270 +++++++++++++++++++
- src/audit.h           | 106 ++++++++
+ src/audit.h           | 146 ++++++++++
  src/auto_kbd.c        |  19 ++
  src/joystick_script.c | 426 +++++++++++++++++++++++++++++
  src/joystick_script.h |  31 +++
@@ -15,7 +19,7 @@ Subject: [PATCH 42/44] -init-delay: hold the first scripted input, for entropy
  src/symfile.h         | 108 ++++++++
  src/xroar.c           |  67 +++++
  src/xroar.h           |  40 +++
- 11 files changed, 1960 insertions(+)
+ 11 files changed, 2000 insertions(+)
  create mode 100644 src/audiorec.c
  create mode 100644 src/audiorec.h
  create mode 100644 src/audit.c
@@ -597,10 +601,10 @@ index 0000000..d486373
 +}
 diff --git a/src/audit.h b/src/audit.h
 new file mode 100644
-index 0000000..707bfdd
+index 0000000..82150fb
 --- /dev/null
 +++ b/src/audit.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,146 @@
 +/** \file
 + *
 + *  \brief Physical-address access audit map.
@@ -639,6 +643,8 @@ index 0000000..707bfdd
 +#define XROAR_AUDIT_H_
 +
 +#include <stdint.h>
++
++#include "mc6809/mc6809.h"
 +
 +// Flat physical span covered.  512K is the stock GIME maximum; the DAT board's
 +// extra bank bits extend the address by two more bits, and the trap code
@@ -680,6 +686,44 @@ index 0000000..707bfdd
 +inline void audit_mark(unsigned phys, uint8_t bits) {
 +	if (audit_map && phys < AUDIT_SPAN)
 +		audit_map[phys] |= bits;
++}
++
++// Compose one audit byte from the CPU's access class for the cycle.  The core
++// is the only place that knows an instruction fetch from a data read or a dead
++// bus cycle from a real one; the machine then pairs the result with the
++// physical address its own decode produced.  One copy for every machine on
++// the 6809 core -- nothing in it is machine state.
++//
++// EXEC and READ are deliberately exclusive: an instruction fetch is a read, but
++// conflating them would make READ useless for finding the data reads, which is
++// most of what the flag is for.
++static inline uint8_t audit_bits_mc6809(const struct MC6809 *cpu, _Bool RnW) {
++	uint8_t cls = cpu->mem_class;
++	if (cls & MC6809_MC_DEAD)
++		return 0;
++	uint8_t bits;
++	if (cls & MC6809_MC_VECTOR) {
++		// A vector read is a read, not an instruction fetch.  The
++		// vectors live in ROM on these machines, so this branch never
++		// fires for a RAM cycle; it is here so that it cannot be
++		// wrong on a machine where they do not.
++		bits = AUDIT_READ;
++	} else if (cls & MC6809_MC_FETCH) {
++		bits = AUDIT_EXEC;
++		if (cls & MC6809_MC_OPCODE)
++			bits |= AUDIT_OPCODE;
++	} else {
++		bits = RnW ? AUDIT_READ : AUDIT_WRITE;
++	}
++	if (cls & MC6809_MC_STACK_S)
++		bits |= AUDIT_STACK_S;
++	if (cls & MC6809_MC_STACK_U)
++		bits |= AUDIT_STACK_U;
++	if (cls & MC6809_MC_PUSHPULL)
++		bits |= AUDIT_PUSHPULL;
++	if (cpu->irq_depth)
++		bits |= AUDIT_IRQ;
++	return bits;
 +}
 +
 +// -audit FILE[,seed=FILE][,start=on|off][,reset].  Allocates the map and, for
@@ -1952,7 +1996,7 @@ index 0000000..086915f
 +
 +#endif
 diff --git a/src/xroar.c b/src/xroar.c
-index 93a8a67..55beaac 100644
+index d9d65e3..d8609df 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -37,6 +37,7 @@
@@ -1963,7 +2007,7 @@ index 93a8a67..55beaac 100644
  #include <unistd.h>
  
  #ifdef WANT_GDB_TARGET
-@@ -534,6 +535,63 @@ static void remove_autosave_flag_file(void);
+@@ -541,6 +542,63 @@ static void remove_autosave_flag_file(void);
  
  static struct cart_config *selected_cart_config;
  
@@ -2027,7 +2071,7 @@ index 93a8a67..55beaac 100644
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
  /* Default configuration */
-@@ -4820,6 +4878,9 @@ static struct xconfig_option const xroar_options[] = {
+@@ -4824,6 +4882,9 @@ static struct xconfig_option const xroar_options[] = {
  	/* Emulator actions: */
  	{ XC_SET_BOOL("ratelimit", &private_cfg.debug.ratelimit) },
  	{ XC_SET_STRING_LIST("type", &private_cfg.kbd.type_list) },
@@ -2037,7 +2081,7 @@ index 93a8a67..55beaac 100644
  
  	/* Debugging: */
  	{ XC_SET_INT("debug-fdc", &logging.debug_fdc) },
-@@ -5002,6 +5063,9 @@ static void helptext(void) {
+@@ -5006,6 +5067,9 @@ static void helptext(void) {
  "  -kbd-translate          enable keyboard translation\n"
  "  -type STRING            intercept ROM calls to type STRING into BASIC\n"
  "  -load-text FILE         type FILE into BASIC\n"
@@ -2047,7 +2091,7 @@ index 93a8a67..55beaac 100644
  "\n"
  
  " Joysticks:\n"
-@@ -5268,6 +5332,9 @@ static void config_print_all(FILE *f, bool all) {
+@@ -5272,6 +5336,9 @@ static void config_print_all(FILE *f, bool all) {
  	xroar_cfg_print_string(f, all, "load-tape", private_cfg.file.tape, NULL);
  	xroar_cfg_print_string(f, all, "tape-write", private_cfg.file.tape_write, NULL);
  	xroar_cfg_print_string(f, all, "load-text", private_cfg.file.text, NULL);
@@ -2058,7 +2102,7 @@ index 93a8a67..55beaac 100644
  
  	fputs("# Cassettes\n", f);
 diff --git a/src/xroar.h b/src/xroar.h
-index 6fa67ef..5dbd2b8 100644
+index ff35d6e..1af71f1 100644
 --- a/src/xroar.h
 +++ b/src/xroar.h
 @@ -99,6 +99,38 @@ struct xroar_cfg {
@@ -2100,7 +2144,7 @@ index 6fa67ef..5dbd2b8 100644
  	} kbd;
  
  	// Becker port
-@@ -212,6 +244,14 @@ extern uint64_t xroar_master_cycles;
+@@ -217,6 +249,14 @@ extern int xroar_serial_out_baud;
  struct ui_interface *xroar_init(int argc, char **argv);
  
  /// Finish initialisation (sets first machine options, attaches media).

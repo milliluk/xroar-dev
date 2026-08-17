@@ -1,7 +1,7 @@
-From f91ecb0e64b769a971292e4a820b12ac308fdc21 Mon Sep 17 00:00:00 2001
+From d1c561d2cb229474290afebd115f966ed5cabcfa Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:35 -0400
-Subject: [PATCH 05/44] macosx: kAudioObjectPropertyElementMain, renamed in 12
+Subject: [PATCH 05/49] macosx: kAudioObjectPropertyElementMain, renamed in 12
 
 kAudioObjectPropertyElementMaster was renamed to ...Main in macOS 12 and the
 old spelling is deprecated, so every macOS build warns:

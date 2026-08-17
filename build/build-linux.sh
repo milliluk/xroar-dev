@@ -45,7 +45,11 @@ cd "xroar-$VER"
 
 echo ">> applying $(ls "$HERE"/xroar/[0-9]*.patch | wc -l) patches"
 for p in "$HERE"/xroar/[0-9]*.patch; do
-    patch -p1 -s < "$p" || { echo "FAILED: $(basename "$p")" >&2; exit 1; }
+    # --no-backup-if-mismatch: a hunk that lands at an offset is still an exact
+    # context match, but patch would leave a .orig beside the file. Offsets are
+    # normal here -- editing any early patch shifts every later one -- and the
+    # backups are pure litter in a tree that is deleted and rebuilt anyway.
+    patch -p1 -s --no-backup-if-mismatch < "$p" || { echo "FAILED: $(basename "$p")" >&2; exit 1; }
 done
 
 

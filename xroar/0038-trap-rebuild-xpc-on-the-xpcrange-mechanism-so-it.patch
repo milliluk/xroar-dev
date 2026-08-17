@@ -1,17 +1,17 @@
-From 8b50f45100d90df6b59527f31e4711c6abf30c0b Mon Sep 17 00:00:00 2001
+From cec680f257e9c05568052a74508ad0d8d86d8574 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:44 -0400
-Subject: [PATCH 38/44] trap: rebuild xpc= on the xpcrange mechanism so it
+Subject: [PATCH 38/49] trap: rebuild xpc= on the xpcrange mechanism so it
 
 ---
  src/xroar.c | 41 ++++++++++++++++++++++++++++++++++-------
  1 file changed, 34 insertions(+), 7 deletions(-)
 
 diff --git a/src/xroar.c b/src/xroar.c
-index 12d13c7..f41ccbf 100644
+index 29e980d..64918b4 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
-@@ -3650,6 +3650,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3658,6 +3658,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  				} else {
  					machine_remove_breakpoint(xroar.machine, a, DELEGATE_AS2(void, bool, uint32, handle_trap_new, trap));
  				}
@@ -43,7 +43,7 @@ index 12d13c7..f41ccbf 100644
  			} else if (0 == c_strcasecmp(key, "xpcrange")) {
  				// xpcrange=LO-HI: fire the instant the PHYSICAL PC enters
  				// the range.  An execution tripwire: arm it over a region
-@@ -4468,13 +4493,15 @@ static void set_trap(const char *cond) {
+@@ -4476,13 +4501,15 @@ static void set_trap(const char *cond) {
  		cur_trap_def->trace = -1;
  		cur_trap_def->no_trace = -1;
  		cur_trap_def->match_value = -1;

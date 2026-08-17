@@ -1,7 +1,7 @@
-From 20559ec99238055f13efdeeff122e3b9f8f5ee1d Mon Sep 17 00:00:00 2001
+From 77501ac65bb440f67c7b13763cb7854cc125075d Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:41:00 -0400
-Subject: [PATCH 17/44] trap-actions: -trap-load (blob loader) +
+Subject: [PATCH 17/49] trap-actions: -trap-load (blob loader) +
 
 The cycle counter is kept twice: xroar_cpu_cycles counts 6809 bus cycles,
 xroar_master_cycles the same interval in master clock ticks (14.31818MHz),
@@ -18,6 +18,15 @@ name rather than its position keeps working either way. The ratio between
 the two fields tells you what speed the machine was in.
 -trap-cycle-reset zeroes both counters whether or not the flag is set, so
 the two are always measuring the same interval.
+
+The counters were summed on the CoCo 3 and Dragon-family bus-cycle paths
+and never on the MC-10's, so on that machine a cycle= trap could never
+fire and -trap-cycle-print reported a frozen zero -- the option was
+accepted and silently measured nothing.  Sum them in mc10_mem_cycle too:
+the CPU count once per call (one call per 6803 bus cycle), the master
+count by the same ncycles figure event time advances by.  The MC-10 has
+no clock-inhibit path and no speed-up poke, so unlike dragon.c the
+master count is unconditional here.
 ---
  portalib/delegate.h        |   2 +
  src/breakpoint.c           |   6 +-
@@ -30,7 +39,7 @@ the two are always measuring the same interval.
  src/dragon/immunity.c      |   2 +-
  src/machine.c              |  12 ++-
  src/machine.h              |   6 +-
- src/mc10.c                 |  10 +--
+ src/mc10.c                 |  15 ++--
  src/mc6801/mc6801.c        |   6 ++
  src/mc6809/hd6309.c        |   1 +
  src/mc6809/mc6809.c        |  11 ++-
@@ -38,7 +47,7 @@ the two are always measuring the same interval.
  src/mc6809/mc6809_common.c |  34 ++++----
  src/xroar.c                | 166 ++++++++++++++++++++++++++++++++++---
  src/xroar.h                |  13 +++
- 19 files changed, 266 insertions(+), 89 deletions(-)
+ 19 files changed, 271 insertions(+), 89 deletions(-)
 
 diff --git a/portalib/delegate.h b/portalib/delegate.h
 index 1e4dd90..bd36063 100644
@@ -146,7 +155,7 @@ index 88b7a8a..b0bbde1 100644
  	}
  }
 diff --git a/src/coco3.c b/src/coco3.c
-index 52ff237..399bc40 100644
+index 51c5a4d..9537b7e 100644
 --- a/src/coco3.c
 +++ b/src/coco3.c
 @@ -342,10 +342,10 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
@@ -162,7 +171,7 @@ index 52ff237..399bc40 100644
  
  static void keyboard_update(void *sptr);
  static void joystick_update(void *sptr);
-@@ -1062,27 +1062,6 @@ static int32_t coco3_emustate(void *sptr, const char *name) {
+@@ -1042,27 +1042,6 @@ static int32_t coco3_emustate(void *sptr, const char *name) {
  	return -1;
  }
  
@@ -190,7 +199,7 @@ index 52ff237..399bc40 100644
  // - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
  
  static void coco3_ui_set_keymap(void *sptr, int tag, void *smsg) {
-@@ -1399,6 +1378,11 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
+@@ -1379,6 +1358,11 @@ static void write_byte(struct coco3 *mcc3, unsigned A) {
  static void cpu_cycle(void *sptr, int ncycles, bool RnW, uint16_t A) {
  	struct coco3 *mcc3 = sptr;
  	mcc3->cycles -= ncycles;
@@ -202,7 +211,7 @@ index 52ff237..399bc40 100644
  	if (mcc3->cycles <= 0) mcc3->CPU->running = 0;
  	event_run_queue(MACHINE_EVENT_LIST, ncycles);
  	MC6809_IRQ_SET(mcc3->CPU, mcc3->PIA0->a.irq | mcc3->PIA0->b.irq | mcc3->GIME->IRQ);
-@@ -1410,7 +1394,7 @@ static void cpu_cycle(void *sptr, int ncycles, bool RnW, uint16_t A) {
+@@ -1390,7 +1374,7 @@ static void cpu_cycle(void *sptr, int ncycles, bool RnW, uint16_t A) {
  		write_byte(mcc3, A);
  	}
  #ifdef WANT_GDB_TARGET
@@ -211,7 +220,7 @@ index 52ff237..399bc40 100644
  #endif
  	mcc3->GIME->IL1 = (PIA_VALUE_A(mcc3->PIA0) | 0x80) != 0xff;
  }
-@@ -1497,7 +1481,7 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
+@@ -1477,7 +1461,7 @@ static void coco3_remove_breakpoint(struct machine *m, int32_t A,
  
  static void coco3_add_watchpoint(struct machine *m, bool RnW,
  				 uint32_t Astart, uint32_t Aend,
@@ -220,7 +229,7 @@ index 52ff237..399bc40 100644
  	struct part *p = &m->part;
  	struct coco3 *mcc3 = (struct coco3 *)m;
  	if (!bp_watchpoint_add(&mcc3->watchpoint_set, RnW, Astart, Aend, handler)) {
-@@ -1507,7 +1491,7 @@ static void coco3_add_watchpoint(struct machine *m, bool RnW,
+@@ -1487,7 +1471,7 @@ static void coco3_add_watchpoint(struct machine *m, bool RnW,
  
  static void coco3_remove_watchpoint(struct machine *m, int RnW,
  				    int32_t Astart, uint32_t Aend,
@@ -230,7 +239,7 @@ index 52ff237..399bc40 100644
  	bp_watchpoint_remove(&mcc3->watchpoint_set, RnW, Astart, Aend, handler);
  }
 diff --git a/src/debug.h b/src/debug.h
-index 1f82ab4..083575e 100644
+index 1ffb2bf..44c6fb4 100644
 --- a/src/debug.h
 +++ b/src/debug.h
 @@ -55,6 +55,11 @@ struct debug_cpu {
@@ -259,7 +268,7 @@ index c7addb4..5b1033b 100644
  	// SAM decode / timing
  	int ncycles = md->SAM->mem_cycle(md->SAM, RnW, A);
 diff --git a/src/dragon/dragon.c b/src/dragon/dragon.c
-index 4b2f89c..9fed50f 100644
+index 81c790c..bffdee2 100644
 --- a/src/dragon/dragon.c
 +++ b/src/dragon/dragon.c
 @@ -238,10 +238,10 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
@@ -275,7 +284,7 @@ index 4b2f89c..9fed50f 100644
  
  static void joystick_update(void *sptr);
  static void hires_joystick_update(struct dragon *md);
-@@ -673,9 +673,6 @@ void dragon_free_common(struct part *p) {
+@@ -691,9 +691,6 @@ void dragon_free_common(struct part *p) {
  	if (md->printer_interface) {
  		printer_interface_free(md->printer_interface);
  	}
@@ -285,7 +294,7 @@ index 4b2f89c..9fed50f 100644
  	event_dequeue(&md->hires_joystick_event[0]);
  	event_dequeue(&md->hires_joystick_event[1]);
  	rombank_free(md->ext_charset);
-@@ -1076,13 +1073,20 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
+@@ -1140,13 +1137,20 @@ static void cpu_cycle(void *sptr, bool RnW, uint16_t A) {
  	struct dragon *md = sptr;
  
  	// Check watchpoints
@@ -307,7 +316,7 @@ index 4b2f89c..9fed50f 100644
  		dragon_advance_clock(md, ncycles);
  		MC6809_IRQ_SET(md->CPU, md->PIA0->a.irq || md->PIA0->b.irq);
  		MC6809_FIRQ_SET(md->CPU, md->PIA1->a.irq || md->PIA1->b.irq);
-@@ -1348,7 +1352,7 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
+@@ -1412,7 +1416,7 @@ static void dragon_remove_breakpoint(struct machine *m, int32_t A,
  
  static void dragon_add_watchpoint(struct machine *m, bool RnW,
  				  uint32_t Astart, uint32_t Aend,
@@ -316,7 +325,7 @@ index 4b2f89c..9fed50f 100644
  	struct part *p = &m->part;
  	struct dragon *md = (struct dragon *)m;
  	if (!bp_watchpoint_add(&md->watchpoint_set, RnW, Astart, Aend, handler)) {
-@@ -1358,7 +1362,7 @@ static void dragon_add_watchpoint(struct machine *m, bool RnW,
+@@ -1422,7 +1426,7 @@ static void dragon_add_watchpoint(struct machine *m, bool RnW,
  
  static void dragon_remove_watchpoint(struct machine *m, int RnW,
  				     int32_t Astart, uint32_t Aend,
@@ -407,7 +416,7 @@ index 1054a42..d9c4cfc 100644
  #ifdef WANT_GDB_TARGET
  void machine_add_hwatch(struct machine *m, bool RnW, uint32_t Astart, uint32_t Aend);
 diff --git a/src/mc10.c b/src/mc10.c
-index f38847e..b66668e 100644
+index fa1229f..6001d06 100644
 --- a/src/mc10.c
 +++ b/src/mc10.c
 @@ -209,10 +209,10 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
@@ -423,7 +432,7 @@ index f38847e..b66668e 100644
  
  static void mc10_vdg_fs(void *sptr, bool level);
  static void mc10_vdg_render_line(void *sptr, unsigned burst, unsigned npixels, uint8_t const *data);
-@@ -904,7 +904,7 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
+@@ -909,7 +909,7 @@ static void mc10_remove_breakpoint(struct machine *m, int32_t A,
  
  static void mc10_add_watchpoint(struct machine *m, bool RnW,
  				  uint32_t Astart, uint32_t Aend,
@@ -432,7 +441,7 @@ index f38847e..b66668e 100644
  	struct part *p = &m->part;
  	struct mc10 *mp = (struct mc10 *)m;
  	if (!bp_watchpoint_add(&mp->watchpoint_set, RnW, Astart, Aend, handler)) {
-@@ -914,7 +914,7 @@ static void mc10_add_watchpoint(struct machine *m, bool RnW,
+@@ -919,7 +919,7 @@ static void mc10_add_watchpoint(struct machine *m, bool RnW,
  
  static void mc10_remove_watchpoint(struct machine *m, int RnW,
  				     int32_t Astart, uint32_t Aend,
@@ -441,15 +450,26 @@ index f38847e..b66668e 100644
  	struct mc10 *mp = (struct mc10 *)m;
  	bp_watchpoint_remove(&mp->watchpoint_set, RnW, Astart, Aend, handler);
  }
-@@ -1076,7 +1076,7 @@ static void mc10_mem_cycle(void *sptr, bool RnW, uint16_t A) {
+@@ -1081,13 +1081,18 @@ static void mc10_mem_cycle(void *sptr, bool RnW, uint16_t A) {
  		}
  	}
  #ifdef WANT_GDB_TARGET
 -	bp_check_watchpoints(&mp->watchpoint_set, RnW, A);
 +	bp_check_watchpoints(&mp->watchpoint_set, RnW, A, mp->CPU->D);
  #endif
++	xroar_cpu_cycles += 1;  // one call per 6803 bus cycle = one CPU cycle
  
  	int ncycles = 16;
+ 	mp->cycles -= ncycles;
+ 	if (mp->cycles <= 0)
+ 		mp->CPU->running = 0;
++	// Counted with the same figure event time advances by, so the master
++	// count is event time and not an approximation of it.  No clock-inhibit
++	// path here, so unlike dragon.c it is unconditional.
++	xroar_master_cycles += ncycles;
+         event_run_queue(MACHINE_EVENT_LIST, ncycles);
+ }
+ 
 diff --git a/src/mc6801/mc6801.c b/src/mc6801/mc6801.c
 index 43ac7e5..0007e31 100644
 --- a/src/mc6801/mc6801.c
@@ -542,12 +562,12 @@ index ba6b6fe..6a13e4e 100644
  
  #endif
 diff --git a/src/mc6809/mc6809_common.c b/src/mc6809/mc6809_common.c
-index 296960d..419fcd1 100644
+index 24c6160..16dfb44 100644
 --- a/src/mc6809/mc6809_common.c
 +++ b/src/mc6809/mc6809_common.c
-@@ -107,8 +107,8 @@ static void store_byte(struct MC6809 *cpu, uint16_t a, uint8_t d) {
- 
- static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -128,8 +128,8 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+ 	if (!mc6809_emuext_supported(cpu))
+ 		return;                  // no emuext here: native illegal opcode
  	uint16_t p = REG_PC;             // cursor over operands; REG_PC untouched
 -	uint16_t fmt = DELEGATE_CALL(cpu->debug_cpu.debug_read, p) << 8; p++;
 -	fmt |= DELEGATE_CALL(cpu->debug_cpu.debug_read, p); p++;
@@ -556,7 +576,7 @@ index 296960d..419fcd1 100644
  
  	char out[1024];
  	unsigned o = 0;
-@@ -116,7 +116,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -137,7 +137,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  	_Bool has_conv = 0;
  
  	for (unsigned i = 0; i < 256 && o < sizeof(out) - 1; i++) {
@@ -565,7 +585,7 @@ index 296960d..419fcd1 100644
  		if (c == 0) { terminated = 1; break; }
  
  		// ${name}: read CPU/machine state directly, consumes NO argument
-@@ -126,13 +126,13 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -147,13 +147,13 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  		//   cycles      event_current_tick -> decimal
  		// A bare '$' not followed by '{' is emitted literally.
  		if (c == '$') {
@@ -581,7 +601,7 @@ index 296960d..419fcd1 100644
  				if (nc == '}' || nc == 0) break;
  				name[nl++] = nc;
  				j++;
-@@ -154,10 +154,10 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -175,10 +175,10 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  			else if (0 == strcmp(name, "s"))   snprintf(piece, sizeof(piece), "%04x", REG_S);
  			else if (0 == strcmp(name, "pc"))  snprintf(piece, sizeof(piece), "%04x", REG_PC);
  			else if (0 == strcmp(name, "cycles")) snprintf(piece, sizeof(piece), "%u", (unsigned)event_current_tick);
@@ -594,7 +614,7 @@ index 296960d..419fcd1 100644
  				if (sv < 0)
  					snprintf(piece, sizeof(piece), "${%s}", name);  // unknown: echo back
  				else if (0 == strcmp(name, "xpc") || 0 == strcmp(name, "paddr"))
-@@ -178,18 +178,18 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -199,18 +199,18 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  		uint8_t cv = 0;
  		for (;;) {
  			i++;
@@ -618,7 +638,7 @@ index 296960d..419fcd1 100644
  
  		char piece[300];
  		switch (cv) {
-@@ -205,7 +205,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -226,7 +226,7 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  		case 's': {
  			unsigned q = 0;
  			for (unsigned k = 0; k < sizeof(piece) - 1 && k < 256; k++) {
@@ -627,7 +647,7 @@ index 296960d..419fcd1 100644
  				if (!sc) break;
  				piece[q++] = sc;
  			}
-@@ -226,20 +226,20 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
+@@ -247,20 +247,20 @@ static void mc6809_emuext_log(struct MC6809 *cpu) {
  	}
  	out[o] = 0;
  
@@ -653,7 +673,7 @@ index 296960d..419fcd1 100644
  
  /*
 diff --git a/src/xroar.c b/src/xroar.c
-index a2b9ee6..6bffbfc 100644
+index cbaf39a..5efface 100644
 --- a/src/xroar.c
 +++ b/src/xroar.c
 @@ -107,6 +107,9 @@ struct xroar xroar = {
@@ -713,7 +733,7 @@ index a2b9ee6..6bffbfc 100644
  	} debug;
  
  #ifndef HAVE_WASM
-@@ -3198,10 +3220,10 @@ static void parse_range_ul(const char *str, unsigned long *a, unsigned long *b)
+@@ -3199,10 +3221,10 @@ static void parse_range_ul(const char *str, unsigned long *a, unsigned long *b)
  	char *bstr = str_copy;
  	char *astr = strsep(&bstr, "-");
  	if (a && astr && *astr) {
@@ -726,7 +746,7 @@ index a2b9ee6..6bffbfc 100644
  	}
  	free(str_copy);
  }
-@@ -3225,6 +3247,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3226,6 +3248,31 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  	char *cond_copy = xstrdup(trap->cond);
  	char *val = cond_copy;
  	char *key = strsep(&val, "=");
@@ -758,7 +778,7 @@ index a2b9ee6..6bffbfc 100644
  	if (key && *key && val && *val) {
  		unsigned long a = -1UL, b = -1UL;
  		parse_range_ul(val, &a, &b);
-@@ -3246,23 +3293,23 @@ static void enable_trap(struct trap_def *trap, bool enable) {
+@@ -3247,23 +3294,23 @@ static void enable_trap(struct trap_def *trap, bool enable) {
  				}
  			} else if (0 == c_strcasecmp(key, "read")) {
  				if (enable) {
@@ -790,7 +810,7 @@ index a2b9ee6..6bffbfc 100644
  				}
  			}
  		}
-@@ -3282,15 +3329,39 @@ static void disable_all_traps(void) {
+@@ -3283,15 +3330,39 @@ static void disable_all_traps(void) {
  	}
  }
  
@@ -832,7 +852,7 @@ index a2b9ee6..6bffbfc 100644
  	struct trap_count_range *range = trap->count ? trap->count->data : NULL;
  	++trap->counter;
  	if (range && trap->counter < range->first) {
-@@ -3315,6 +3386,37 @@ static void handle_trap(void *sptr) {
+@@ -3316,6 +3387,37 @@ static void handle_trap(void *sptr) {
  		xroar_set_trace(0, 0);
  	}
  
@@ -870,7 +890,7 @@ index a2b9ee6..6bffbfc 100644
  	if (range) {
  		if (range->last == (unsigned long)-1) {
  			// Unlimited - don't remove breakpoint
-@@ -3336,6 +3438,19 @@ static void handle_trap(void *sptr) {
+@@ -3337,6 +3439,19 @@ static void handle_trap(void *sptr) {
  	enable_trap(trap, 0);
  }
  
@@ -890,7 +910,7 @@ index a2b9ee6..6bffbfc 100644
  static void set_trap(const char *cond) {
  	if (cur_trap_def) {
  		if (private_cfg.debug.trap_def.count) {
-@@ -3368,6 +3483,19 @@ static void set_trap(const char *cond) {
+@@ -3369,6 +3484,19 @@ static void set_trap(const char *cond) {
  			cur_trap_def->no_trace = private_cfg.debug.trap_def.no_trace;
  			private_cfg.debug.trap_def.no_trace = -1;
  		}
@@ -910,7 +930,7 @@ index a2b9ee6..6bffbfc 100644
  	}
  	if (cond) {
  		unsigned i = num_trap_defs++;
-@@ -3377,6 +3505,7 @@ static void set_trap(const char *cond) {
+@@ -3378,6 +3506,7 @@ static void set_trap(const char *cond) {
  		cur_trap_def->cond = xstrdup(cond);
  		cur_trap_def->trace = -1;
  		cur_trap_def->no_trace = -1;
@@ -918,7 +938,7 @@ index a2b9ee6..6bffbfc 100644
  	}
  }
  
-@@ -3621,6 +3750,11 @@ static struct xconfig_option const xroar_options[] = {
+@@ -3622,6 +3751,11 @@ static struct xconfig_option const xroar_options[] = {
  	{ XC_SET_INT0("trap-trace", &private_cfg.debug.trap_def.trace) },
  	{ XC_SET_INT("trap-trace-n", &private_cfg.debug.trap_def.trace) },
  	{ XC_SET_INT1("trap-no-trace", &private_cfg.debug.trap_def.no_trace) },
@@ -930,7 +950,7 @@ index a2b9ee6..6bffbfc 100644
  	// All now handled with traps:
  	{ XC_CALL_STRING("snap-motoroff", &set_snap_motoroff) },
  	{ XC_CALL_STRING("timeout", &set_timeout) },
-@@ -3856,13 +3990,19 @@ static void helptext(void) {
+@@ -3857,13 +3991,19 @@ static void helptext(void) {
  "  -v, -verbose LEVEL    general debug verbosity (0-3) [1]\n"
  "  -q, -quiet            equivalent to -verbose 0\n"
  #ifdef WANT_TRAPS
@@ -952,7 +972,7 @@ index a2b9ee6..6bffbfc 100644
  "  -timeout-motoroff N   quit N seconds after tape motor switches off\n"
  "  -snap-motoroff FILE   write a snapshot each time tape motor switches off\n"
 diff --git a/src/xroar.h b/src/xroar.h
-index 973edc2..6fa67ef 100644
+index e28fdee..eafc5bc 100644
 --- a/src/xroar.h
 +++ b/src/xroar.h
 @@ -184,6 +184,19 @@ struct xroar {

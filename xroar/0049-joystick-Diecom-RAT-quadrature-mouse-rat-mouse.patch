@@ -1,0 +1,372 @@
+From b761a25b68e89a412f548e702857f667a0c028b6 Mon Sep 17 00:00:00 2001
+From: milliluk-erik <build@localhost>
+Date: Thu, 6 Aug 2026 11:00:00 -0400
+Subject: [PATCH 49/49] joystick: Diecom RAT quadrature mouse (-rat-mouse)
+
+The RAT wires two quadrature wheels onto a joystick port's analogue inputs.
+From the machine's side it is a pot whose resistance snaps between four
+discrete levels, one per wheel detent, and a driver recovers direction from
+the sequence of levels rather than from any single reading.  Nothing in XRoar
+could present that, so guest code that drives one -- Color Max Deluxe has a
+RAT driver with its own GIME timer ISR -- had no way to be executed at all.
+
+It is a filter over one port's axis readings, not a joystick module, and that
+is the design decision worth defending.  A module supplies a position; the RAT
+does not have one, because the position lives in the guest, which integrates
+the detents.  Filtering inside joystick_read_axis() instead means the port
+keeps whatever source it already had, so -joy-right script drives a RAT from
+an input script, the mouse drives one under a GUI build, and neither had to
+learn anything.  It also costs one branch on a path that already exists,
+against a module's worth of duplicated plumbing.
+
+The four levels are MAME's joy_rat_table[] = { 15, 24, 42, 33 }, six-bit DAC
+codes in phase order, deliberately not monotonic: ordered by resistance the
+phases run 0, 1, 3, 2, so consecutive phases are neighbours in the guest's
+bucketed reading and one bucket of change decodes to a direction.  A code is
+presented as the axis value that the comparator in each machine's
+joystick_update() maps back to it -- ((v << 2) | 2) << 8, which is
+joystick_dac_target_value()'s formula read backwards.
+
+-rat-rate is the option that can be got wrong, so its default was chosen
+against a real decoder rather than guessed.  Feeding Color Max Deluxe's own
+decode table a run of detents: one per guest sample tracks exactly, one pixel
+each.  TWO per sample while it is already moving decodes correctly as two
+pixels; two per sample FROM REST decodes as no motion at all and leaves the
+decoder's phase where it started, so a wheel that only ever steps two at a
+time is invisible.  Three per sample decodes as a reversal.  Hence a ceiling
+below the guest's sample rate: 150Hz by default, under both the ~157Hz the
+original RAT2.BIN driver sampled at and the 180.5Hz GIME timer Color Max
+Deluxe uses.  At one pixel per detent that crosses a 320-pixel screen in about
+two seconds, which is what the device really costs.
+
+The ceiling is enforced in emulated time and evaluated lazily in the read,
+because a port is read far more often than it is sampled -- every $FF00 read
+runs the comparator and the keyboard scan does that constantly -- so a counter
+driven by reads would be driven by the keyboard.  A level can therefore change
+in the middle of a guest's threshold compare; that is safe, because the
+compare buckets monotonically and a one-detent move lands in one of the two
+adjacent buckets, both legal transitions, and it is what real hardware does.
+
+Buttons needed nothing: the RAT has two, a port already carries two, and
+joystick_read_buttons() places all four where the CoCo 3 wires PIA0 PA0-PA3.
+
+Absolute position does not survive the trip and a script should not assume it
+does: the guest's decode hands out one or two pixels per detent depending on
+its phase, and eats a detent whenever the direction reverses.  Drive to a hard
+stop for a known origin and peek the guest's cursor rather than computing it.
+
+Verified: builds with -Werror; -h and -rat-mouse help list it; the four levels
+land one per bucket against the thresholds Color Max Deluxe's sampler strobes,
+with guest code == phase, so a phase increment is a code increment.
+
+Also verified against a guest now, which the first version of this message
+said had not been done.  A 6809 program doing the same six-bit successive
+approximation a real driver does -- SEL2/SEL1 low for the right port's X
+axis, walk the DAC in PIA1 A bits 7..2, read the comparator on PIA0 PA7 --
+and logging each code through emuext, driven by -input-script sweeps:
+
+  -rat-mouse right, sweeping right   15 24 42 33 15 24 42 33 ...
+  the same sweep leftward            15 33 42 24 15 33 42 24 ...
+  no -rat-mouse (control)            31 38 39 46 54, tracking the axis
+
+So the presented codes are exactly joy_rat_table[] in phase order, the
+sequence reverses with direction, and the filter is inert when the option
+is absent.  The leftward run needs the wheel to catch up with the source
+first: a centre-to-limit jump is 160 detents, which at the 150Hz ceiling
+takes about a second, and sampling before that finishes only ever shows
+the wind-on.  That is the device being honest, not a bug -- see the note
+above about absolute position not surviving the trip.
+---
+ src/Makefile.am    |   1 +
+ src/joystick.c     |  13 +++-
+ src/joystick_rat.c | 156 +++++++++++++++++++++++++++++++++++++++++++++
+ src/joystick_rat.h |  37 +++++++++++
+ src/xroar.c        |   9 +++
+ 5 files changed, 213 insertions(+), 3 deletions(-)
+ create mode 100644 src/joystick_rat.c
+ create mode 100644 src/joystick_rat.h
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+index c7b217c..e93e585 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -43,6 +43,7 @@ xroar_SOURCES = \
+ 	hkbd.c hkbd.h \
+ 	hkbd_joystick.c \
+ 	joystick.c joystick.h \
++	joystick_rat.c joystick_rat.h \
+ 	joystick_script.c joystick_script.h \
+ 	keyboard.c keyboard.h \
+ 	logging.c logging.h \
+diff --git a/src/joystick.c b/src/joystick.c
+index c6f8c92..5ee56c7 100644
+--- a/src/joystick.c
++++ b/src/joystick.c
+@@ -41,6 +41,7 @@
+ #include "xalloc.h"
+ 
+ #include "joystick.h"
++#include "joystick_rat.h"
+ #include "logging.h"
+ #include "messenger.h"
+ #include "module.h"
+@@ -921,11 +922,17 @@ static struct joystick_submodule *select_submod(struct joystick_submodule *submo
+ 
+ int joystick_read_axis(int port, int axis_index) {
+ 	struct joystick *j = joystick_port[port];
++	int value = 32767;
+ 	if (j && j->axes[axis_index]) {
+ 		struct joystick_control *axis = j->axes[axis_index];
+-		return DELEGATE_CALL(axis->read);
+-	}
+-	return 32767;
++		value = DELEGATE_CALL(axis->read);
++	}
++	// A Diecom RAT is a quadrature wheel wired to the pot, so the port's
++	// source reports a position and the device reports a phase.  Filtering
++	// here rather than in a joystick module means any source can drive one.
++	if (port == joystick_rat_port)
++		value = joystick_rat_axis(axis_index, value);
++	return value;
+ }
+ 
+ static inline int read_button(int port, int button_index) {
+diff --git a/src/joystick_rat.c b/src/joystick_rat.c
+new file mode 100644
+index 0000000..0727fb2
+--- /dev/null
++++ b/src/joystick_rat.c
+@@ -0,0 +1,156 @@
++/** \file
++ *
++ *  \brief Diecom RAT quadrature mouse on a joystick port.
++ *
++ *  \copyright Public domain. Part of the xroar-dev fork.
++ *
++ *  WHY THIS IS A FILTER AND NOT A JOYSTICK MODULE
++ *
++ *  A joystick module supplies a position.  The RAT does not have one: it is a
++ *  pair of quadrature wheels, and what reaches the CoCo is a pot whose
++ *  resistance snaps between four discrete levels as the wheel turns.  Motion
++ *  is in the *sequence* of levels, not in any single reading, and the guest
++ *  integrates it into a cursor position the emulator never sees.
++ *
++ *  So this sits between an ordinary source and the port: the source still says
++ *  where the host pointer is, and the filter converts the difference between
++ *  that and the position it has already handed over into wheel detents, one at
++ *  a time.  Anything that can drive a port drives a RAT -- `-joy-right script`
++ *  from an input script, the mouse under a GUI build, a real stick -- and none
++ *  of them needed to know.
++ *
++ *  THE FOUR LEVELS
++ *
++ *  MAME's trs/coco.cpp carries them as joy_rat_table[] = { 15, 24, 42, 33 },
++ *  six-bit DAC codes in phase order.  They are deliberately not monotonic:
++ *  ordered by resistance the phases run 0, 1, 3, 2, so consecutive phases are
++ *  neighbours in the guest's bucketed reading and a change of one bucket
++ *  decodes to a direction.  Two levels apart is 180 degrees and has no
++ *  direction, which is why the step rate below matters.
++ *
++ *  A guest buckets a reading with a three-step threshold compare against the
++ *  same DAC the sound chip uses, so a level is presented here as the axis
++ *  value the comparator in the machine's joystick_update() maps back to that
++ *  DAC code -- RAT_AXIS_VALUE below is joystick_dac_target_value()'s formula
++ *  read backwards.  Nothing in this file knows what thresholds a particular
++ *  guest picks; it only has to land in the right bucket, and the four codes
++ *  are one per bucket by construction.
++ *
++ *  THE STEP RATE IS THE ONE THING THAT CAN BE WRONG
++ *
++ *  A quadrature decoder must see every transition, and what a guest does with
++ *  a skipped one was measured against Color Max Deluxe's decoder rather than
++ *  assumed.  Two detents between samples while it is ALREADY MOVING decodes
++ *  correctly, as two pixels in the direction it had; two detents from rest
++ *  decodes as no motion at all, and leaves the decoder's phase where it
++ *  started, so a wheel that only ever steps two at a time is invisible.
++ *  Three decodes as a reversal.  So the ceiling here has to sit below the
++ *  rate the guest samples at, and it is an option because only the guest
++ *  knows that rate.  The default is 150Hz, which is under both the ~157Hz the
++ *  original RAT2.BIN driver used and the 180.5Hz GIME timer Color Max Deluxe
++ *  samples on.  At one pixel per detent that is a 320-pixel screen crossed in
++ *  about two seconds, which is what the device really costs.
++ *
++ *  The rate limit is evaluated lazily, in the read, rather than from an event:
++ *  a port is read far more often than it is sampled (every $FF00 read runs the
++ *  comparator, and the keyboard scan does that constantly), so a step counter
++ *  driven by reads would be driven by the keyboard.  Emulated time is the only
++ *  honest clock here.  A level CAN therefore change in the middle of a guest's
++ *  threshold compare; that is safe, because the compare buckets monotonically
++ *  and a one-detent move lands it in one of the two adjacent buckets, both of
++ *  which are legal transitions.  It is also what real hardware does.
++ *
++ *  ABSOLUTE POSITION DOES NOT SURVIVE THE TRIP, and a script driving one of
++ *  these should not assume it does.  The guest's own decode table hands out
++ *  one or two pixels per detent depending on the phase it is in, and eats a
++ *  detent whenever the direction reverses.  Drive to a hard stop first if you
++ *  need a known origin, and peek the guest's cursor rather than computing it.
++ *
++ *  BUTTONS need nothing here.  The RAT has two; a port already carries two
++ *  (joystick_read_buttons() places both, and the CoCo 3 wires all four to PIA0
++ *  PA0-PA3), so `down 0` / `down 1` in an input script are the RAT's left and
++ *  right buttons already.  What a *guest* does with the second one is the
++ *  guest's business.
++ */
++
++#include "top-config.h"
++
++#include <stdint.h>
++
++#include "events.h"
++#include "joystick_rat.h"
++#include "xconfig.h"
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++// Configuration.  Written by the option parser before any of this runs.
++
++int joystick_rat_port = RAT_PORT_NONE;
++
++// 65536 axis units span the pot's whole travel, and a guest that moves one
++// pixel per detent wants one detent per pixel of a 320-pixel screen.
++int joystick_rat_scale = 205;
++
++int joystick_rat_rate = 150;
++
++struct xconfig_enum joystick_rat_port_list[] = {
++	{ XC_ENUM_INT("none", RAT_PORT_NONE, "No RAT attached") },
++	{ XC_ENUM_INT("right", 0, "Diecom RAT on the right port") },
++	{ XC_ENUM_INT("left", 1, "Diecom RAT on the left port") },
++	{ XC_ENUM_END() }
++};
++
++// - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
++
++// Six-bit DAC codes in phase order, MAME's joy_rat_table[].
++static const unsigned rat_dac_code[4] = { 15, 24, 42, 33 };
++
++// A six-bit code as the axis value whose comparison against the DAC picks it
++// out: the machine builds its threshold as ((PIA1 A & 0xfc) | 2) << 8, and the
++// six bits sit in 7..2, so a code v is centred at ((v << 2) | 2) << 8.
++#define RAT_AXIS_VALUE(v) ((int)((((unsigned)(v) << 2) | 2u) << 8))
++
++static struct {
++	int phase;             // 0..3, index into rat_dac_code[]
++	int detent;            // source position already handed over, in detents
++	_Bool primed;          // detent is meaningful
++	event_ticks next_step;  // earliest emulated time the wheel may turn again
++} rat_axis_state[2];
++
++int joystick_rat_axis(int axis, int value) {
++	if (axis < 0 || axis > 1)
++		return value;
++	if (joystick_rat_scale < 1)
++		joystick_rat_scale = 1;
++
++	int target = value / joystick_rat_scale;
++
++	// The first reading is where the wheel already is, not somewhere to
++	// move to: without this every run would open by winding the pot from
++	// zero to wherever the source happens to be pointing.
++	if (!rat_axis_state[axis].primed) {
++		rat_axis_state[axis].primed = 1;
++		rat_axis_state[axis].detent = target;
++		rat_axis_state[axis].next_step = event_current_tick;
++	}
++
++	if (rat_axis_state[axis].detent != target &&
++	    event_tick_delta(event_current_tick, rat_axis_state[axis].next_step) >= 0) {
++		// One detent.  Phase up is the direction the guest reads as
++		// increasing, because its decode is (old code - new code) & 3.
++		if (target > rat_axis_state[axis].detent) {
++			rat_axis_state[axis].detent++;
++			rat_axis_state[axis].phase = (rat_axis_state[axis].phase + 1) & 3;
++		} else {
++			rat_axis_state[axis].detent--;
++			rat_axis_state[axis].phase = (rat_axis_state[axis].phase + 3) & 3;
++		}
++		int rate = joystick_rat_rate > 0 ? joystick_rat_rate : 1;
++		// From now, not from the deadline: a port that goes unread for a
++		// while must not bank up steps and then spend them in one burst,
++		// which is precisely the skipped-transition case above.
++		rat_axis_state[axis].next_step = event_current_tick +
++			(event_ticks)(EVENT_TICK_RATE / (uintmax_t)rate);
++	}
++
++	return RAT_AXIS_VALUE(rat_dac_code[rat_axis_state[axis].phase]);
++}
+diff --git a/src/joystick_rat.h b/src/joystick_rat.h
+new file mode 100644
+index 0000000..f68cd7e
+--- /dev/null
++++ b/src/joystick_rat.h
+@@ -0,0 +1,37 @@
++/** \file
++ *
++ *  \brief Diecom RAT quadrature mouse on a joystick port.
++ *
++ *  A filter over one port's axis readings, not a joystick module: it takes
++ *  whatever source is already mapped to that port (script, mouse, physical)
++ *  and re-presents its position as a quadrature wheel, so the guest sees the
++ *  four-level pot a RAT presents instead of a continuous one.
++ *
++ *  \copyright Public domain. Part of the xroar-dev fork.
++ */
++
++#ifndef XROAR_JOYSTICK_RAT_H_
++#define XROAR_JOYSTICK_RAT_H_
++
++#include "xconfig.h"
++
++// Port the RAT is attached to: RAT_PORT_NONE, or 0 (right) / 1 (left).  Set
++// directly by the -rat-mouse option.
++#define RAT_PORT_NONE (-1)
++extern int joystick_rat_port;
++
++// Source axis units (0..65535) per wheel detent.  -rat-scale.
++extern int joystick_rat_scale;
++
++// Ceiling on detent steps per second of emulated time.  -rat-rate.  MUST stay
++// below the rate the guest samples the port at; see joystick_rat.c.
++extern int joystick_rat_rate;
++
++// For -rat-mouse's XC_SET_ENUM.
++extern struct xconfig_enum joystick_rat_port_list[];
++
++// Called from joystick_read_axis() for the attached port only.  value is the
++// underlying source's reading; the return is the pot level to present.
++int joystick_rat_axis(int axis, int value);
++
++#endif
+diff --git a/src/xroar.c b/src/xroar.c
+index 7871b3a..0a82fba 100644
+--- a/src/xroar.c
++++ b/src/xroar.c
+@@ -68,6 +68,7 @@
+ #include "hexs19.h"
+ #include "hkbd.h"
+ #include "joystick.h"
++#include "joystick_rat.h"
+ #include "keyboard.h"
+ #include "logging.h"
+ #include "machine.h"
+@@ -5103,6 +5104,9 @@ static struct xconfig_option const xroar_options[] = {
+ 	{ XC_SET_STRING("joy-left", &private_cfg.joy.left) },
+ 	{ XC_SET_STRING("joy-virtual", &private_cfg.joy.virtual) },
+ 	{ XC_SET_STRING("input-script", &input_script_path) },
++	{ XC_SET_ENUM("rat-mouse", &joystick_rat_port, joystick_rat_port_list) },
++	{ XC_SET_INT("rat-scale", &joystick_rat_scale) },
++	{ XC_SET_INT("rat-rate", &joystick_rat_rate) },
+ 
+ 	/* Printing: */
+ 	{ XC_SET_STRING_NE("lp-file", &private_cfg.printer.file) },
+@@ -5327,6 +5331,11 @@ static void helptext(void) {
+ "  -joy-left NAME        map left joystick\n"
+ "  -joy-virtual NAME     specify the 'virtual' joystick to cycle [kjoy0]\n"
+ "  -input-script FILE    drive keyboard and joystick from a script file\n"
++"  -rat-mouse PORT       present a port's source as a Diecom RAT quadrature\n"
++"                          mouse (none, right, left)\n"
++"    -rat-scale UNITS      axis units per wheel detent [205]\n"
++"    -rat-rate HZ          ceiling on detent steps per second; must stay below\n"
++"                          the rate the guest samples the port at [150]\n"
+ "\n"
+ 
+ " Printers:\n"

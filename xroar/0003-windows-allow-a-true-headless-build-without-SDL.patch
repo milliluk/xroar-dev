@@ -1,7 +1,7 @@
-From a3ae12f11b064e5491014448a7166abc225419ac Mon Sep 17 00:00:00 2001
+From c062c6609fb26228e8ab646f0037b409c8724ba1 Mon Sep 17 00:00:00 2001
 From: milliluk-erik <build@localhost>
 Date: Mon, 3 Aug 2026 12:40:14 -0400
-Subject: [PATCH 03/44] windows: allow a true headless build without SDL
+Subject: [PATCH 03/49] windows: allow a true headless build without SDL
 
 MinGW previously selected the native windows32 UI solely from the host OS. Even --without-sdl3 still compiled that UI, so Windows automation had to ship SDL3 and a GUI-subsystem executable despite selecting the null UI at runtime.
 
